@@ -313,10 +313,22 @@ mod tests {
         assert!(serde_json::from_value::<ServerMessage>(v).is_err());
     }
 
+    /// Exact dispatch frame from driffs `src/dispatch/dispatcher.ts`:
+    /// `conn.send({type: 'cancel', tenant: job.tenant, jobId: job.id})`.
+    #[test]
+    fn cancel_matches_dispatch_frame() {
+        let literal = r#"{"type":"cancel","tenant":"driffs","jobId":"job-render-abc123"}"#;
+        let msg = round_trip_server(literal);
+        let ServerMessage::Cancel(c) = msg else {
+            panic!("expected cancel");
+        };
+        assert_eq!(c.tenant, "driffs");
+        assert_eq!(c.job_id, "job-render-abc123");
+    }
+
     #[test]
     fn remaining_server_frames() {
         round_trip_server(r#"{"type":"ping","tenant":"driffs"}"#);
-        round_trip_server(r#"{"type":"cancel","tenant":"driffs","jobId":"job-render-abc123"}"#);
         round_trip_server(
             r#"{"type":"updateAvailable","tenant":"driffs","supervisorVersion":"rust-0.0.2","payloadVersion":"remotion-4.0.339"}"#,
         );
