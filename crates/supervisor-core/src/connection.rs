@@ -3,13 +3,16 @@
 //! Mirrors the connection behavior of the TS reference worker
 //! (driffs `scripts/spike-worker.ts`): connect with `?token=` on the URL,
 //! send `register` immediately, heartbeat every 20 s, retry the initial
-//! connect with a short delay (the dispatch may still be starting), and hand
-//! every parsed server message to a caller-supplied handler.
+//! connect with a short delay (the dispatch may still be starting), and
+//! process server messages inline.
 //!
 //! The loop accepts an [`Observability`] bundle. When channels are attached
 //! (Tauri app), it emits structured status snapshots and tailable log lines.
 //! When they are `None` (CLI), it falls back to `tracing` only. Both skins
 //! drive the exact same code path.
+//!
+//! There is no `ServerMessageHandler` trait — the observation mechanism is
+//! the [`Observability`] bundle alone. One mechanism, not two.
 
 use std::time::Duration;
 
@@ -23,17 +26,6 @@ use crate::protocol::{
 };
 use crate::runner::{run_job, InFlightJob};
 use crate::status::{ConnectionState, JobPhase, JobStatus, LogLine, Observability};
-
-/// Receives every parsed server → worker message.
-pub trait ServerMessageHandler: Send {
-    fn on_message(&mut self, msg: &ServerMessage);
-}
-
-impl<F: FnMut(&ServerMessage) + Send> ServerMessageHandler for F {
-    fn on_message(&mut self, msg: &ServerMessage) {
-        self(msg);
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
@@ -99,19 +91,19 @@ fn encode_uri_component(s: &str) -> String {
     out
 }
 
-/// Connect, register, heartbeat, and pump server messages into `handler`.
+/// Connect, register, heartbeat, and process server messages.
 ///
 /// Returns `Ok(())` on a clean self-initiated close (heartbeat limit reached)
 /// or when the server closes the socket after we ever connected; returns an
 /// error if the dispatch is unreachable after all connect attempts.
 ///
-/// `obs` carries the optional status/log channels + the live `allow_real_jobs`
-/// flag. The CLI passes `Observability::default()`; the Tauri app passes one
-/// with channels attached.
-pub async fn run<H: ServerMessageHandler>(
+/// `obs` is the sole observation surface. The CLI passes
+/// `Observability::default()` (tracing-only); the Tauri app passes one with
+/// status/log channels attached. There is no handler callback — everything
+/// the caller needs to observe flows through `obs`.
+pub async fn run(
     config: &ConnectionConfig,
     register: &RegisterMessage,
-    handler: &mut H,
     obs: &Observability,
 ) -> anyhow::Result<()> {
     let url = config.url_with_token();
@@ -265,7 +257,6 @@ pub async fn run<H: ServerMessageHandler>(
                         match serde_json::from_str::<ServerMessage>(&text) {
                             Ok(msg) => {
                                 log_server_message(&msg, obs.allows_real_jobs());
-                                handler.on_message(&msg);
                                 match msg {
                                     ServerMessage::JobAssign(assign) => {
                                         if !obs.allows_real_jobs() {
@@ -387,7 +378,6 @@ fn log_server_message(msg: &ServerMessage, allow_real_jobs: bool) {
 mod tests {
     use super::*;
     use crate::protocol::{Capabilities, Platform, PROTOCOL_VERSION};
-    use std::sync::{Arc, Mutex};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
     use tokio_tungstenite::WebSocketStream;
@@ -418,7 +408,7 @@ mod tests {
 
     async fn accept_ws(listener: &TcpListener) -> (WebSocketStream<TcpStream>, String) {
         let (tcp, _) = listener.accept().await.unwrap();
-        let uri = Arc::new(Mutex::new(String::new()));
+        let uri = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let uri_clone = uri.clone();
         // tungstenite's handshake callback signature carries a large Err type.
         #[allow(clippy::result_large_err)]
@@ -450,9 +440,7 @@ mod tests {
         let register = test_register();
         let obs = Observability::default();
 
-        let client = tokio::spawn(async move {
-            run(&config, &register, &mut |_: &ServerMessage| {}, &obs).await
-        });
+        let client = tokio::spawn(async move { run(&config, &register, &obs).await });
 
         let (mut ws, uri) = accept_ws(&listener).await;
         assert!(
@@ -486,13 +474,7 @@ mod tests {
         let register = test_register();
         let obs = Observability::default();
 
-        let seen: Arc<Mutex<Vec<ServerMessage>>> = Arc::default();
-        let seen_clone = seen.clone();
-        let client = tokio::spawn(async move {
-            let mut handler =
-                move |msg: &ServerMessage| seen_clone.lock().unwrap().push(msg.clone());
-            run(&config, &register, &mut handler, &obs).await
-        });
+        let client = tokio::spawn(async move { run(&config, &register, &obs).await });
 
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
@@ -521,14 +503,6 @@ mod tests {
             sent_types.iter().all(|t| t == "heartbeat"),
             "only heartbeats expected after register, got {sent_types:?}"
         );
-
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2, "handler must receive ping + jobAssign");
-        assert!(matches!(seen[0], ServerMessage::Ping(_)));
-        match &seen[1] {
-            ServerMessage::JobAssign(a) => assert_eq!(a.job_id, "job-render-x"),
-            other => panic!("expected jobAssign, got {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -541,9 +515,7 @@ mod tests {
         let config = fast_config(port);
         let register = test_register();
         let obs = Observability::default();
-        let client = tokio::spawn(async move {
-            run(&config, &register, &mut |_: &ServerMessage| {}, &obs).await
-        });
+        let client = tokio::spawn(async move { run(&config, &register, &obs).await });
 
         // Let a few attempts fail before the "dispatch" comes up.
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -570,9 +542,7 @@ mod tests {
         let (obs, status_rx, _log_rx) =
             Observability::channels(crate::status::SupervisorStatus::default());
 
-        let client = tokio::spawn(async move {
-            run(&config, &register, &mut |_: &ServerMessage| {}, &obs).await
-        });
+        let client = tokio::spawn(async move { run(&config, &register, &obs).await });
 
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
@@ -590,6 +560,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn obs_receives_job_assign_warning_when_jobs_disabled() {
+        // With allow_real_jobs=false, a jobAssign must produce a warning log
+        // but no jobAccepted frame.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = fast_config(port);
+        let register = test_register();
+
+        let (obs, status_rx, mut log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+
+        let client = tokio::spawn(async move { run(&config, &register, &obs).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(
+			r#"{"type":"jobAssign","tenant":"driffs","jobId":"job-refused-1","kind":"standard","durationFrames":1,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#.into(),
+		))
+		.await
+		.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Status: no current job (refused).
+        assert!(status_rx.borrow().current_job.is_none());
+
+        // Log: should have the refusal warning.
+        let mut found_refusal = false;
+        while let Ok(line) = log_rx.try_recv() {
+            if line.message.contains("refused") {
+                found_refusal = true;
+            }
+        }
+        assert!(found_refusal, "expected a job refusal warning log line");
+
+        // Drain to close.
+        while ws.next().await.is_some() {}
+        client.await.unwrap().expect("clean exit");
+    }
+
+    #[tokio::test]
     async fn runtime_toggle_accepts_jobs() {
         // Start with allow_real_jobs=false, then flip the atomic at runtime.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -602,9 +614,7 @@ mod tests {
         assert!(!obs.allows_real_jobs());
 
         let obs2 = obs.clone();
-        let client = tokio::spawn(async move {
-            run(&config, &register, &mut |_: &ServerMessage| {}, &obs2).await
-        });
+        let client = tokio::spawn(async move { run(&config, &register, &obs2).await });
 
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;

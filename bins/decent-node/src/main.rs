@@ -10,7 +10,7 @@
 
 use clap::{Parser, Subcommand};
 use supervisor_core::connection::{self, ConnectionConfig};
-use supervisor_core::protocol::{self, Capabilities, Platform, RegisterMessage, PROTOCOL_VERSION};
+use supervisor_core::protocol::{Capabilities, Platform, RegisterMessage, PROTOCOL_VERSION};
 use supervisor_core::status::Observability;
 
 const SUPERVISOR_VERSION: &str = "rust-0.0.1";
@@ -123,13 +123,7 @@ async fn main() -> anyhow::Result<()> {
             // CLI uses tracing-only observability (no status/log channels).
             let obs = Observability::default();
             obs.set_allow_real_jobs(allow_real_jobs);
-            connection::run(
-                &config,
-                &register,
-                &mut |_: &protocol::ServerMessage| {},
-                &obs,
-            )
-            .await?;
+            connection::run(&config, &register, &obs).await?;
             tracing::info!("decent-node exited cleanly");
             Ok(())
         }
