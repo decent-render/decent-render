@@ -1,0 +1,15 @@
+[package]
+name = "decent-node"
+version = "0.0.1"
+description = "Decent render network node — thin CLI over supervisor-core. The Tauri shell comes later."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+supervisor-core = { path = "../../crates/supervisor-core" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
