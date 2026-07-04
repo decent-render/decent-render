@@ -19,6 +19,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dirs-next = "2"
+keyring = { version = "3", features = ["apple-native"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
