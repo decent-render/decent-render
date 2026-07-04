@@ -35,6 +35,10 @@ enum Command {
         /// Exit cleanly after this many heartbeats (smoke-test mode).
         #[arg(long)]
         heartbeat_limit: Option<u32>,
+        /// Opt in to executing real render jobs. Default safety posture refuses
+        /// jobAssign frames and only registers/heartbeats.
+        #[arg(long, env = "ALLOW_REAL_JOBS", default_value_t = false)]
+        allow_real_jobs: bool,
     },
 }
 
@@ -85,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
             dispatch_url,
             token,
             heartbeat_limit,
+            allow_real_jobs,
         } => {
             let register = RegisterMessage {
                 tenant: TENANT.into(),
@@ -95,7 +100,9 @@ async fn main() -> anyhow::Result<()> {
                 ram_gb: detect_ram_gb(),
                 supervisor_version: SUPERVISOR_VERSION.into(),
                 payload_version: "none".into(),
-                capabilities: Capabilities { gpu: false },
+                capabilities: Capabilities {
+                    gpu: allow_real_jobs,
+                },
             };
             tracing::info!(
                 dispatch_url = %dispatch_url,
@@ -105,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
             );
             let config = ConnectionConfig {
                 heartbeat_limit,
+                allow_real_jobs,
                 ..ConnectionConfig::new(dispatch_url, token)
             };
             connection::run(&config, &register, &mut |_: &protocol::ServerMessage| {}).await?;

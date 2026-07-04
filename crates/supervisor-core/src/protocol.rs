@@ -171,6 +171,11 @@ pub struct JobAssignMessage {
     /// bundle).
     pub bundle_sha256: String,
     pub bundle_get_url: String,
+    /// Pinned render payload tarball (runner binary + remotion-binaries/).
+    /// Dispatch resolves this by render_bundles.remotionVersion → active
+    /// render_payloads row; the supervisor verifies and caches by sha.
+    pub payload_sha256: String,
+    pub payload_get_url: String,
     /// Presigned R2 GET for the job's input props JSON
     /// (`{compositionId, inputProps}`). Self-describing — the worker needs no
     /// other job data.
@@ -287,7 +292,7 @@ mod tests {
     /// jobAssign with every field from protocol.ts JobAssignMessageSchema.
     #[test]
     fn job_assign_matches_dispatch_shape() {
-        let literal = r#"{"type":"jobAssign","tenant":"driffs","jobId":"job-render-abc123","kind":"gpu","durationFrames":300,"fps":30,"codec":"h264","bundleSha256":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08","bundleGetUrl":"https://r2.example.com/bundles/9f86.tar.gz?sig=1","inputPropsGetUrl":"https://r2.example.com/renders/t1/input-props.json?sig=2","assetGetUrls":["https://r2.example.com/assets/a.png?sig=3"],"outputPutUrl":"https://r2.example.com/renders/t1/out.mp4?sig=4","outputKey":"renders/t1/out.mp4","purgeAfter":true}"#;
+        let literal = r#"{"type":"jobAssign","tenant":"driffs","jobId":"job-render-abc123","kind":"gpu","durationFrames":300,"fps":30,"codec":"h264","bundleSha256":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08","bundleGetUrl":"https://r2.example.com/bundles/9f86.tar.gz?sig=1","payloadSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","payloadGetUrl":"https://r2.example.com/render-payloads/aaaa.tar.gz?sig=payload","inputPropsGetUrl":"https://r2.example.com/renders/t1/input-props.json?sig=2","assetGetUrls":["https://r2.example.com/assets/a.png?sig=3"],"outputPutUrl":"https://r2.example.com/renders/t1/out.mp4?sig=4","outputKey":"renders/t1/out.mp4","purgeAfter":true}"#;
         let msg = round_trip_server(literal);
         let ServerMessage::JobAssign(a) = msg else {
             panic!("expected jobAssign");
@@ -305,7 +310,7 @@ mod tests {
     #[test]
     fn job_assign_rejects_purge_after_false() {
         let mut v: Value = serde_json::from_str(
-            r#"{"type":"jobAssign","tenant":"driffs","jobId":"j","kind":"standard","durationFrames":1,"fps":30,"codec":"vp8","bundleSha256":"x","bundleGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#,
+            r#"{"type":"jobAssign","tenant":"driffs","jobId":"j","kind":"standard","durationFrames":1,"fps":30,"codec":"vp8","bundleSha256":"x","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#,
         )
         .unwrap();
         assert!(serde_json::from_value::<ServerMessage>(v.clone()).is_ok());

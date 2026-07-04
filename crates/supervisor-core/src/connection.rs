@@ -17,7 +17,10 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::protocol::{HeartbeatMessage, RegisterMessage, ServerMessage, WorkerMessage};
+use crate::protocol::{
+    HeartbeatMessage, JobAcceptedMessage, RegisterMessage, ServerMessage, WorkerMessage,
+};
+use crate::runner::{run_job, InFlightJob};
 
 /// Receives every parsed server → worker message.
 pub trait ServerMessageHandler: Send {
@@ -45,6 +48,9 @@ pub struct ConnectionConfig {
     /// If set, close the socket cleanly after sending this many heartbeats.
     /// Used for smoke tests; `None` runs until the server closes.
     pub heartbeat_limit: Option<u32>,
+    /// Safety gate: default false refuses jobAssign. Real rendering only runs
+    /// when the CLI/env opts in.
+    pub allow_real_jobs: bool,
 }
 
 impl ConnectionConfig {
@@ -56,6 +62,7 @@ impl ConnectionConfig {
             max_connect_attempts: 15,
             connect_retry_delay: Duration::from_secs(1),
             heartbeat_limit: None,
+            allow_real_jobs: false,
         }
     }
 
@@ -147,10 +154,11 @@ pub async fn run<H: ServerMessageHandler>(
         config.heartbeat_interval,
     );
     let mut heartbeats_sent = 0u32;
-    // No job execution in this crate version — the count is always 0.
-    let current_job_count = 0u32;
+    let (worker_tx, mut worker_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerMessage>();
+    let mut in_flight: Option<InFlightJob> = None;
 
     loop {
+        let current_job_count = u32::from(in_flight.is_some());
         tokio::select! {
             _ = heartbeat.tick() => {
                 let msg = WorkerMessage::Heartbeat(HeartbeatMessage {
@@ -167,13 +175,48 @@ pub async fn run<H: ServerMessageHandler>(
                     }
                 }
             }
+            Some(msg) = worker_rx.recv() => {
+                if matches!(msg, WorkerMessage::JobComplete(_) | WorkerMessage::JobFailed(_)) {
+                    in_flight = None;
+                }
+                sink.send(Message::Text(send(msg))).await.context("failed to send worker job frame")?;
+            }
             frame = stream.next() => {
                 match frame {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ServerMessage>(&text) {
                             Ok(msg) => {
-                                log_server_message(&msg);
+                                log_server_message(&msg, config.allow_real_jobs);
                                 handler.on_message(&msg);
+                                match msg {
+                                    ServerMessage::JobAssign(assign) => {
+                                        if !config.allow_real_jobs {
+                                            tracing::warn!(job_id = %assign.job_id, "refusing jobAssign; --allow-real-jobs not set");
+                                            continue;
+                                        }
+                                        if in_flight.is_some() {
+                                            tracing::warn!(job_id = %assign.job_id, "refusing jobAssign while busy");
+                                            continue;
+                                        }
+                                        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+                                        in_flight = Some(InFlightJob { job_id: assign.job_id.clone(), cancel: cancel_tx });
+                                        sink.send(Message::Text(send(WorkerMessage::JobAccepted(JobAcceptedMessage {
+                                            tenant: assign.tenant.clone(),
+                                            job_id: assign.job_id.clone(),
+                                        })))).await.context("failed to send jobAccepted")?;
+                                        tokio::spawn(run_job(assign, cancel_rx, worker_tx.clone()));
+                                    }
+                                    ServerMessage::Cancel(cancel)
+                                        if in_flight.as_ref().map(|j| j.job_id.as_str())
+                                            == Some(cancel.job_id.as_str()) =>
+                                    {
+                                        if let Some(job) = in_flight.take() {
+                                            let _ = job.cancel.send(());
+                                        }
+                                    }
+                                    ServerMessage::Cancel(_) => {}
+                                    _ => {}
+                                }
                             }
                             Err(e) => tracing::warn!(error = %e, frame = %text, "unparseable frame from server"),
                         }
@@ -195,16 +238,24 @@ pub async fn run<H: ServerMessageHandler>(
     }
 }
 
-fn log_server_message(msg: &ServerMessage) {
+fn log_server_message(msg: &ServerMessage, allow_real_jobs: bool) {
     match msg {
         ServerMessage::JobAssign(assign) => {
-            tracing::warn!(
-                job_id = %assign.job_id,
-                kind = ?assign.kind,
-                frames = assign.duration_frames,
-                "← jobAssign — job execution not implemented in this supervisor version; \
-                 NOT accepting (job requeues on disconnect)"
-            );
+            if allow_real_jobs {
+                tracing::info!(
+                    job_id = %assign.job_id,
+                    kind = ?assign.kind,
+                    frames = assign.duration_frames,
+                    "← jobAssign — accepting real job"
+                );
+            } else {
+                tracing::warn!(
+                    job_id = %assign.job_id,
+                    kind = ?assign.kind,
+                    frames = assign.duration_frames,
+                    "← jobAssign — real jobs disabled; NOT accepting"
+                );
+            }
         }
         ServerMessage::Ping(_) => tracing::debug!("← ping"),
         ServerMessage::Cancel(c) => tracing::info!(job_id = %c.job_id, "← cancel"),
@@ -331,7 +382,7 @@ mod tests {
             .await
             .unwrap();
         ws.send(Message::Text(
-            r#"{"type":"jobAssign","tenant":"driffs","jobId":"job-render-x","kind":"gpu","durationFrames":10,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#.into(),
+            r#"{"type":"jobAssign","tenant":"driffs","jobId":"job-render-x","kind":"gpu","durationFrames":10,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#.into(),
         ))
         .await
         .unwrap();
