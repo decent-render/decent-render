@@ -47,7 +47,7 @@ pub struct JobStatus {
     pub phase: JobPhase,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeIdentity {
     pub chip: String,
@@ -68,7 +68,7 @@ impl NodeIdentity {
 }
 
 /// The complete observable state snapshot. Pushed via `watch` on every change.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupervisorStatus {
     pub connection: ConnectionState,

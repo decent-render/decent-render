@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/supervisor-core", "bins/decent-node"]
+members = ["crates/supervisor-core", "bins/decent-node", "apps/decent-app/src-tauri"]
 
 [workspace.package]
 edition = "2021"

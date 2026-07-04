@@ -1,0 +1,1 @@
+{"identifier":"com.decent-render.app","productName":"Decent Render","version":"0.0.1","build":{"frontendDist":"../dist","devUrl":"http://localhost:1420","beforeDevCommand":"bun run dev","beforeBuildCommand":"bun run build"},"app":{"windows":[{"title":"Decent Render","width":900,"height":700,"resizable":true}],"security":{"csp":null}}}
