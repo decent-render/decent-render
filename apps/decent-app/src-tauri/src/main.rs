@@ -2,8 +2,8 @@
 //!
 //! Bridges supervisor-core to the webview. The supervisor connection runs in
 //! a background tokio task; status updates and log lines flow to the UI via
-//! Tauri events. UI commands (start, stop, toggle) flow back through the
-//! shared Observability bundle.
+//! Tauri events via proper async forwarder tasks (no polling). UI commands
+//! (start, stop, toggle) flow back through the shared Observability bundle.
 //!
 //! This is the proof of "two skins, one core": the app drives the exact same
 //! `connection::run` as the CLI. The only difference is that channels are
@@ -33,7 +33,7 @@ struct AppState {
 }
 
 /// Persisted app config (dispatch URL + workdir + allow-real-jobs default).
-/// Token is handled separately (see AppConfigWithSecret below).
+/// The token is stored separately in the OS keychain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppConfig {
@@ -52,16 +52,6 @@ impl Default for AppConfig {
     }
 }
 
-/// Config including the token (for save/load only — never sent to the webview
-/// in plaintext).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AppConfigWithSecret {
-    #[serde(flatten)]
-    base: AppConfig,
-    token: String,
-}
-
 fn config_path() -> std::path::PathBuf {
     let dir = dirs_next::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -70,19 +60,37 @@ fn config_path() -> std::path::PathBuf {
     dir.join("config.json")
 }
 
-fn load_config() -> AppConfigWithSecret {
+fn load_config() -> AppConfig {
     match std::fs::read_to_string(config_path()) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => AppConfigWithSecret {
-            base: AppConfig::default(),
-            token: String::new(),
-        },
+        Err(_) => AppConfig::default(),
     }
 }
 
-fn save_config(config: &AppConfigWithSecret) {
+fn save_config(config: &AppConfig) {
     if let Ok(text) = serde_json::to_string_pretty(config) {
         let _ = std::fs::write(config_path(), text);
+    }
+}
+
+// ── Token storage (OS keychain via keyring crate) ──────────────────────────
+
+const KEYCHAIN_SERVICE: &str = "decent-render";
+const KEYCHAIN_USER: &str = "worker-token";
+
+fn load_token() -> String {
+    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER)
+        .and_then(|e| e.get_password())
+        .unwrap_or_default()
+}
+
+fn save_token(token: &str) {
+    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER) {
+        if token.is_empty() {
+            let _ = entry.delete_credential();
+        } else {
+            let _ = entry.set_password(token);
+        }
     }
 }
 
@@ -137,25 +145,30 @@ fn make_register(allow_real_jobs: bool) -> RegisterMessage {
 
 #[tauri::command]
 fn get_config() -> AppConfig {
-    load_config().base
+    load_config()
 }
 
 #[tauri::command]
 fn save_app_config(
     dispatch_url: String,
-    token: String,
     workdir_root: Option<String>,
     allow_real_jobs_default: bool,
 ) {
-    let config = AppConfigWithSecret {
-        base: AppConfig {
-            dispatch_url,
-            workdir_root,
-            allow_real_jobs_default,
-        },
-        token,
-    };
-    save_config(&config);
+    save_config(&AppConfig {
+        dispatch_url,
+        workdir_root,
+        allow_real_jobs_default,
+    });
+}
+
+#[tauri::command]
+fn get_token() -> String {
+    load_token()
+}
+
+#[tauri::command]
+fn save_token_cmd(token: String) {
+    save_token(&token);
 }
 
 #[tauri::command]
@@ -193,63 +206,66 @@ async fn start_connection(
     });
     state.obs.log(LogLine::info("Starting connection…"));
 
+    // Save token to keychain for next launch.
+    save_token(&token);
+
     let obs = state.obs.clone();
     let register = make_register(obs.allows_real_jobs());
     let config = ConnectionConfig::new(dispatch_url, token);
-    let app_handle = app.clone();
 
-    let handle = tokio::spawn(async move {
-        let obs_for_task = obs.clone();
-        let app_for_task = app_handle.clone();
-        // Spawn a forwarder for status changes → webview events.
-        let (status_tx, mut status_rx) = tokio::sync::watch::channel(obs_for_task.borrow_status());
-        let status_forward = tokio::spawn(async move {
-            while status_rx.has_changed().is_ok() || status_rx.changed().await.is_ok() {
-                let status = status_rx.borrow_and_update().clone();
-                let _ = app_for_task.emit("status-update", &status);
-            }
-        });
-        // We need to poll obs for changes and forward them. Since supervisor-core
-        // owns the watch sender, we poll on an interval.
-        drop(status_tx);
-        drop(status_forward);
-
-        // Instead of complex forwarding, poll obs on a timer.
-        let poll_app = app_handle.clone();
-        let poll_obs = obs_for_task.clone();
-        let poller = tokio::spawn(async move {
-            let mut last_status: Option<SupervisorStatus> = None;
-            let mut log_rx = poll_obs.log_tx.as_ref().map(|tx| tx.subscribe());
-            loop {
-                let current = poll_obs.borrow_status();
-                if last_status.as_ref() != Some(&current) {
-                    last_status = Some(current.clone());
-                    let _ = poll_app.emit("status-update", &current);
-                }
-                // Forward any new log lines.
-                if let Some(ref mut rx) = log_rx {
-                    while let Ok(line) = rx.try_recv() {
-                        let _ = poll_app.emit("log-line", &line);
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        });
-
-        let handler = &mut |_: &supervisor_core::protocol::ServerMessage| {};
-        let result = connection::run(&config, &register, handler, &obs_for_task).await;
-        match result {
-            Ok(()) => {
-                obs_for_task.log(LogLine::info("Connection closed"));
-            }
-            Err(e) => {
-                obs_for_task.log(LogLine::error(format!("Connection error: {e}")));
-            }
+    // Spawn two forwarder tasks: one for status, one for logs.
+    // Each consumes its own receiver — no polling, no duplication.
+    let status_app = app.clone();
+    let status_rx = obs.status_tx.as_ref().map(|tx| tx.subscribe());
+    let status_forward = tokio::spawn(async move {
+        let mut rx = match status_rx {
+            Some(rx) => rx,
+            None => return,
+        };
+        // Emit initial snapshot.
+        let _ = status_app.emit("status-update", &*rx.borrow());
+        while rx.changed().await.is_ok() {
+            let status = rx.borrow_and_update().clone();
+            let _ = status_app.emit("status-update", &status);
         }
-        poller.abort();
     });
 
-    *handle_guard = Some(handle);
+    let log_app = app.clone();
+    let log_rx = obs.log_tx.as_ref().map(|tx| tx.subscribe());
+    let log_forward = tokio::spawn(async move {
+        let mut rx = match log_rx {
+            Some(rx) => rx,
+            None => return,
+        };
+        while let Ok(line) = rx.recv().await {
+            let _ = log_app.emit("log-line", &line);
+        }
+    });
+
+    let handle = tokio::spawn(async move {
+        let result = connection::run(&config, &register, &obs).await;
+        match result {
+            Ok(()) => {
+                obs.log(LogLine::info("Connection closed"));
+            }
+            Err(e) => {
+                obs.log(LogLine::error(format!("Connection error: {e}")));
+            }
+        }
+        // Forwarders exit when the status/log senders are dropped (which won't
+        // happen here since obs lives in AppState). Aborting them explicitly
+        // would break reconnection; instead they sit idle waiting for the next
+        // connection.
+    });
+
+    // When the connection task finishes, clean up forwarders.
+    let forward_guard = tokio::spawn(async move {
+        handle.await.ok();
+        status_forward.abort();
+        log_forward.abort();
+    });
+
+    *handle_guard = Some(forward_guard);
     Ok(())
 }
 
@@ -280,7 +296,7 @@ fn main() {
 
     // Load saved config and initialize allow flag.
     let saved = load_config();
-    obs.set_allow_real_jobs(saved.base.allow_real_jobs_default);
+    obs.set_allow_real_jobs(saved.allow_real_jobs_default);
 
     let app_state = AppState {
         obs,
@@ -293,6 +309,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_app_config,
+            get_token,
+            save_token_cmd,
             get_status,
             get_allow_real_jobs,
             set_allow_real_jobs,

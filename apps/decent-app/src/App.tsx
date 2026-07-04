@@ -86,7 +86,7 @@ export default function App() {
 	const [connecting, setConnecting] = useState(false);
 	const logEndRef = useRef<HTMLDivElement>(null);
 
-	// Load config on mount.
+	// Load config + token on mount.
 	useEffect(() => {
 		(async () => {
 			const cfg = await invoke<AppConfig>('get_config');
@@ -94,6 +94,7 @@ export default function App() {
 			setDispatchUrl(cfg.dispatchUrl);
 			setAllowRealJobs(await invoke<boolean>('get_allow_real_jobs'));
 			setStatus(await invoke<SupervisorStatus>('get_status'));
+			setToken(await invoke<string>('get_token'));
 		})();
 	}, []);
 
@@ -131,10 +132,10 @@ export default function App() {
 		setConnecting(true);
 		invoke('save_app_config', {
 			dispatchUrl,
-			token,
 			workdirRoot: null,
 			allowRealJobsDefault: allowRealJobs,
 		});
+		invoke('save_token_cmd', {token});
 		try {
 			await invoke('start_connection', {dispatchUrl, token});
 		} catch (e) {
