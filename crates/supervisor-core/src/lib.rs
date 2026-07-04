@@ -13,3 +13,4 @@ pub mod connection;
 pub mod protocol;
 pub mod purge;
 pub mod runner;
+pub mod status;

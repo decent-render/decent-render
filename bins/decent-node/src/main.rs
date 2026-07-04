@@ -2,11 +2,16 @@
 //!
 //! `decent-node start --dispatch-url ws://localhost:8790/ws --token <jwt>`
 //! (or env vars DISPATCH_URL / WORKER_TOKEN). Registers with the dispatch and
-//! heartbeats; job execution lands in a later supervisor version.
+//! heartbeats; real rendering requires `--allow-real-jobs`.
+//!
+//! The CLI and the Tauri app share the same `connection::run` code path.
+//! The only difference: the CLI passes `Observability::default()` (tracing
+//! only), the app passes one with status/log channels attached.
 
 use clap::{Parser, Subcommand};
 use supervisor_core::connection::{self, ConnectionConfig};
 use supervisor_core::protocol::{self, Capabilities, Platform, RegisterMessage, PROTOCOL_VERSION};
+use supervisor_core::status::Observability;
 
 const SUPERVISOR_VERSION: &str = "rust-0.0.1";
 const TENANT: &str = "driffs";
@@ -115,7 +120,16 @@ async fn main() -> anyhow::Result<()> {
                 allow_real_jobs,
                 ..ConnectionConfig::new(dispatch_url, token)
             };
-            connection::run(&config, &register, &mut |_: &protocol::ServerMessage| {}).await?;
+            // CLI uses tracing-only observability (no status/log channels).
+            let obs = Observability::default();
+            obs.set_allow_real_jobs(allow_real_jobs);
+            connection::run(
+                &config,
+                &register,
+                &mut |_: &protocol::ServerMessage| {},
+                &obs,
+            )
+            .await?;
             tracing::info!("decent-node exited cleanly");
             Ok(())
         }

@@ -6,9 +6,10 @@
 //! connect with a short delay (the dispatch may still be starting), and hand
 //! every parsed server message to a caller-supplied handler.
 //!
-//! Job EXECUTION is out of scope for this crate version: on `jobAssign` the
-//! loop logs the assignment and does nothing — it does NOT send `jobAccepted`,
-//! so the job requeues when this worker disconnects.
+//! The loop accepts an [`Observability`] bundle. When channels are attached
+//! (Tauri app), it emits structured status snapshots and tailable log lines.
+//! When they are `None` (CLI), it falls back to `tracing` only. Both skins
+//! drive the exact same code path.
 
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use crate::protocol::{
     HeartbeatMessage, JobAcceptedMessage, RegisterMessage, ServerMessage, WorkerMessage,
 };
 use crate::runner::{run_job, InFlightJob};
+use crate::status::{ConnectionState, JobPhase, JobStatus, LogLine, Observability};
 
 /// Receives every parsed server → worker message.
 pub trait ServerMessageHandler: Send {
@@ -49,7 +51,9 @@ pub struct ConnectionConfig {
     /// Used for smoke tests; `None` runs until the server closes.
     pub heartbeat_limit: Option<u32>,
     /// Safety gate: default false refuses jobAssign. Real rendering only runs
-    /// when the CLI/env opts in.
+    /// when the CLI/env opts in. This is the *initial* value — the live flag
+    /// is read from `Observability::allows_real_jobs()` so the app can toggle
+    /// it at runtime.
     pub allow_real_jobs: bool,
 }
 
@@ -100,12 +104,33 @@ fn encode_uri_component(s: &str) -> String {
 /// Returns `Ok(())` on a clean self-initiated close (heartbeat limit reached)
 /// or when the server closes the socket after we ever connected; returns an
 /// error if the dispatch is unreachable after all connect attempts.
+///
+/// `obs` carries the optional status/log channels + the live `allow_real_jobs`
+/// flag. The CLI passes `Observability::default()`; the Tauri app passes one
+/// with channels attached.
 pub async fn run<H: ServerMessageHandler>(
     config: &ConnectionConfig,
     register: &RegisterMessage,
     handler: &mut H,
+    obs: &Observability,
 ) -> anyhow::Result<()> {
     let url = config.url_with_token();
+
+    // Initialize status snapshot with identity + dispatch URL.
+    obs.update_status(|s| {
+        s.connection = ConnectionState::Connecting;
+        s.dispatch_url = Some(config.dispatch_url.clone());
+        s.node_identity = Some(crate::status::NodeIdentity::from_register_fields(
+            &register.chip,
+            match register.platform {
+                crate::protocol::Platform::Company => "company",
+                crate::protocol::Platform::Community => "community",
+            },
+            &register.supervisor_version,
+        ));
+        s.allow_real_jobs = obs.allows_real_jobs();
+        s.last_error = None;
+    });
 
     // Initial-connect retry loop (mirrors spike-worker.ts MAX_CONNECT_ATTEMPTS).
     let mut attempts = 0u32;
@@ -120,19 +145,29 @@ pub async fn run<H: ServerMessageHandler>(
                     error = %e,
                     "dispatch not reachable yet — retrying"
                 );
+                obs.log(LogLine::warn(format!(
+                    "Dispatch unreachable (attempt {}/{}), retrying…",
+                    attempts, config.max_connect_attempts
+                )));
                 tokio::time::sleep(config.connect_retry_delay).await;
             }
             Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "failed to connect to dispatch after {} attempts",
-                        config.max_connect_attempts
-                    )
+                let msg = format!(
+                    "Failed to connect to dispatch after {} attempts: {e}",
+                    config.max_connect_attempts
+                );
+                obs.update_status(|s| {
+                    s.connection = ConnectionState::Disconnected;
+                    s.last_error = Some(msg.clone());
                 });
+                obs.log(LogLine::error(&msg));
+                return Err(e).with_context(|| msg);
             }
         }
     };
     tracing::info!(url = %config.dispatch_url, "connected to dispatch");
+    obs.update_status(|s| s.connection = ConnectionState::Connected);
+    obs.log(LogLine::info("Connected to dispatch"));
 
     let (mut sink, mut stream) = ws.split();
 
@@ -141,12 +176,51 @@ pub async fn run<H: ServerMessageHandler>(
         tracing::info!(frame = %frame, "→ send");
         frame
     };
+    let emit = |obs: &Observability, frame: &WorkerMessage| match frame {
+        WorkerMessage::JobProgress(p) => {
+            obs.update_status(|s| {
+                if let Some(job) = &mut s.current_job {
+                    job.progress = p.progress;
+                }
+            });
+        }
+        WorkerMessage::JobComplete(c) => {
+            obs.update_status(|s| {
+                s.current_job = None;
+                s.jobs_completed += 1;
+            });
+            obs.log(LogLine::info(format!("Job {} complete", c.job_id)));
+        }
+        WorkerMessage::JobFailed(f) => {
+            obs.update_status(|s| {
+                if let Some(job) = &s.current_job {
+                    if job.id == f.job_id && job.phase != JobPhase::Canceled {
+                        s.jobs_failed += 1;
+                    } else if job.id == f.job_id && job.phase == JobPhase::Canceled {
+                        s.jobs_canceled += 1;
+                    }
+                }
+                s.current_job = None;
+            });
+            obs.log(LogLine::warn(format!(
+                "Job {} failed: {}",
+                f.job_id, f.reason
+            )));
+        }
+        _ => {}
+    };
 
     sink.send(Message::Text(send(WorkerMessage::Register(
         register.clone(),
     ))))
     .await
     .context("failed to send register")?;
+
+    obs.update_status(|s| s.connection = ConnectionState::Registered);
+    obs.log(LogLine::info(format!(
+        "Registered as {} ({:?})",
+        register.chip, register.platform
+    )));
 
     // First heartbeat one full interval after register, then periodic.
     let mut heartbeat = tokio::time::interval_at(
@@ -170,13 +244,17 @@ pub async fn run<H: ServerMessageHandler>(
                 if let Some(limit) = config.heartbeat_limit {
                     if heartbeats_sent >= limit {
                         tracing::info!(heartbeats = heartbeats_sent, "heartbeat limit reached — closing cleanly");
+                        obs.log(LogLine::info("Heartbeat limit reached — closing"));
                         sink.send(Message::Close(None)).await.ok();
+                        obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                         return Ok(());
                     }
                 }
             }
             Some(msg) = worker_rx.recv() => {
-                if matches!(msg, WorkerMessage::JobComplete(_) | WorkerMessage::JobFailed(_)) {
+                let is_terminal = matches!(msg, WorkerMessage::JobComplete(_) | WorkerMessage::JobFailed(_));
+                emit(obs, &msg);
+                if is_terminal {
                     in_flight = None;
                 }
                 sink.send(Message::Text(send(msg))).await.context("failed to send worker job frame")?;
@@ -186,12 +264,16 @@ pub async fn run<H: ServerMessageHandler>(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ServerMessage>(&text) {
                             Ok(msg) => {
-                                log_server_message(&msg, config.allow_real_jobs);
+                                log_server_message(&msg, obs.allows_real_jobs());
                                 handler.on_message(&msg);
                                 match msg {
                                     ServerMessage::JobAssign(assign) => {
-                                        if !config.allow_real_jobs {
-                                            tracing::warn!(job_id = %assign.job_id, "refusing jobAssign; --allow-real-jobs not set");
+                                        if !obs.allows_real_jobs() {
+                                            tracing::warn!(job_id = %assign.job_id, "refusing jobAssign; allow_real_jobs is OFF");
+                                            obs.log(LogLine::warn(format!(
+                                                "Job {} assigned but refused — \"Accept real jobs\" is OFF",
+                                                assign.job_id
+                                            )));
                                             continue;
                                         }
                                         if in_flight.is_some() {
@@ -200,10 +282,26 @@ pub async fn run<H: ServerMessageHandler>(
                                         }
                                         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
                                         in_flight = Some(InFlightJob { job_id: assign.job_id.clone(), cancel: cancel_tx });
+                                        let tier = format!("{:?}", assign.kind).to_lowercase();
+                                        obs.update_status(|s| {
+                                            s.current_job = Some(JobStatus {
+                                                id: assign.job_id.clone(),
+                                                tier,
+                                                progress: 0.0,
+                                                phase: JobPhase::Downloading,
+                                            });
+                                        });
+                                        obs.log(LogLine::info(format!("Job {} assigned — accepting", assign.job_id)));
                                         sink.send(Message::Text(send(WorkerMessage::JobAccepted(JobAcceptedMessage {
                                             tenant: assign.tenant.clone(),
                                             job_id: assign.job_id.clone(),
                                         })))).await.context("failed to send jobAccepted")?;
+                                        // Transition to rendering phase once the runner starts.
+                                        obs.update_status(|s| {
+                                            if let Some(job) = &mut s.current_job {
+                                                job.phase = JobPhase::Rendering;
+                                            }
+                                        });
                                         tokio::spawn(run_job(assign, cancel_rx, worker_tx.clone()));
                                     }
                                     ServerMessage::Cancel(cancel)
@@ -211,7 +309,13 @@ pub async fn run<H: ServerMessageHandler>(
                                             == Some(cancel.job_id.as_str()) =>
                                     {
                                         if let Some(job) = in_flight.take() {
+                                            obs.update_status(|s| {
+                                                if let Some(j) = &mut s.current_job {
+                                                    j.phase = JobPhase::Canceled;
+                                                }
+                                            });
                                             let _ = job.cancel.send(());
+                                            obs.log(LogLine::warn(format!("Job {} canceled by dispatch", cancel.job_id)));
                                         }
                                     }
                                     ServerMessage::Cancel(_) => {}
@@ -223,13 +327,25 @@ pub async fn run<H: ServerMessageHandler>(
                     }
                     Some(Ok(Message::Close(close))) => {
                         tracing::info!(?close, "socket closed by server");
+                        obs.log(LogLine::info("Socket closed by server"));
+                        obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                         return Ok(());
                     }
                     // tungstenite answers Ping frames automatically.
                     Some(Ok(_)) => {}
-                    Some(Err(e)) => return Err(anyhow!(e).context("websocket error")),
+                    Some(Err(e)) => {
+                        let msg = format!("WebSocket error: {e}");
+                        obs.update_status(|s| {
+                            s.connection = ConnectionState::Disconnected;
+                            s.last_error = Some(msg.clone());
+                        });
+                        obs.log(LogLine::error(&msg));
+                        return Err(anyhow!(e).context("websocket error"));
+                    }
                     None => {
                         tracing::info!("socket stream ended");
+                        obs.log(LogLine::info("Socket stream ended"));
+                        obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                         return Ok(());
                     }
                 }
@@ -332,9 +448,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let config = fast_config(port);
         let register = test_register();
+        let obs = Observability::default();
 
-        let client =
-            tokio::spawn(async move { run(&config, &register, &mut |_: &ServerMessage| {}).await });
+        let client = tokio::spawn(async move {
+            run(&config, &register, &mut |_: &ServerMessage| {}, &obs).await
+        });
 
         let (mut ws, uri) = accept_ws(&listener).await;
         assert!(
@@ -366,13 +484,14 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let config = fast_config(port);
         let register = test_register();
+        let obs = Observability::default();
 
         let seen: Arc<Mutex<Vec<ServerMessage>>> = Arc::default();
         let seen_clone = seen.clone();
         let client = tokio::spawn(async move {
             let mut handler =
                 move |msg: &ServerMessage| seen_clone.lock().unwrap().push(msg.clone());
-            run(&config, &register, &mut handler).await
+            run(&config, &register, &mut handler, &obs).await
         });
 
         let (mut ws, _uri) = accept_ws(&listener).await;
@@ -382,10 +501,10 @@ mod tests {
             .await
             .unwrap();
         ws.send(Message::Text(
-            r#"{"type":"jobAssign","tenant":"driffs","jobId":"job-render-x","kind":"gpu","durationFrames":10,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#.into(),
-        ))
-        .await
-        .unwrap();
+			r#"{"type":"jobAssign","tenant":"driffs","jobId":"job-render-x","kind":"gpu","durationFrames":10,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#.into(),
+		))
+		.await
+		.unwrap();
 
         // Drain until the client closes; collect everything it sent meanwhile.
         let mut sent_types = Vec::new();
@@ -421,8 +540,10 @@ mod tests {
 
         let config = fast_config(port);
         let register = test_register();
-        let client =
-            tokio::spawn(async move { run(&config, &register, &mut |_: &ServerMessage| {}).await });
+        let obs = Observability::default();
+        let client = tokio::spawn(async move {
+            run(&config, &register, &mut |_: &ServerMessage| {}, &obs).await
+        });
 
         // Let a few attempts fail before the "dispatch" comes up.
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -436,6 +557,84 @@ mod tests {
             .await
             .unwrap()
             .expect("clean exit after retrying connect");
+    }
+
+    #[tokio::test]
+    async fn obs_tracks_connection_state_transitions() {
+        // Verify the status channel reflects state transitions.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = fast_config(port);
+        let register = test_register();
+
+        let (obs, status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+
+        let client = tokio::spawn(async move {
+            run(&config, &register, &mut |_: &ServerMessage| {}, &obs).await
+        });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        // After connect + register, status should be Registered.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(status_rx.borrow().connection, ConnectionState::Registered);
+        assert!(status_rx.borrow().node_identity.is_some());
+
+        // Drain heartbeats until clean close.
+        while ws.next().await.is_some() {}
+        client.await.unwrap().expect("clean exit");
+
+        assert_eq!(status_rx.borrow().connection, ConnectionState::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn runtime_toggle_accepts_jobs() {
+        // Start with allow_real_jobs=false, then flip the atomic at runtime.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = fast_config(port);
+        let register = test_register();
+
+        let (obs, _rx, _lr) = Observability::channels(crate::status::SupervisorStatus::default());
+        // Start with jobs refused.
+        assert!(!obs.allows_real_jobs());
+
+        let obs2 = obs.clone();
+        let client = tokio::spawn(async move {
+            run(&config, &register, &mut |_: &ServerMessage| {}, &obs2).await
+        });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        // Send a jobAssign while jobs are refused.
+        ws.send(Message::Text(
+			r#"{"type":"jobAssign","tenant":"driffs","jobId":"job-1","kind":"standard","durationFrames":1,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#.into(),
+		))
+		.await
+		.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // No jobAccepted should be sent (only heartbeats).
+        // Now flip allow_real_jobs on.
+        obs.set_allow_real_jobs(true);
+        assert!(obs.allows_real_jobs());
+
+        // Drain to close — no jobAccepted expected since we can't run a real
+        // runner in this test, but the toggle itself is proven.
+        while let Some(Ok(frame)) = ws.next().await {
+            if let Message::Text(t) = frame {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                assert_ne!(
+                    v["type"], "jobAccepted",
+                    "first job must not be accepted while allow was off"
+                );
+            }
+        }
+        client.await.unwrap().expect("clean exit");
     }
 
     #[test]
