@@ -21,15 +21,25 @@ use supervisor_core::connection::{self, ConnectionConfig};
 use supervisor_core::protocol::{Capabilities, Platform, RegisterMessage, PROTOCOL_VERSION};
 use supervisor_core::status::{ConnectionState, LogLine, Observability, SupervisorStatus};
 use tauri::{Emitter, State};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 const SUPERVISOR_VERSION: &str = "rust-0.0.1-app";
 const TENANT: &str = "driffs";
 
-/// App state: the observability bundle + a handle to abort the connection task.
+/// App state: the observability bundle + a handle to the connection task.
 struct AppState {
     obs: Observability,
-    conn_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    conn: Arc<Mutex<Option<ConnectionHandle>>>,
+}
+
+/// Tracks the connection task + its shutdown signal + forwarder tasks.
+/// On Stop, we fire the shutdown signal first (graceful), then abort
+/// everything and clear the mutex so a fresh Start always succeeds.
+struct ConnectionHandle {
+    shutdown: Option<oneshot::Sender<()>>,
+    conn_task: tokio::task::JoinHandle<()>,
+    status_forward: tokio::task::JoinHandle<()>,
+    log_forward: tokio::task::JoinHandle<()>,
 }
 
 /// Persisted app config (dispatch URL + workdir + allow-real-jobs default).
@@ -193,8 +203,8 @@ async fn start_connection(
     dispatch_url: String,
     token: String,
 ) -> Result<(), String> {
-    let mut handle_guard = state.conn_handle.lock().await;
-    if handle_guard.is_some() {
+    let mut conn_guard = state.conn.lock().await;
+    if conn_guard.is_some() {
         return Err("Connection already running".into());
     }
 
@@ -212,9 +222,9 @@ async fn start_connection(
     let obs = state.obs.clone();
     let register = make_register(obs.allows_real_jobs());
     let config = ConnectionConfig::new(dispatch_url, token);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     // Spawn two forwarder tasks: one for status, one for logs.
-    // Each consumes its own receiver — no polling, no duplication.
     let status_app = app.clone();
     let status_rx = obs.status_tx.as_ref().map(|tx| tx.subscribe());
     let status_forward = tokio::spawn(async move {
@@ -222,7 +232,6 @@ async fn start_connection(
             Some(rx) => rx,
             None => return,
         };
-        // Emit initial snapshot.
         let _ = status_app.emit("status-update", &*rx.borrow());
         while rx.changed().await.is_ok() {
             let status = rx.borrow_and_update().clone();
@@ -242,38 +251,44 @@ async fn start_connection(
         }
     });
 
-    let handle = tokio::spawn(async move {
-        let result = connection::run(&config, &register, &obs).await;
+    // Spawn the connection task. On exit, it logs the result.
+    let conn_obs = obs.clone();
+    let conn_task = tokio::spawn(async move {
+        let result = connection::run(&config, &register, &conn_obs, shutdown_rx).await;
         match result {
             Ok(()) => {
-                obs.log(LogLine::info("Connection closed"));
+                conn_obs.log(LogLine::info("Connection closed"));
             }
             Err(e) => {
-                obs.log(LogLine::error(format!("Connection error: {e}")));
+                conn_obs.log(LogLine::error(format!("Connection error: {e}")));
             }
         }
-        // Forwarders exit when the status/log senders are dropped (which won't
-        // happen here since obs lives in AppState). Aborting them explicitly
-        // would break reconnection; instead they sit idle waiting for the next
-        // connection.
     });
 
-    // When the connection task finishes, clean up forwarders.
-    let forward_guard = tokio::spawn(async move {
-        handle.await.ok();
-        status_forward.abort();
-        log_forward.abort();
+    *conn_guard = Some(ConnectionHandle {
+        shutdown: Some(shutdown_tx),
+        conn_task,
+        status_forward,
+        log_forward,
     });
-
-    *handle_guard = Some(forward_guard);
     Ok(())
 }
 
 #[tauri::command]
 async fn stop_connection(state: State<'_, AppState>) -> Result<(), String> {
-    let mut handle_guard = state.conn_handle.lock().await;
-    if let Some(handle) = handle_guard.take() {
-        handle.abort();
+    let mut conn_guard = state.conn.lock().await;
+    if let Some(handle) = conn_guard.take() {
+        // Graceful: fire shutdown signal so connection::run closes the socket,
+        // cancels any in-flight job (SIGTERM runner → purge workdir), and returns.
+        if let Some(shutdown) = handle.shutdown {
+            let _ = shutdown.send(());
+        }
+        // Give the connection task a moment to process the shutdown signal,
+        // then abort all tasks as cleanup.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.conn_task.abort();
+        handle.status_forward.abort();
+        handle.log_forward.abort();
         state.obs.update_status(|s| {
             s.connection = ConnectionState::Disconnected;
             s.current_job = None;
@@ -300,7 +315,7 @@ fn main() {
 
     let app_state = AppState {
         obs,
-        conn_handle: Arc::new(Mutex::new(None)),
+        conn: Arc::new(Mutex::new(None)),
     };
 
     tauri::Builder::default()

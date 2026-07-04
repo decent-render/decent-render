@@ -123,7 +123,9 @@ async fn main() -> anyhow::Result<()> {
             // CLI uses tracing-only observability (no status/log channels).
             let obs = Observability::default();
             obs.set_allow_real_jobs(allow_real_jobs);
-            connection::run(&config, &register, &obs).await?;
+            // CLI never signals shutdown — runs until heartbeat-limit or server close.
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            connection::run(&config, &register, &obs, shutdown_rx).await?;
             tracing::info!("decent-node exited cleanly");
             Ok(())
         }

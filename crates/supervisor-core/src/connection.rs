@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::oneshot;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -93,18 +94,25 @@ fn encode_uri_component(s: &str) -> String {
 
 /// Connect, register, heartbeat, and process server messages.
 ///
-/// Returns `Ok(())` on a clean self-initiated close (heartbeat limit reached)
-/// or when the server closes the socket after we ever connected; returns an
-/// error if the dispatch is unreachable after all connect attempts.
+/// Returns `Ok(())` on a clean self-initiated close (heartbeat limit reached,
+/// shutdown signal, or server close) or when the server closes the socket after
+/// we ever connected; returns an error if the dispatch is unreachable after all
+/// connect attempts.
 ///
 /// `obs` is the sole observation surface. The CLI passes
 /// `Observability::default()` (tracing-only); the Tauri app passes one with
 /// status/log channels attached. There is no handler callback — everything
 /// the caller needs to observe flows through `obs`.
+///
+/// `shutdown` is a oneshot receiver that triggers graceful shutdown: cancels
+/// any in-flight job (SIGTERM runner → purge workdir), sends a Close frame,
+/// and returns `Ok(())`. The CLI never fires it (runs to completion); the
+/// Tauri app fires it from the Stop button.
 pub async fn run(
     config: &ConnectionConfig,
     register: &RegisterMessage,
     obs: &Observability,
+    mut shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     let url = config.url_with_token();
 
@@ -226,6 +234,26 @@ pub async fn run(
     loop {
         let current_job_count = u32::from(in_flight.is_some());
         tokio::select! {
+            // Graceful shutdown: cancel in-flight job, close socket, exit.
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received — closing connection");
+                obs.log(LogLine::info("Shutting down connection…"));
+                if let Some(job) = in_flight.take() {
+                    obs.update_status(|s| {
+                        if let Some(j) = &mut s.current_job {
+                            j.phase = JobPhase::Canceled;
+                        }
+                    });
+                    let _ = job.cancel.send(());
+                    obs.log(LogLine::warn(
+                        "In-flight job canceled by shutdown — workdir purged".to_string(),
+                    ));
+                }
+                sink.send(Message::Close(None)).await.ok();
+                obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                obs.log(LogLine::info("Connection closed"));
+                return Ok(());
+            }
             _ = heartbeat.tick() => {
                 let msg = WorkerMessage::Heartbeat(HeartbeatMessage {
                     tenant: register.tenant.clone(),
@@ -382,6 +410,26 @@ mod tests {
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
     use tokio_tungstenite::WebSocketStream;
 
+    /// Create a shutdown receiver that never fires (tests use heartbeat_limit
+    /// or server close for clean exit instead). mem::forget the sender so the
+    /// oneshot never resolves to Err(Closed).
+    fn never_shutdown() -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        std::mem::forget(tx);
+        rx
+    }
+
+    /// Config with no heartbeat limit — runs until shutdown or server close.
+    fn long_config(port: u16) -> ConnectionConfig {
+        ConnectionConfig {
+            heartbeat_interval: Duration::from_millis(50),
+            max_connect_attempts: 20,
+            connect_retry_delay: Duration::from_millis(50),
+            heartbeat_limit: None,
+            ..ConnectionConfig::new(format!("ws://127.0.0.1:{port}/ws"), "test-jwt.token")
+        }
+    }
+
     fn test_register() -> RegisterMessage {
         RegisterMessage {
             tenant: "driffs".into(),
@@ -440,7 +488,8 @@ mod tests {
         let register = test_register();
         let obs = Observability::default();
 
-        let client = tokio::spawn(async move { run(&config, &register, &obs).await });
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs, never_shutdown()).await });
 
         let (mut ws, uri) = accept_ws(&listener).await;
         assert!(
@@ -474,7 +523,8 @@ mod tests {
         let register = test_register();
         let obs = Observability::default();
 
-        let client = tokio::spawn(async move { run(&config, &register, &obs).await });
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs, never_shutdown()).await });
 
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
@@ -515,7 +565,8 @@ mod tests {
         let config = fast_config(port);
         let register = test_register();
         let obs = Observability::default();
-        let client = tokio::spawn(async move { run(&config, &register, &obs).await });
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs, never_shutdown()).await });
 
         // Let a few attempts fail before the "dispatch" comes up.
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -542,7 +593,8 @@ mod tests {
         let (obs, status_rx, _log_rx) =
             Observability::channels(crate::status::SupervisorStatus::default());
 
-        let client = tokio::spawn(async move { run(&config, &register, &obs).await });
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs, never_shutdown()).await });
 
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
@@ -571,7 +623,8 @@ mod tests {
         let (obs, status_rx, mut log_rx) =
             Observability::channels(crate::status::SupervisorStatus::default());
 
-        let client = tokio::spawn(async move { run(&config, &register, &obs).await });
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs, never_shutdown()).await });
 
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
@@ -614,7 +667,8 @@ mod tests {
         assert!(!obs.allows_real_jobs());
 
         let obs2 = obs.clone();
-        let client = tokio::spawn(async move { run(&config, &register, &obs2).await });
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
 
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
@@ -645,6 +699,41 @@ mod tests {
             }
         }
         client.await.unwrap().expect("clean exit");
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_closes_socket_gracefully() {
+        // Fire the shutdown signal and verify: socket closes cleanly,
+        // status goes to Disconnected, no panic.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+
+        let (obs, status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let obs2 = obs.clone();
+        let client = tokio::spawn(async move { run(&config, &register, &obs2, shutdown_rx).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        // Wait until registered.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(status_rx.borrow().connection, ConnectionState::Registered);
+
+        // Fire shutdown.
+        let _ = shutdown_tx.send(());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Status should be Disconnected.
+        assert_eq!(status_rx.borrow().connection, ConnectionState::Disconnected);
+
+        // Connection task should exit cleanly.
+        client.await.unwrap().expect("clean exit on shutdown");
     }
 
     #[test]
