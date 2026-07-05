@@ -181,6 +181,14 @@ fn save_token_cmd(token: String) {
     save_token(&token);
 }
 
+/// Open the system browser to the driffs device pairing page.
+/// The user creates a token there, copies it, and pastes it back into the app.
+#[tauri::command]
+async fn open_pairing_page(app_url: String) -> Result<(), String> {
+    let url = format!("{}/settings/devices", app_url.trim_end_matches('/'));
+    open::that(&url).map_err(|e| format!("Failed to open browser: {e}"))
+}
+
 #[tauri::command]
 fn get_status(state: State<'_, AppState>) -> SupervisorStatus {
     state.obs.borrow_status()
@@ -326,6 +334,7 @@ fn main() {
             save_app_config,
             get_token,
             save_token_cmd,
+            open_pairing_page,
             get_status,
             get_allow_real_jobs,
             set_allow_real_jobs,

@@ -171,6 +171,24 @@ button:disabled {
 	color: #fff;
 }
 
+.pair-device {
+	margin-top: 12px;
+	padding-top: 12px;
+	border-top: 1px solid var(--border);
+}
+
+.btn-link {
+	background: transparent;
+	color: var(--accent);
+	padding: 4px 0;
+	font-size: 13px;
+	text-decoration: none;
+}
+
+.btn-link:hover {
+	text-decoration: underline;
+}
+
 .toggle {
 	display: flex;
 	align-items: center;

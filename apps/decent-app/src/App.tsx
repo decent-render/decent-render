@@ -154,6 +154,16 @@ export default function App() {
 		await invoke('set_allow_real_jobs', {value});
 	}, []);
 
+	const handlePairDevice = useCallback(async () => {
+		// Extract the origin from the dispatch URL to construct the app URL.
+		// ws://localhost:8790/ws → http://localhost:5173 (driffs dev server)
+		// In production this would be the driffs domain.
+		const appUrl = dispatchUrl.startsWith('ws://localhost')
+			? 'http://localhost:5173'
+			: dispatchUrl.replace(/^ws/, 'http').replace(/:\d+\/ws$/, ':5173');
+		await invoke('open_pairing_page', {appUrl});
+	}, [dispatchUrl]);
+
 	const isConnected = status?.connection === 'connected' || status?.connection === 'registered';
 	const currentJob = status?.currentJob;
 
@@ -207,6 +217,16 @@ export default function App() {
 						Stop
 					</button>
 				</div>
+				{!isConnected && (
+					<div className="pair-device">
+						<button className="btn-link" onClick={handlePairDevice}>
+							Connect this Mac →
+						</button>
+						<span className="hint">
+							Opens your browser to create a device token. Copy it back here.
+						</span>
+					</div>
+				)}
 			</section>
 
 			{/* Controls */}

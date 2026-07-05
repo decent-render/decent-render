@@ -652,6 +652,7 @@ version = "0.0.1"
 dependencies = [
  "dirs-next",
  "keyring",
+ "open",
  "serde",
  "serde_json",
  "supervisor-core",
