@@ -290,6 +290,12 @@ export default function App() {
 				</div>
 			</section>
 
+			{/* Earnings */}
+			<section className="card">
+				<h2>Earnings</h2>
+				<EarningsPanel dispatchUrl={dispatchUrl} />
+			</section>
+
 			{/* Log tail */}
 			<section className="card log-section">
 				<h2>Log Tail</h2>
@@ -311,6 +317,68 @@ export default function App() {
 			<footer className="footer">
 				<span>Purge rule enforced by core — the app cannot bypass workdir deletion.</span>
 			</footer>
+		</div>
+	);
+}
+
+// ── Earnings Panel ──────────────────────────────────────────────────────────
+
+interface EarningsData {
+	totals: {pending: number; credited: number; voided: number};
+	earnedBalance: number;
+	reputation: {
+		jobsCompleted: number;
+		verificationsPassed: number;
+		verificationsFailed: number;
+		consecutivePasses: number;
+		isBanned: boolean;
+	} | null;
+}
+
+function EarningsPanel({dispatchUrl}: {dispatchUrl: string}) {
+	const [data, setData] = useState<EarningsData | null>(null);
+	const [error, setError] = useState<string | null>(null);
+
+	const load = useCallback(async () => {
+		const appUrl = dispatchUrl.startsWith('ws://localhost')
+			? 'http://localhost:5173'
+			: dispatchUrl.replace(/^ws/, 'http').replace(/:\d+\/ws$/, ':5173');
+		try {
+			const json = await invoke<string>('fetch_earnings', {appUrl});
+			setData(JSON.parse(json));
+			setError(null);
+		} catch (e) {
+			setError(String(e));
+		}
+	}, [dispatchUrl]);
+
+	useEffect(() => {
+		load();
+		const interval = setInterval(load, 30_000);
+		return () => clearInterval(interval);
+	}, [load]);
+
+	if (error) {
+		return <div className="empty-state">{error}</div>;
+	}
+	if (!data) {
+		return <div className="empty-state">Loading…</div>;
+	}
+
+	return (
+		<div className="stats">
+			<div className="stat">
+				<span className="stat-num green">{data.earnedBalance}</span>
+				<span className="stat-label">Earned (spendable)</span>
+			</div>
+			<div className="stat">
+				<span className="stat-num yellow">{data.totals.pending}</span>
+				<span className="stat-label">Pending</span>
+			</div>
+			<div className="stat">
+				<span className="stat-num">{data.reputation?.jobsCompleted ?? 0}</span>
+				<span className="stat-label">Jobs done</span>
+			</div>
 		</div>
 	);
 }

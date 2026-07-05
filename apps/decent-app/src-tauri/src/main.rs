@@ -158,6 +158,29 @@ fn get_config() -> AppConfig {
     load_config()
 }
 
+/// Fetch operator earnings from the driffs API using the stored worker token.
+/// Returns the JSON response body as a string (the frontend parses it).
+#[tauri::command]
+async fn fetch_earnings(app_url: String) -> Result<String, String> {
+    let url = format!("{}/api/operator-earnings", app_url.trim_end_matches('/'));
+    let token = load_token();
+    if token.is_empty() {
+        return Err("No token stored".into());
+    }
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.text()
+        .await
+        .map_err(|e| format!("Body read failed: {e}"))
+}
+
 #[tauri::command]
 fn save_app_config(
     dispatch_url: String,
@@ -335,6 +358,7 @@ fn main() {
             get_token,
             save_token_cmd,
             open_pairing_page,
+            fetch_earnings,
             get_status,
             get_allow_real_jobs,
             set_allow_real_jobs,
