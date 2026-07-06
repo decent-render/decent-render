@@ -40,33 +40,35 @@ the first time). Subsequent runs are fast thanks to incremental compilation.
 - Dispatch URL, workdir root, and the allow-real-jobs default are persisted to
   the platform config dir (`~/Library/Application Support/decent-render/config.json`
   on macOS).
-- The worker token is stored in the same config file (gitignored, never committed).
-  A future version will use the OS keychain for the token.
+- The worker token is stored in the **OS keychain** (macOS Keychain via the
+  `keyring` crate; service `decent-render`, account `worker-token`) — never
+  written to the config file or disk, never committed.
 
 ## How the app maps to the CLI
 
-| Concern              | CLI (`decent-node`)              | App (`decent-app`)                    |
-|----------------------|----------------------------------|---------------------------------------|
-| Core code path       | `connection::run`                | `connection::run` (same function)     |
-| Observability        | `Observability::default()`       | `Observability::channels()`           |
-| Allow real jobs      | `--allow-real-jobs` flag         | UI toggle → `Observability::set_*`    |
-| Status visibility    | `tracing` logs (stdout)          | `watch::channel` → Tauri events → UI  |
-| Connection control   | process lifecycle                | Start/Stop buttons → task abort       |
-| Purge rule           | enforced by `WorkDir::Drop`      | enforced by `WorkDir::Drop` (same)    |
+| Concern            | CLI (`decent-node`)         | App (`decent-app`)                   |
+| ------------------ | --------------------------- | ------------------------------------ |
+| Core code path     | `connection::run`           | `connection::run` (same function)    |
+| Observability      | `Observability::default()`  | `Observability::channels()`          |
+| Allow real jobs    | `--allow-real-jobs` flag    | UI toggle → `Observability::set_*`   |
+| Status visibility  | `tracing` logs (stdout)     | `watch::channel` → Tauri events → UI |
+| Connection control | process lifecycle           | Start/Stop buttons → task abort      |
+| Purge rule         | enforced by `WorkDir::Drop` | enforced by `WorkDir::Drop` (same)   |
 
 The app **cannot** bypass the purge rule — it observes and controls, but the
 core enforces workdir deletion structurally.
 
-## Earnings / allocation / multi-tenant console
+## Earnings console
 
-Deferred to Phase 2. The operator dashboard for earnings, settlement, and
-multi-tenant allocation requires:
-- Network identity (own domain, operator signup flow)
-- Settlement layer (driffs credits ledger + denomination field)
-- Operator DPA / ToS signing flow
+The app fetches and displays the operator's earnings totals (pending / credited /
+voided) from the platform's `/api/operator-earnings` endpoint. This is a
+read-only view of what the network has paid the operator — the credit ledger,
+settlement, and denomination live in the closed platform, not in this open app.
 
-These are Phase-2 milestones per the plan doc. The app's UI shell is ready
-to receive them — they'll be additional cards/tabs, not a rewrite.
+The fuller operator dashboard — settlement detail, multi-tenant allocation,
+operator DPA / ToS signing — is Phase 2 and requires network identity (own
+domain, operator signup flow) plus a settlement layer. The app's UI shell is
+ready to receive them as additional cards/tabs, not a rewrite.
 
 ## Architecture
 
