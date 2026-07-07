@@ -2,7 +2,7 @@
 
 Open-source node supervisor for the **Decent render network**: a distributed
 render farm for Remotion compositions, including GPU (WebGPU/Metal) renders
-that serverless infrastructure can't do. Operators run one small signed app on
+that serverless infrastructure can't do. Operators run the `decent-node` CLI on
 an Apple-Silicon Mac; the supervisor opens a single **outbound** WebSocket to
 the dispatch service (GitHub-Actions-runner model — works behind any NAT, zero
 router configuration), receives jobs, renders, uploads, and purges.
@@ -28,10 +28,23 @@ dispatch service, and the credit system are separate, closed components.
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/supervisor-core` | The core: wire protocol (v2), outbound WebSocket loop, job-execution orchestration (payload download + sha256 verify + spawn versioned runner + stream progress + upload + cancel), observable status bus, purge rule |
 | `bins/decent-node`       | Thin CLI over the core                                                                                                                                                                                                |
-| `apps/decent-app`        | Tauri v2 desktop app over the same core — device pairing, OS-keychain token storage, connection controls, live job progress, session stats, log tail, earnings console                                                |
+| `apps/decent-app`        | Tauri v2 desktop app over the same core (**in-repo; desktop GUI distribution deferred** — the CLI is the operator surface today)                                                |
 
-One core, two skins: the CLI and the Tauri app drive the exact same
-`connection::run` code path, just with different observability attached.
+One core: the CLI is the shipped operator surface. The in-repo Tauri app
+drives the exact same `connection::run` code path with richer observability,
+but desktop GUI distribution is deferred — operators run the CLI today, and a
+web dashboard (decent-render.com) will be the management surface for tracking
+your machines.
+
+## Install
+
+Build from source (requires Rust + Cargo):
+
+```sh
+cargo install --git https://github.com/decent-render/decent-render decent-node
+```
+
+A Homebrew tap and a crates.io package are coming.
 
 ## Usage
 
@@ -46,7 +59,9 @@ Worker tokens are minted by the platform (tenant) you register with.
 ## Status
 
 Implemented: register + heartbeat + protocol v2 + purge guard + **job-execution
-orchestration** + observable status bus + the Tauri operator app.
+orchestration** + observable status bus. (A Tauri desktop app also lives
+in-repo over the same core; desktop GUI distribution is deferred — the CLI is
+the operator surface today.)
 
 Job execution works by **spawning versioned render payloads**: the supervisor
 downloads the assigned payload, verifies its sha256, extracts it, and spawns the
