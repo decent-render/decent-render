@@ -345,7 +345,22 @@ pub async fn run(
                         }
                     }
                     Some(Ok(Message::Close(close))) => {
-                        tracing::info!(?close, "socket closed by server");
+                        // W3.5: if dispatch closed with an "upgrade-required"
+                        // reason, surface it prominently and exit cleanly
+                        // (no silent retry/hang). Otherwise log + disconnect.
+                        if let Some(frame) = &close {
+                            let reason: &str = frame.reason.as_ref();
+                            if reason.starts_with("upgrade-required") {
+                                tracing::warn!(%reason, "dispatch rejected connection (upgrade required)");
+                                eprintln!("\nUPGRADE REQUIRED — {reason}");
+                                eprintln!("Upgrade decent-node and restart.\n");
+                                obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                                return Ok(());
+                            }
+                            tracing::info!(%reason, "socket closed by server");
+                        } else {
+                            tracing::info!("socket closed by server");
+                        }
                         obs.log(LogLine::info("Socket closed by server"));
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                         return Ok(());
