@@ -67,8 +67,7 @@ fn set_owner_only(_path: &std::path::Path, _mode: u32) {}
 const LAUNCHD_LABEL: &str = "com.decent-render.decent-node";
 
 fn launch_agents_dir() -> anyhow::Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
     let dir = std::path::PathBuf::from(home).join("Library/LaunchAgents");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -80,11 +79,7 @@ fn plist_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// Build the launchd agent plist: runs `decent-node start --allow-real-jobs` at
 /// login against dispatch, restarts on exit (KeepAlive), logs to the config dir.
-fn build_plist(
-    exe: &std::path::Path,
-    dispatch_url: &str,
-    log_path: &std::path::Path,
-) -> String {
+fn build_plist(exe: &std::path::Path, dispatch_url: &str, log_path: &std::path::Path) -> String {
     let exe_str = exe.to_string_lossy();
     let mut args = String::new();
     for &arg in &[
@@ -173,7 +168,11 @@ enum Command {
     /// real jobs. Run `decent-node login` first to store a token.
     Install {
         /// Dispatch WebSocket URL.
-        #[arg(long, env = "DISPATCH_URL", default_value = "wss://decent-render-dispatch.fly.dev/ws")]
+        #[arg(
+            long,
+            env = "DISPATCH_URL",
+            default_value = "wss://decent-render-dispatch.fly.dev/ws"
+        )]
         dispatch_url: String,
     },
     /// Uninstall the launchd agent (stops it and removes the plist).
@@ -279,8 +278,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Login { app_url } => {
-            let pairing_url =
-                format!("{}/settings/devices", app_url.trim_end_matches('/'));
+            let pairing_url = format!("{}/settings/devices", app_url.trim_end_matches('/'));
             println!("Open this page to issue a worker token for this machine:");
             println!("  {pairing_url}");
             // Best-effort browser open (no-op on a headless box); never fatal.
