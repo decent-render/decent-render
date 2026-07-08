@@ -178,6 +178,9 @@ enum Command {
     },
     /// Uninstall the launchd agent (stops it and removes the plist).
     Uninstall,
+    /// Show pairing + daemon status: is a token stored? is the launchd agent
+    /// installed/loaded?
+    Status,
 }
 
 /// Best-effort hardware probe: sysctl on macOS, stubs elsewhere.
@@ -313,6 +316,13 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Install { dispatch_url } => {
+            // Guard: refuse to install a daemon that would bail-loop with no
+            // token (start would exit immediately, launchd would restart it).
+            if load_token().is_empty() {
+                anyhow::bail!(
+                    "No worker token stored. Run `decent-node login` first, then `decent-node install`."
+                );
+            }
             let exe = std::env::current_exe()?;
             let plist = plist_path()?;
             let log_path = token_path()?
@@ -355,6 +365,41 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::remove_file(&plist)?;
             }
             println!("Uninstalled launchd agent {LAUNCHD_LABEL}.");
+            Ok(())
+        }
+
+        Command::Status => {
+            let token = load_token();
+            println!(
+                "token stored : {}",
+                if token.is_empty() {
+                    "NO  — run `decent-node login`"
+                } else {
+                    "yes"
+                }
+            );
+            let plist_present = plist_path().map(|p| p.exists()).unwrap_or(false);
+            println!(
+                "agent plist  : {}",
+                if plist_present {
+                    "yes — `decent-node uninstall` to remove"
+                } else {
+                    "no  — run `decent-node install`"
+                }
+            );
+            let loaded = std::process::Command::new("launchctl")
+                .arg("list")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains(LAUNCHD_LABEL))
+                .unwrap_or(false);
+            println!(
+                "agent loaded : {}",
+                if loaded {
+                    "yes — running under launchd"
+                } else {
+                    "no"
+                }
+            );
             Ok(())
         }
     }
