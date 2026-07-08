@@ -16,26 +16,52 @@ use supervisor_core::status::Observability;
 const SUPERVISOR_VERSION: &str = "rust-0.0.1";
 const TENANT: &str = "driffs";
 
-/// OS keychain entry — shared with the Tauri app, so a token stored by either
-/// surface is read by the other.
-const KEYCHAIN_SERVICE: &str = "decent-render";
-const KEYCHAIN_USER: &str = "worker-token";
+/// Token storage: a 0600 file at ~/.config/decent-node/worker-token. Not the
+/// macOS Keychain — the Keychain prompts on access for an unsigned binary,
+/// which is hostile CLI UX; a revocable per-device worker token is fine in a
+/// user-only file, the way `gh` / `npm` store theirs.
+fn token_path() -> anyhow::Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate token file"))?;
+    Ok(std::path::PathBuf::from(home).join(".config/decent-node/worker-token"))
+}
 
 fn load_token() -> String {
-    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER)
-        .and_then(|e| e.get_password())
+    token_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(&p).ok())
         .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 fn save_token(token: &str) -> anyhow::Result<()> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER)?;
-    if token.is_empty() {
-        entry.delete_credential()?;
-    } else {
-        entry.set_password(token)?;
+    let path = token_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        set_owner_only(parent, 0o700);
     }
+    std::fs::write(&path, format!("{token}\n"))?;
+    set_owner_only(&path, 0o600);
     Ok(())
 }
+
+fn delete_token() -> anyhow::Result<()> {
+    match std::fs::remove_file(&token_path()?) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_owner_only(_path: &std::path::Path, _mode: u32) {}
 
 #[derive(Parser)]
 #[command(
@@ -56,7 +82,7 @@ enum Command {
         #[arg(long, env = "DISPATCH_URL", default_value = "ws://localhost:8790/ws")]
         dispatch_url: String,
         /// Worker JWT. If omitted (and no WORKER_TOKEN env), reads the token
-        /// stored by `decent-node login` from the OS keychain.
+        /// stored by `decent-node login` (the token file).
         #[arg(long, env = "WORKER_TOKEN")]
         token: Option<String>,
         /// Exit cleanly after this many heartbeats (smoke-test mode).
@@ -68,13 +94,13 @@ enum Command {
         allow_real_jobs: bool,
     },
     /// Pair this machine: open the web pairing page, paste the issued worker
-    /// token, and store it in the OS keychain for `start` to use.
+    /// token, and store it in a 0600 file for `start` to use.
     Login {
         /// The web app URL to pair against.
         #[arg(long, env = "APP_URL", default_value = "https://decent-riffs.com")]
         app_url: String,
     },
-    /// Forget the stored worker token (clears the OS keychain entry).
+    /// Forget the stored worker token (clears the token file).
     Logout,
 }
 
@@ -128,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
             allow_real_jobs,
         } => {
             // Resolve token: explicit --token / WORKER_TOKEN env, else the
-            // keychain entry written by `decent-node login`.
+            // token file written by `decent-node login`.
             let token = match token {
                 Some(t) if !t.trim().is_empty() => t.trim().to_string(),
                 _ => load_token(),
@@ -192,19 +218,21 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             save_token(&token)?;
-            println!("Token saved to the OS keychain. Run `decent-node start` to connect.");
+            println!("Token saved to ~/.config/decent-node/worker-token (0600). Run `decent-node start` to connect.");
             Ok(())
         }
 
         Command::Logout => {
-            match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER) {
-                Ok(entry) => match entry.delete_credential() {
-                    Ok(()) => println!("Stored token cleared."),
-                    Err(keyring::Error::NoEntry) => println!("No stored token to clear."),
-                    Err(err) => anyhow::bail!("failed to clear keychain entry: {err}"),
-                },
-                Err(err) => anyhow::bail!("failed to open keychain: {err}"),
-            }
+            let had_token = !load_token().is_empty();
+            delete_token()?;
+            println!(
+                "{}",
+                if had_token {
+                    "Stored token cleared."
+                } else {
+                    "No stored token to clear."
+                }
+            );
             Ok(())
         }
     }
