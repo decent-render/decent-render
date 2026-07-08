@@ -1,26 +1,33 @@
 {
   "name": "@decent-render/protocol",
   "version": "0.1.0",
-  "description": "Decent render-network wire protocol (v2) — shared TS types + zod schemas. Canonical to the Rust supervisor-core (crates/supervisor-core/src/protocol.rs); this package is the TS mirror, pinned by a cross-language conformance test.",
+  "description": "Decent render-network wire protocol (v2) — shared TS types + zod schemas. Canonical to the Rust supervisor-core; pinned by a cross-language conformance test.",
   "license": "Apache-2.0",
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
   "files": [
-    "src",
+    "dist",
     "fixtures",
     "CHANGELOG.md",
     "README.md"
   ],
   "scripts": {
-    "test": "echo 'run via vitest from the consumer / repo root' && exit 0"
+    "build": "tsc",
+    "test": "vitest run",
+    "prepublishOnly": "bun run build"
   },
   "peerDependencies": {
     "zod": "^3.0.0"
   },
   "devDependencies": {
+    "typescript": "^5.4.0",
     "vitest": "^1.6.0",
     "zod": "^3.23.8"
   },
