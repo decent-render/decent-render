@@ -63,6 +63,72 @@ fn set_owner_only(path: &std::path::Path, mode: u32) {
 #[cfg(not(unix))]
 fn set_owner_only(_path: &std::path::Path, _mode: u32) {}
 
+/// launchd label for the installed agent.
+const LAUNCHD_LABEL: &str = "com.decent-render.decent-node";
+
+fn launch_agents_dir() -> anyhow::Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    let dir = std::path::PathBuf::from(home).join("Library/LaunchAgents");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn plist_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(launch_agents_dir()?.join(format!("{LAUNCHD_LABEL}.plist")))
+}
+
+/// Build the launchd agent plist: runs `decent-node start --allow-real-jobs` at
+/// login against dispatch, restarts on exit (KeepAlive), logs to the config dir.
+fn build_plist(
+    exe: &std::path::Path,
+    dispatch_url: &str,
+    log_path: &std::path::Path,
+) -> String {
+    let exe_str = exe.to_string_lossy();
+    let mut args = String::new();
+    for &arg in &[
+        exe_str.as_ref(),
+        "start",
+        "--dispatch-url",
+        dispatch_url,
+        "--allow-real-jobs",
+    ] {
+        args.push_str("        <string>");
+        args.push_str(arg);
+        args.push_str("</string>\n");
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+{args}    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>
+"#,
+        label = LAUNCHD_LABEL,
+        log = log_path.display(),
+    )
+}
+
 #[derive(Parser)]
 #[command(
     name = "decent-node",
@@ -102,6 +168,16 @@ enum Command {
     },
     /// Forget the stored worker token (clears the token file).
     Logout,
+    /// Install as a macOS launchd agent: runs `decent-node start` at login and
+    /// restarts on exit (KeepAlive), so the node renders unattended. Accepts
+    /// real jobs. Run `decent-node login` first to store a token.
+    Install {
+        /// Dispatch WebSocket URL.
+        #[arg(long, env = "DISPATCH_URL", default_value = "wss://decent-render-dispatch.fly.dev/ws")]
+        dispatch_url: String,
+    },
+    /// Uninstall the launchd agent (stops it and removes the plist).
+    Uninstall,
 }
 
 /// Best-effort hardware probe: sysctl on macOS, stubs elsewhere.
@@ -233,6 +309,52 @@ async fn main() -> anyhow::Result<()> {
                     "No stored token to clear."
                 }
             );
+            Ok(())
+        }
+
+        Command::Install { dispatch_url } => {
+            let exe = std::env::current_exe()?;
+            let plist = plist_path()?;
+            let log_path = token_path()?
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("token file has no parent"))?
+                .join("decent-node.log");
+            let xml = build_plist(&exe, &dispatch_url, &log_path);
+            // Best-effort unload for a clean reinstall (suppress output —
+            // "not loaded" is the expected first-install case, not an error).
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist.to_string_lossy()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            std::fs::write(&plist, xml)?;
+            let status = std::process::Command::new("launchctl")
+                .args(["load", &plist.to_string_lossy()])
+                .status()?;
+            if !status.success() {
+                anyhow::bail!(
+                    "launchctl load failed; inspect the plist at {}",
+                    plist.display()
+                );
+            }
+            println!("Installed launchd agent {LAUNCHD_LABEL}.");
+            println!("  binary: {}", exe.display());
+            println!("  plist:  {}", plist.display());
+            println!("  log:    {}", log_path.display());
+            println!("Runs `decent-node start --allow-real-jobs` at login; restarts on exit (KeepAlive).");
+            println!("Tip: run `decent-node login` first if this machine has no token yet.");
+            Ok(())
+        }
+
+        Command::Uninstall => {
+            let plist = plist_path()?;
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist.to_string_lossy()])
+                .status();
+            if plist.exists() {
+                std::fs::remove_file(&plist)?;
+            }
+            println!("Uninstalled launchd agent {LAUNCHD_LABEL}.");
             Ok(())
         }
     }
