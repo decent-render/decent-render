@@ -1,0 +1,106 @@
+{
+  "protocolVersion": 2,
+  "description": "Canonical wire-format fixtures for the decent render-network protocol v2. Rust (crates/supervisor-core) and TS (@decent-render/protocol) BOTH assert against these — a field present in a fixture but missing from an implementation fails that implementation's test. This is the drift tripwire (the outputSizeInBytes scar is covered by the two jobComplete variants).",
+  "cases": [
+    {
+      "name": "register",
+      "direction": "worker",
+      "wire": {
+        "type": "register",
+        "tenant": "driffs",
+        "protocolVersion": 2,
+        "operator": null,
+        "platform": "company",
+        "chip": "Apple M4 Max (darwin)",
+        "ramGb": 64,
+        "supervisorVersion": "spike-0.0.2",
+        "payloadVersion": "none",
+        "capabilities": {"gpu": true}
+      }
+    },
+    {
+      "name": "heartbeat",
+      "direction": "worker",
+      "wire": {"type": "heartbeat", "tenant": "driffs", "currentJobCount": 0}
+    },
+    {
+      "name": "jobAccepted",
+      "direction": "worker",
+      "wire": {"type": "jobAccepted", "tenant": "driffs", "jobId": "spike-1"}
+    },
+    {
+      "name": "jobProgress",
+      "direction": "worker",
+      "wire": {"type": "jobProgress", "tenant": "driffs", "jobId": "spike-1", "progress": 0.5}
+    },
+    {
+      "name": "jobComplete (outputSizeInBytes ABSENT — the drift scar)",
+      "direction": "worker",
+      "wire": {
+        "type": "jobComplete",
+        "tenant": "driffs",
+        "jobId": "spike-1",
+        "outputKey": "renders/t1/out.mp4",
+        "metrics": {"wallMs": 12345, "frames": 300}
+      }
+    },
+    {
+      "name": "jobComplete (outputSizeInBytes PRESENT — the drift scar)",
+      "direction": "worker",
+      "wire": {
+        "type": "jobComplete",
+        "tenant": "driffs",
+        "jobId": "spike-1",
+        "outputKey": "renders/t1/out.mp4",
+        "metrics": {"wallMs": 12345, "frames": 300, "outputSizeInBytes": 647399}
+      }
+    },
+    {
+      "name": "jobFailed",
+      "direction": "worker",
+      "wire": {"type": "jobFailed", "tenant": "driffs", "jobId": "spike-1", "reason": "bundle sha mismatch"}
+    },
+    {
+      "name": "jobAssign",
+      "direction": "server",
+      "wire": {
+        "type": "jobAssign",
+        "tenant": "driffs",
+        "jobId": "job-render-abc123",
+        "kind": "gpu",
+        "durationFrames": 300,
+        "fps": 30,
+        "codec": "h264",
+        "bundleSha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "bundleGetUrl": "https://r2.example.com/bundles/9f86.tar.gz?sig=1",
+        "payloadSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "payloadGetUrl": "https://r2.example.com/render-payloads/aaaa.tar.gz?sig=payload",
+        "inputPropsGetUrl": "https://r2.example.com/renders/t1/input-props.json?sig=2",
+        "assetGetUrls": ["https://r2.example.com/assets/a.png?sig=3"],
+        "outputPutUrl": "https://r2.example.com/renders/t1/out.mp4?sig=4",
+        "outputKey": "renders/t1/out.mp4",
+        "purgeAfter": true
+      }
+    },
+    {
+      "name": "cancel",
+      "direction": "server",
+      "wire": {"type": "cancel", "tenant": "driffs", "jobId": "job-render-abc123"}
+    },
+    {
+      "name": "ping",
+      "direction": "server",
+      "wire": {"type": "ping", "tenant": "driffs"}
+    },
+    {
+      "name": "updateAvailable",
+      "direction": "server",
+      "wire": {
+        "type": "updateAvailable",
+        "tenant": "driffs",
+        "supervisorVersion": "rust-0.0.2",
+        "payloadVersion": "remotion-4.0.339"
+      }
+    }
+  ]
+}

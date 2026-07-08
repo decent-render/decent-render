@@ -230,6 +230,7 @@ pub enum ServerMessage {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use std::fs;
 
     fn round_trip_worker(literal: &str) -> WorkerMessage {
         let parsed: WorkerMessage = serde_json::from_str(literal).expect("deserialize");
@@ -289,6 +290,14 @@ mod tests {
         };
         assert_eq!(c.metrics.wall_ms, 12345);
         assert_eq!(c.metrics.frames, 300);
+        assert_eq!(c.metrics.output_size_in_bytes, None);
+        let complete_with_size = round_trip_worker(
+            r#"{"type":"jobComplete","tenant":"driffs","jobId":"spike-1","outputKey":"renders/t1/out.mp4","metrics":{"wallMs":12345,"frames":300,"outputSizeInBytes":647399}}"#,
+        );
+        let WorkerMessage::JobComplete(c) = complete_with_size else {
+            panic!("expected jobComplete");
+        };
+        assert_eq!(c.metrics.output_size_in_bytes, Some(647399));
         round_trip_worker(
             r#"{"type":"jobFailed","tenant":"driffs","jobId":"spike-1","reason":"bundle sha mismatch"}"#,
         );
@@ -342,5 +351,47 @@ mod tests {
         round_trip_server(
             r#"{"type":"updateAvailable","tenant":"driffs","supervisorVersion":"rust-0.0.2","payloadVersion":"remotion-4.0.339"}"#,
         );
+    }
+
+    /// Cross-language conformance: every fixture in
+    /// `packages/protocol/fixtures/v2.json` (the shared wire-format contract)
+    /// must round-trip through the Rust types with no field drift. The TS
+    /// package asserts the same fixtures against its zod schemas — so together
+    /// the two sides cannot drift. The outputSizeInBytes scar is covered by the
+    /// two jobComplete fixtures: if this struct ever dropped the field again,
+    /// the PRESENT fixture would fail here, exactly as it failed in prod.
+    #[test]
+    fn cross_language_fixtures_round_trip() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packages/protocol/fixtures/v2.json"
+        );
+        let raw = fs::read_to_string(path)
+            .expect("fixtures/v2.json must exist (run from the decent-render workspace)");
+        let parsed: Value = serde_json::from_str(&raw).expect("fixtures are valid JSON");
+
+        for case in parsed["cases"].as_array().expect("cases array") {
+            let name = case["name"].as_str().unwrap();
+            let direction = case["direction"].as_str().unwrap();
+            let wire = case["wire"].clone();
+
+            let re = match direction {
+                "worker" => {
+                    let msg: WorkerMessage =
+                        serde_json::from_value(wire.clone()).expect("worker parse");
+                    serde_json::to_value(&msg).expect("worker serialize")
+                }
+                "server" => {
+                    let msg: ServerMessage =
+                        serde_json::from_value(wire.clone()).expect("server parse");
+                    serde_json::to_value(&msg).expect("server serialize")
+                }
+                other => panic!("unknown direction {other}"),
+            };
+            // Deep, order-independent structural equality (serde_json::Value
+            // compares objects as maps): a missing or extra field on either side
+            // makes the re-serialized value differ from the fixture.
+            assert_eq!(re, wire, "fixture drifted: {name} ({direction})");
+        }
     }
 }
