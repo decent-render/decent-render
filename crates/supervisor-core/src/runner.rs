@@ -223,10 +223,15 @@ async fn run_job_inner(
                     }
                     RunnerEvent::Done { output_size_in_bytes, wall_time_ms, metrics } => {
                         tracing::info!(job_id = %assign.job_id, output_size_in_bytes, wall_time_ms, "runner done");
-                        done_metrics = Some(metrics.unwrap_or(JobMetrics {
+                        let mut m = metrics.unwrap_or(JobMetrics {
                             wall_ms: wall_time_ms,
                             frames: assign.duration_frames,
-                        }));
+                            output_size_in_bytes: None,
+                        });
+                        // The `done` envelope always carries the output size;
+                        // stamp it onto the metrics so dispatch persists it.
+                        m.output_size_in_bytes = Some(output_size_in_bytes);
+                        done_metrics = Some(m);
                     }
                     RunnerEvent::Error { message } => return Err(anyhow!(message)),
                 }

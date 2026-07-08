@@ -78,6 +78,11 @@ pub struct JobMetrics {
     /// Wall-clock render time on the worker, milliseconds.
     pub wall_ms: u64,
     pub frames: u64,
+    /// Finished output size in bytes. Reported by the runner in its `done`
+    /// event; dispatch persists it on the job row so the UI shows size without
+    /// a second round-trip. `None` when the runner didn't report it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_size_in_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
