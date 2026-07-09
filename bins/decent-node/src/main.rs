@@ -201,7 +201,7 @@ fn build_plist(exe: &std::path::Path, dispatch_url: &str, log_path: &std::path::
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -375,12 +375,18 @@ fn current_uid() -> Option<String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // No subcommand → default to `status` (a friendly entry point: bare
+    // `decent-node` shows you where the node stands).
+    let command = cli.command.unwrap_or_else(|| {
+        println!("No command given — showing status. Run `decent-node --help` for all commands.\n");
+        Command::Status
+    });
 
     // The TUI runs in the alternate screen; tracing-to-stderr would leave
     // leftover text on exit. Skip the subscriber in TUI mode — the connection
     // loop emits its events via the obs.log() channel, which the TUI renders
     // directly, so nothing important is lost.
-    if !matches!(cli.command, Command::Tui { .. }) {
+    if !matches!(command, Command::Tui { .. }) {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -389,7 +395,7 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
-    match cli.command {
+    match command {
         Command::Start {
             dispatch_url,
             token,
