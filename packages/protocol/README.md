@@ -49,6 +49,28 @@ Rust side, from the repo root:
 cargo test -p supervisor-core cross_language
 ```
 
+## Publishing
+
+**Secure, CI-only — never publish from a dev machine.** The publish is a
+[GitHub Actions workflow](../../.github/workflows/publish-protocol.yml)
+(`workflow_dispatch`) that builds, runs the conformance tests, then publishes to
+npm **with provenance** (`--provenance` — npmjs.com shows "Provenance ✓",
+cryptographically tied to the exact CI build/commit). It is gated behind a
+protected `publish` environment (manual approval) and uses a scoped
+`NPM_TOKEN`.
+
+To publish a new version:
+
+1. bump `version` in `packages/protocol/package.json`,
+2. commit + push,
+3. GitHub → Actions → **Publish protocol package** → Run workflow,
+4. approve the `publish` environment prompt.
+
+`NPM_TOKEN` is a **Granular** npm token (scoped to this package only, publish
+permission, ~90-day rotation), stored as an *environment* secret — never in a
+dev machine's `~/.npmrc`. This closes the stolen-token / infected-dev-machine
+attack vector seen in recent npm supply-chain incidents.
+
 ## Wire format
 
 Plain JSON, camelCase keys, messages discriminated by `type`.

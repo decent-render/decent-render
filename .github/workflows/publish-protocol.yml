@@ -1,0 +1,80 @@
+# Publish @decent-render/protocol to npm — securely.
+#
+# Supply-chain security model:
+#  1. CI-only publish. NPM_TOKEN lives as a secret, NEVER on a dev machine
+#     (removes the "infected laptop → stolen token" attack vector).
+#  2. Provenance signing: `--provenance` + OIDC attests each publish to this
+#     exact CI build/commit. npmjs.com shows "Provenance ✓"; consumers can
+#     verify the package came from our CI, not a random machine.
+#  3. Scoped Granular token (set as NPM_TOKEN): publish-only, limited to this
+#     package, ~90-day rotation.
+#  4. Protected `publish` environment: manual approval required before any
+#     publish runs, and NPM_TOKEN is only exposed inside it.
+#
+# Trigger: MANUAL (workflow_dispatch). Publishing is a deliberate act — bump
+# the version in packages/protocol/package.json first, then run this workflow.
+#
+# ── ONE-TIME SETUP (owner) ──────────────────────────────────────────────
+#  • npmjs.com → Access Tokens → Granular Access Token: scope = ONLY
+#    @decent-render/protocol, permission = Read and write (publish), expiry
+#    ~90 days. (Keep 2FA on the account.)
+#  • GitHub → repo Settings → Environments → New environment "publish" →
+#    Required reviewers = you (manual-approval gate).
+#  • In that `publish` environment → Add secret `NPM_TOKEN` = the granular
+#    token above (environment-scoped, not repo-level).
+#  • Revoke the old broad/dev-machine token.
+name: Publish protocol package
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "npm pack only (no publish)"
+        type: boolean
+        default: false
+
+# id-token: write is REQUIRED for npm provenance (OIDC → Sigstore attestation).
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    # Protected environment: requires manual approval (Settings → Environments).
+    # NPM_TOKEN must be created as an environment secret here.
+    environment: publish
+    steps:
+      - uses: actions/checkout@v4
+
+      # NOTE: first-party actions on tags (@v4). For strict hardening, pin these
+      # to commit SHAs (Settings → or a future pass). Low risk for actions/*.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          # Writes ~/.npmrc so `npm publish` authenticates via NODE_AUTH_TOKEN.
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install
+        working-directory: packages/protocol
+        run: npm install
+
+      - name: Build (tsc → dist)
+        working-directory: packages/protocol
+        run: npm run build
+
+      - name: Conformance tests must pass before publish
+        working-directory: packages/protocol
+        run: npm test
+
+      - name: Dry run (npm pack — no publish)
+        if: ${{ inputs.dry-run }}
+        working-directory: packages/protocol
+        run: npm pack
+
+      - name: Publish to npm with provenance
+        if: ${{ !inputs.dry-run }}
+        working-directory: packages/protocol
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
