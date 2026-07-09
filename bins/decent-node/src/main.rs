@@ -56,6 +56,73 @@ fn delete_token() -> anyhow::Result<()> {
     }
 }
 
+/// Current epoch time in milliseconds (for status-snapshot freshness).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The daemon's live status snapshot, parsed from the `daemon-status` file the
+/// running daemon writes every few seconds. Read by the separate `status`
+/// command so an operator can see connection/job state without the TUI.
+struct DaemonSnapshot {
+    connection: String,
+    current_job: Option<(String, String, f64)>,
+    jobs_completed: u64,
+    jobs_failed: u64,
+    jobs_canceled: u64,
+    update_available: Option<String>,
+    updated_at_ms: u64,
+}
+
+impl DaemonSnapshot {
+    /// Fresh = written within the last 15s (the daemon writes every 3s).
+    fn is_fresh(&self) -> bool {
+        now_ms().saturating_sub(self.updated_at_ms) < 15_000
+    }
+}
+
+fn read_daemon_snapshot() -> Option<DaemonSnapshot> {
+    let content = token_path()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("daemon-status")))
+        .and_then(|p| std::fs::read_to_string(&p).ok())?;
+    let kv: std::collections::HashMap<&str, &str> = content
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.splitn(2, '=');
+            Some((it.next()?, it.next()?))
+        })
+        .collect();
+    let val = |k: &str| kv.get(k).copied().unwrap_or("");
+    let job_id = val("current_job_id");
+    let current_job = if job_id.is_empty() {
+        None
+    } else {
+        Some((
+            job_id.to_string(),
+            val("current_job_phase").to_string(),
+            val("current_job_progress").parse().unwrap_or(0.0),
+        ))
+    };
+    let upd = val("update_available");
+    Some(DaemonSnapshot {
+        connection: val("connection").to_string(),
+        current_job,
+        jobs_completed: val("jobs_completed").parse().unwrap_or(0),
+        jobs_failed: val("jobs_failed").parse().unwrap_or(0),
+        jobs_canceled: val("jobs_canceled").parse().unwrap_or(0),
+        update_available: if upd.is_empty() {
+            None
+        } else {
+            Some(upd.to_string())
+        },
+        updated_at_ms: val("updated_at_ms").parse().unwrap_or(0),
+    })
+}
+
 #[cfg(unix)]
 fn set_owner_only(path: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
@@ -346,26 +413,50 @@ async fn main() -> anyhow::Result<()> {
             // `updateAvailable` for `decent-node status` to surface.
             let (obs, _status_rx, _log_rx) = Observability::channels(SupervisorStatus::default());
             obs.set_allow_real_jobs(allow_real_jobs);
-            // Persist update-available state to a file the separate `status`
-            // command can read. Cleared on each connect (optimistic up-to-date).
+            // Persist a status snapshot the separate `status` command reads, so an
+            // operator can see the daemon's live connection/job state without the
+            // TUI. (Supersedes the old update-available-only file.) The file going
+            // stale signals the daemon stopped.
             let obs_persist = obs.clone();
-            if let Some(path) = token_path()
+            if let Some(dir) = token_path()
                 .ok()
-                .and_then(|p| p.parent().map(|d| d.join("update-available")))
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             {
+                let status_path = dir.join("daemon-status");
                 tokio::spawn(async move {
                     loop {
-                        let latest = obs_persist.borrow_status().update_available.clone();
-                        let _ = match latest {
-                            Some(v) => std::fs::write(&path, v),
-                            None => std::fs::remove_file(&path).or_else(|e| {
-                                if e.kind() == std::io::ErrorKind::NotFound {
-                                    Ok(())
-                                } else {
-                                    Err(e)
-                                }
-                            }),
-                        };
+                        let s = obs_persist.borrow_status();
+                        let job = &s.current_job;
+                        let mut snap = String::new();
+                        {
+                            let mut line = |k: &str, v: &str| {
+                                snap.push_str(k);
+                                snap.push('=');
+                                snap.push_str(v);
+                                snap.push('\n');
+                            };
+                            line("connection", &format!("{:?}", s.connection));
+                            line("dispatch_url", s.dispatch_url.as_deref().unwrap_or(""));
+                            line(
+                                "current_job_id",
+                                job.as_ref().map(|j| j.id.as_str()).unwrap_or(""),
+                            );
+                            line(
+                                "current_job_phase",
+                                &job.as_ref().map(|j| format!("{:?}", j.phase)).unwrap_or_default(),
+                            );
+                            line(
+                                "current_job_progress",
+                                &job.as_ref().map(|j| j.progress.to_string()).unwrap_or_default(),
+                            );
+                            line("jobs_completed", &s.jobs_completed.to_string());
+                            line("jobs_failed", &s.jobs_failed.to_string());
+                            line("jobs_canceled", &s.jobs_canceled.to_string());
+                            line("allow_real_jobs", &s.allow_real_jobs.to_string());
+                            line("update_available", s.update_available.as_deref().unwrap_or(""));
+                            line("updated_at_ms", &now_ms().to_string());
+                        }
+                        let _ = std::fs::write(&status_path, snap);
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     }
                 });
@@ -499,21 +590,42 @@ async fn main() -> anyhow::Result<()> {
                 "paused — run `decent-node resume` (or `uninstall` to remove)"
             };
             println!("daemon      : {daemon_state}");
-            let update = token_path()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("update-available")))
-                .and_then(|p| std::fs::read_to_string(&p).ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            println!(
-                "update       : {}",
-                match update {
-                    Some(v) => {
-                        format!("⚠ {v} available — `brew upgrade decent-node` + restart")
+            // Live daemon state from the snapshot the running daemon writes.
+            match read_daemon_snapshot() {
+                Some(s) if s.is_fresh() => {
+                    println!("connection  : {}", s.connection);
+                    match s.current_job {
+                        Some((id, phase, prog)) => {
+                            let pct = (prog.clamp(0.0, 1.0) * 100.0).round() as u32;
+                            println!("current job : {id} · {phase} · {pct}%");
+                        }
+                        None => println!("current job : idle"),
                     }
-                    None => "up to date".to_string(),
+                    println!(
+                        "jobs        : {} done · {} failed · {} canceled",
+                        s.jobs_completed, s.jobs_failed, s.jobs_canceled
+                    );
+                    println!(
+                        "update      : {}",
+                        match s.update_available {
+                            Some(v) => {
+                                format!("⚠ {v} available — `brew upgrade decent-node` + restart")
+                            }
+                            None => "up to date".to_string(),
+                        }
+                    );
                 }
-            );
+                Some(_) => {
+                    println!("connection  : stale (no recent snapshot — daemon may have stopped)");
+                    println!("update      : up to date");
+                }
+                None => {
+                    if loaded {
+                        println!("connection  : (no live snapshot — daemon starting, or an older binary)");
+                    }
+                    println!("update      : up to date");
+                }
+            }
             Ok(())
         }
 
