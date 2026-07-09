@@ -1,0 +1,14 @@
+# Harden cargo's crates.io access against transient CI network failures.
+# GitHub Actions occasionally resets connections mid-fetch (see the v0.0.3
+# release `plan` failure: "[56] Recv failure: Connection reset by peer" while
+# `cargo metadata` pulled the `http` crate). These settings apply to EVERY
+# cargo invocation in CI — both the cargo-dist `plan` step (`cargo metadata`)
+# and the `build` step — and to local runs.
+#
+#   retry  — more attempts before giving up on a flaky download (default 3)
+#   sparse — the modern, faster + more reliable crates.io index protocol
+[net]
+retry = 10
+
+[registries.crates-io]
+protocol = "sparse"
