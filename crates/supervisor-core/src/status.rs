@@ -80,6 +80,9 @@ pub struct SupervisorStatus {
     pub jobs_canceled: u64,
     pub last_error: Option<String>,
     pub allow_real_jobs: bool,
+    /// Latest supervisor version reported by dispatch via `updateAvailable`,
+    /// when one is available. `None` = up to date (or not yet notified).
+    pub update_available: Option<String>,
 }
 
 impl Default for SupervisorStatus {
@@ -94,6 +97,7 @@ impl Default for SupervisorStatus {
             jobs_canceled: 0,
             last_error: None,
             allow_real_jobs: false,
+            update_available: None,
         }
     }
 }

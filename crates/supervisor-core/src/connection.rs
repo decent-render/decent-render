@@ -130,6 +130,10 @@ pub async fn run(
         ));
         s.allow_real_jobs = obs.allows_real_jobs();
         s.last_error = None;
+        // Optimistic: assume up to date until dispatch says otherwise. Cleared
+        // on every connect so a freshly-upgraded node stops showing a stale
+        // "update available" once it matches the latest.
+        s.update_available = None;
     });
 
     // Initial-connect retry loop (mirrors spike-worker.ts MAX_CONNECT_ATTEMPTS).
@@ -338,6 +342,12 @@ pub async fn run(
                                         }
                                     }
                                     ServerMessage::Cancel(_) => {}
+                                    ServerMessage::UpdateAvailable(u) => {
+                                        obs.update_status(|s| {
+                                            s.update_available =
+                                                Some(u.supervisor_version.clone());
+                                        });
+                                    }
                                     _ => {}
                                 }
                             }

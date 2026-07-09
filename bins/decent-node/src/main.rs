@@ -11,9 +11,9 @@
 use clap::{Parser, Subcommand};
 use supervisor_core::connection::{self, ConnectionConfig};
 use supervisor_core::protocol::{Capabilities, Platform, RegisterMessage, PROTOCOL_VERSION};
-use supervisor_core::status::Observability;
+use supervisor_core::status::{Observability, SupervisorStatus};
 
-const SUPERVISOR_VERSION: &str = "rust-0.0.1";
+const SUPERVISOR_VERSION: &str = concat!("rust-", env!("CARGO_PKG_VERSION"));
 const TENANT: &str = "driffs";
 
 /// Token storage: a 0600 file at ~/.config/decent-node/worker-token. Not the
@@ -267,9 +267,34 @@ async fn main() -> anyhow::Result<()> {
                 allow_real_jobs,
                 ..ConnectionConfig::new(dispatch_url, token)
             };
-            // CLI uses tracing-only observability (no status/log channels).
-            let obs = Observability::default();
+            // CLI uses real status channels so a background task can persist
+            // `updateAvailable` for `decent-node status` to surface.
+            let (obs, _status_rx, _log_rx) = Observability::channels(SupervisorStatus::default());
             obs.set_allow_real_jobs(allow_real_jobs);
+            // Persist update-available state to a file the separate `status`
+            // command can read. Cleared on each connect (optimistic up-to-date).
+            let obs_persist = obs.clone();
+            if let Some(path) = token_path()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("update-available")))
+            {
+                tokio::spawn(async move {
+                    loop {
+                        let latest = obs_persist.borrow_status().update_available.clone();
+                        let _ = match latest {
+                            Some(v) => std::fs::write(&path, v),
+                            None => std::fs::remove_file(&path).or_else(|e| {
+                                if e.kind() == std::io::ErrorKind::NotFound {
+                                    Ok(())
+                                } else {
+                                    Err(e)
+                                }
+                            }),
+                        };
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    }
+                });
+            }
             // CLI never signals shutdown — runs until heartbeat-limit or server close.
             let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             connection::run(&config, &register, &obs, shutdown_rx).await?;
@@ -396,6 +421,21 @@ async fn main() -> anyhow::Result<()> {
                     "yes — running under launchd"
                 } else {
                     "no"
+                }
+            );
+            let update = token_path()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("update-available")))
+                .and_then(|p| std::fs::read_to_string(&p).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            println!(
+                "update       : {}",
+                match update {
+                    Some(v) => {
+                        format!("⚠ {v} available — `brew upgrade decent-node` + restart")
+                    }
+                    None => "up to date".to_string(),
                 }
             );
             Ok(())
