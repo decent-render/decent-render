@@ -1,0 +1,39 @@
+# CI — keeps the wire protocol from drifting between the TS package and the
+# Rust supervisor-core. Runs the shared-fixture conformance on BOTH sides.
+# (The cargo-dist release pipeline lives in release.yml; this is the PR/push
+# gate that catches a protocol mismatch BEFORE release.)
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: supervisor-core tests (incl. cross-language conformance)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Runs every supervisor-core test, including
+      # `cross_language_fixtures_round_trip`, which round-trips the shared
+      # fixtures/v2.json through the Rust protocol types.
+      - run: cargo test -p supervisor-core
+
+  protocol:
+    name: protocol package conformance (TS)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      # The TS side parses + round-trips the same fixtures/v2.json through the
+      # zod schemas. bun auto-installs the zod peer dependency.
+      - run: bun install
+        working-directory: packages/protocol
+      - run: bun run test
+        working-directory: packages/protocol

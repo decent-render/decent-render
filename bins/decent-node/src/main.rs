@@ -160,6 +160,11 @@ enum Command {
         /// The web app URL to pair against.
         #[arg(long, env = "APP_URL", default_value = "https://decent-riffs.com")]
         app_url: String,
+        /// Store a worker token directly instead of opening the web pairing
+        /// page. For company/internal tokens minted via
+        /// `scripts/mint-worker-token.ts` (skips the self-serve device flow).
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Forget the stored worker token (clears the token file).
     Logout,
@@ -180,6 +185,9 @@ enum Command {
     /// Show pairing + daemon status: is a token stored? is the launchd agent
     /// installed/loaded?
     Status,
+    /// Upgrade decent-node via Homebrew, then restart the daemon (if loaded)
+    /// so launchd relaunches it with the new binary. One-command fleet update.
+    Upgrade,
 }
 
 /// Best-effort hardware probe: sysctl on macOS, stubs elsewhere.
@@ -213,6 +221,26 @@ fn detect_ram_gb() -> u32 {
         }
     }
     0 // stub on platforms without a probe
+}
+
+/** Is the decent-node launchd agent currently loaded? */
+fn launchctl_has_label() -> bool {
+    std::process::Command::new("launchctl")
+        .arg("list")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(LAUNCHD_LABEL))
+        .unwrap_or(false)
+}
+
+/// Current numeric UID, for the launchctl `gui/<uid>/<label>` service target.
+fn current_uid() -> Option<String> {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[tokio::main]
@@ -302,7 +330,20 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
-        Command::Login { app_url } => {
+        Command::Login { app_url, token } => {
+            // Direct token storage (company/internal tokens) skips the web page.
+            if let Some(tok) = token {
+                let tok = tok.trim().to_string();
+                if tok.split('.').count() != 3 {
+                    anyhow::bail!(
+                        "That doesn't look like a worker token (expected three dot-separated parts)."
+                    );
+                }
+                save_token(&tok)?;
+                println!("Token saved to ~/.config/decent-node/worker-token (0600).");
+                println!("Run `decent-node start`, or `decent-node install` for the daemon.");
+                return Ok(());
+            }
             let pairing_url = format!("{}/settings/devices", app_url.trim_end_matches('/'));
             println!("Open this page to issue a worker token for this machine:");
             println!("  {pairing_url}");
@@ -438,6 +479,52 @@ async fn main() -> anyhow::Result<()> {
                     None => "up to date".to_string(),
                 }
             );
+            Ok(())
+        }
+
+        Command::Upgrade => {
+            // 1. brew upgrade decent-node — swaps the binary on disk. The
+            //    running `upgrade` process keeps its old in-memory copy; the
+            //    NEXT invocation uses the new binary.
+            let brew = std::process::Command::new("brew")
+                .args(["upgrade", "decent-node"])
+                .status();
+            match brew {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    anyhow::bail!("`brew upgrade decent-node` failed (exit {:?})", s.code())
+                }
+                Err(_) => anyhow::bail!(
+                    "Could not run `brew` — is Homebrew installed? Upgrade manually and restart."
+                ),
+            }
+            println!("Upgraded decent-node via Homebrew.");
+            // 2. Restart the daemon so launchd relaunches with the new binary.
+            //    Only if the agent is loaded; KeepAlive makes `kickstart -k`
+            //    sufficient (kill + relaunch).
+            if launchctl_has_label() {
+                if let Some(uid) = current_uid() {
+                    let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
+                    let kicked = std::process::Command::new("launchctl")
+                        .args(["kickstart", "-k", &target])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if kicked {
+                        println!("Daemon restarted (kickstart -k {target}) — new binary loaded.");
+                    } else {
+                        println!("launchctl kickstart failed; restart manually:");
+                        println!("  launchctl kickstart -k gui/$(id -u)/{LAUNCHD_LABEL}");
+                    }
+                } else {
+                    println!("Could not determine UID; restart the daemon manually:");
+                    println!("  launchctl kickstart -k gui/$(id -u)/{LAUNCHD_LABEL}");
+                }
+            } else {
+                println!(
+                    "Launchd agent not loaded — run `decent-node start` to use the new version."
+                );
+            }
             Ok(())
         }
     }
