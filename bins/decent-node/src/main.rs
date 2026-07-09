@@ -188,6 +188,14 @@ enum Command {
     /// Upgrade decent-node via Homebrew, then restart the daemon (if loaded)
     /// so launchd relaunches it with the new binary. One-command fleet update.
     Upgrade,
+    /// Stop the daemon (launchctl bootout): the node disconnects from dispatch
+    /// and stops rendering, but the launchd agent stays installed. Use
+    /// `resume` to start it again. Note: launchd re-loads LaunchAgents at
+    /// login, so a paused daemon restarts after reboot — use `uninstall`
+    /// for an off state that survives reboot.
+    Pause,
+    /// Start the daemon again after `pause` (launchctl bootstrap).
+    Resume,
 }
 
 /// Best-effort hardware probe: sysctl on macOS, stubs elsewhere.
@@ -443,27 +451,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             );
             let plist_present = plist_path().map(|p| p.exists()).unwrap_or(false);
-            println!(
-                "agent plist  : {}",
-                if plist_present {
-                    "yes — `decent-node uninstall` to remove"
-                } else {
-                    "no  — run `decent-node install`"
-                }
-            );
-            let loaded = std::process::Command::new("launchctl")
-                .arg("list")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains(LAUNCHD_LABEL))
-                .unwrap_or(false);
-            println!(
-                "agent loaded : {}",
-                if loaded {
-                    "yes — running under launchd"
-                } else {
-                    "no"
-                }
-            );
+            let loaded = launchctl_has_label();
+            let daemon_state = if !plist_present {
+                "not installed — run `decent-node install`"
+            } else if loaded {
+                "running"
+            } else {
+                "paused — run `decent-node resume` (or `uninstall` to remove)"
+            };
+            println!("daemon      : {daemon_state}");
             let update = token_path()
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.join("update-available")))
@@ -526,6 +522,76 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             Ok(())
+        }
+
+        Command::Pause => {
+            let plist = plist_path()?;
+            if !plist.exists() {
+                anyhow::bail!(
+                    "No launchd agent installed — run `decent-node install` first."
+                );
+            }
+            if let Some(uid) = current_uid() {
+                let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
+                // bootout returns non-zero if the agent isn't loaded — that's
+                // "already stopped", not an error.
+                let stopped = std::process::Command::new("launchctl")
+                    .args(["bootout", &target])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if stopped {
+                    println!("Daemon paused — disconnected from dispatch, not rendering.");
+                    println!("Run `decent-node resume` to start it again.");
+                } else {
+                    println!("Daemon wasn't running (already paused).");
+                }
+                Ok(())
+            } else {
+                anyhow::bail!("Could not determine UID.")
+            }
+        }
+
+        Command::Resume => {
+            let plist = plist_path()?;
+            if !plist.exists() {
+                anyhow::bail!(
+                    "No launchd agent installed — run `decent-node install` first."
+                );
+            }
+            if let Some(uid) = current_uid() {
+                let domain = format!("gui/{uid}");
+                let bootstrapped = std::process::Command::new("launchctl")
+                    .args(["bootstrap", &domain, &plist.to_string_lossy()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if bootstrapped {
+                    println!("Daemon resumed — reconnecting to dispatch.");
+                } else {
+                    // bootstrap fails if already loaded — kick it instead.
+                    let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
+                    let kicked = std::process::Command::new("launchctl")
+                        .args(["kickstart", &target])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if kicked {
+                        println!("Daemon was already loaded — kicked (running).");
+                    } else {
+                        anyhow::bail!(
+                            "Could not resume the daemon. Try `decent-node install` to reload it."
+                        );
+                    }
+                }
+                Ok(())
+            } else {
+                anyhow::bail!("Could not determine UID.")
+            }
         }
     }
 }
