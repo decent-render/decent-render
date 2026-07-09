@@ -8,6 +8,8 @@
 //! The only difference: the CLI passes `Observability::default()` (tracing
 //! only), the app passes one with status/log channels attached.
 
+mod tui;
+
 use clap::{Parser, Subcommand};
 use supervisor_core::connection::{self, ConnectionConfig};
 use supervisor_core::protocol::{Capabilities, Platform, RegisterMessage, PROTOCOL_VERSION};
@@ -196,6 +198,24 @@ enum Command {
     Pause,
     /// Start the daemon again after `pause` (launchctl bootstrap).
     Resume,
+    /// Live terminal dashboard (W3.11): connection state, node identity,
+    /// current job + progress, counters, and a scrolling log tail. A
+    /// foreground supervisor (like `start`) with a UI — don't run alongside
+    /// an installed daemon on the same machine (two sockets, one device
+    /// token). `q`/Esc to quit.
+    Tui {
+        /// Dispatch WebSocket URL.
+        #[arg(long, env = "DISPATCH_URL", default_value = "ws://localhost:8790/ws")]
+        dispatch_url: String,
+        /// Worker JWT. If omitted (and no WORKER_TOKEN env), reads the token
+        /// stored by `decent-node login`.
+        #[arg(long, env = "WORKER_TOKEN")]
+        token: Option<String>,
+        /// Opt in to executing real render jobs. Default safety posture refuses
+        /// jobAssign frames and only registers/heartbeats.
+        #[arg(long, env = "ALLOW_REAL_JOBS", default_value_t = false)]
+        allow_real_jobs: bool,
+    },
 }
 
 /// Best-effort hardware probe: sysctl on macOS, stubs elsewhere.
@@ -592,6 +612,57 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 anyhow::bail!("Could not determine UID.")
             }
+        }
+
+        Command::Tui {
+            dispatch_url,
+            token,
+            allow_real_jobs,
+        } => {
+            let token = match token {
+                Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+                _ => load_token(),
+            };
+            if token.is_empty() {
+                anyhow::bail!(
+                    "No worker token. Run `decent-node login` to pair this machine, \
+                     or pass --token / set WORKER_TOKEN."
+                );
+            }
+            let register = RegisterMessage {
+                tenant: TENANT.into(),
+                protocol_version: PROTOCOL_VERSION,
+                operator: None,
+                platform: Platform::Company,
+                chip: detect_chip(),
+                ram_gb: detect_ram_gb(),
+                supervisor_version: SUPERVISOR_VERSION.into(),
+                payload_version: "none".into(),
+                capabilities: Capabilities {
+                    gpu: allow_real_jobs,
+                },
+            };
+            let config = ConnectionConfig {
+                heartbeat_limit: None,
+                allow_real_jobs,
+                ..ConnectionConfig::new(dispatch_url, token)
+            };
+            // Channels ON: the connection loop emits status snapshots (watch)
+            // + log lines (broadcast) that the TUI renders live.
+            let (obs, status_rx, log_rx) =
+                Observability::channels(SupervisorStatus::default());
+            obs.set_allow_real_jobs(allow_real_jobs);
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let conn = tokio::spawn(async move {
+                let _ = connection::run(&config, &register, &obs, shutdown_rx).await;
+            });
+            // Blocks until q/Esc; restores the terminal + signals shutdown.
+            if let Err(e) = crate::tui::run(status_rx, log_rx, shutdown_tx) {
+                eprintln!("TUI error: {e:#}");
+            }
+            // Let the connection task drain (clean disconnect) before exit.
+            let _ = conn.await;
+            Ok(())
         }
     }
 }
