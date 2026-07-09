@@ -1,28 +1,28 @@
-# Publish @decent-render/protocol to npm — securely.
+# Publish @decent-render/protocol to npm via OIDC TRUSTED PUBLISHING — passwordless.
 #
-# Supply-chain security model:
-#  1. CI-only publish. NPM_TOKEN lives as a secret, NEVER on a dev machine
-#     (removes the "infected laptop → stolen token" attack vector).
-#  2. Provenance signing: `--provenance` + OIDC attests each publish to this
-#     exact CI build/commit. npmjs.com shows "Provenance ✓"; consumers can
-#     verify the package came from our CI, not a random machine.
-#  3. Scoped Granular token (set as NPM_TOKEN): publish-only, limited to this
-#     package, ~90-day rotation.
-#  4. Protected `publish` environment: manual approval required before any
-#     publish runs, and NPM_TOKEN is only exposed inside it.
-#
-# Trigger: MANUAL (workflow_dispatch). Publishing is a deliberate act — bump
-# the version in packages/protocol/package.json first, then run this workflow.
+# NO npm token exists (nothing to steal, rotate, or store). npm trusts THIS
+# workflow in THIS repo + environment, authenticated each run by a short-lived
+# OIDC token issued by GitHub. Combined with the package setting "Require 2FA
+# and disallow tokens", ONLY this workflow can publish — token publishes are
+# rejected entirely. This is the OpenSSF trusted-publishers standard (same as
+# PyPI/RubyGems).
 #
 # ── ONE-TIME SETUP (owner) ──────────────────────────────────────────────
-#  • npmjs.com → Access Tokens → Granular Access Token: scope = ONLY
-#    @decent-render/protocol, permission = Read and write (publish), expiry
-#    ~90 days. (Keep 2FA on the account.)
-#  • GitHub → repo Settings → Environments → New environment "publish" →
-#    Required reviewers = you (manual-approval gate).
-#  • In that `publish` environment → Add secret `NPM_TOKEN` = the granular
-#    token above (environment-scoped, not repo-level).
-#  • Revoke the old broad/dev-machine token.
+#  npmjs.com → @decent-render/protocol → Settings:
+#   • Trusted Publisher → GitHub Actions:
+#       Organization/user = decent-render
+#       Repository        = decent-render
+#       Workflow filename = publish-protocol.yml   (filename only)
+#       Environment name  = publish
+#       Allowed actions   = npm publish
+#     → Set up connection.
+#   • Publishing access → "Require two-factor authentication and disallow
+#     tokens (recommended)" → Update.
+#  GitHub → repo Settings → Environments → New "publish" → Required reviewers = you.
+#
+#  No NPM_TOKEN secret. No token of any kind. (Revoke the legacy npm_KUHZ… token.)
+#
+# Requires npm CLI ≥11.5.1 + Node ≥22.14 — Node 24 (below) bundles npm 11.
 name: Publish protocol package
 
 on:
@@ -33,7 +33,7 @@ on:
         type: boolean
         default: false
 
-# id-token: write is REQUIRED for npm provenance (OIDC → Sigstore attestation).
+# id-token: write is REQUIRED — lets GitHub mint the OIDC token npm verifies.
 permissions:
   contents: read
   id-token: write
@@ -41,19 +41,17 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-22.04
-    # Protected environment: requires manual approval (Settings → Environments).
-    # NPM_TOKEN must be created as an environment secret here.
+    # Must match the trusted publisher's "Environment name". Create this
+    # environment in GitHub Settings with Required reviewers = you (manual
+    # approval gate before any publish).
     environment: publish
     steps:
       - uses: actions/checkout@v4
-
-      # NOTE: first-party actions on tags (@v4). For strict hardening, pin these
-      # to commit SHAs (Settings → or a future pass). Low risk for actions/*.
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          # Writes ~/.npmrc so `npm publish` authenticates via NODE_AUTH_TOKEN.
+          node-version: '24' # bundles npm 11 (≥11.5.1 required for trusted publishing)
           registry-url: 'https://registry.npmjs.org'
+          # No cache for release builds (reproducibility).
 
       - name: Install
         working-directory: packages/protocol
@@ -72,9 +70,9 @@ jobs:
         working-directory: packages/protocol
         run: npm pack
 
-      - name: Publish to npm with provenance
+      # No NODE_AUTH_TOKEN — the npm CLI auto-detects the GitHub OIDC
+      # environment and authenticates via the trusted publisher.
+      - name: Publish (OIDC trusted publisher — no token)
         if: ${{ !inputs.dry-run }}
         working-directory: packages/protocol
-        run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

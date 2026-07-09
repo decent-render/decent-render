@@ -51,13 +51,14 @@ cargo test -p supervisor-core cross_language
 
 ## Publishing
 
-**Secure, CI-only — never publish from a dev machine.** The publish is a
+**OIDC trusted publishing — no npm token exists.** The publish is a
 [GitHub Actions workflow](../../.github/workflows/publish-protocol.yml)
-(`workflow_dispatch`) that builds, runs the conformance tests, then publishes to
-npm **with provenance** (`--provenance` — npmjs.com shows "Provenance ✓",
-cryptographically tied to the exact CI build/commit). It is gated behind a
-protected `publish` environment (manual approval) and uses a scoped
-`NPM_TOKEN`.
+(`workflow_dispatch`) that authenticates to npm with a **short-lived, per-run
+OIDC token** from GitHub — no long-lived token to steal, rotate, or store. npm
+trusts *only* this specific workflow + repo + environment; combined with the
+package setting "Require 2FA and disallow tokens", **no token can publish this
+package, ever** — only this CI workflow can. (OpenSSF trusted-publishers
+standard, same as PyPI/RubyGems.)
 
 To publish a new version:
 
@@ -66,10 +67,12 @@ To publish a new version:
 3. GitHub → Actions → **Publish protocol package** → Run workflow,
 4. approve the `publish` environment prompt.
 
-`NPM_TOKEN` is a **Granular** npm token (scoped to this package only, publish
-permission, ~90-day rotation), stored as an *environment* secret — never in a
-dev machine's `~/.npmrc`. This closes the stolen-token / infected-dev-machine
-attack vector seen in recent npm supply-chain incidents.
+One-time setup (owner): on npmjs.com configure the package's **Trusted
+Publisher** (GitHub Actions; org `decent-render`, repo `decent-render`, workflow
+`publish-protocol.yml`, environment `publish`, action `npm publish`) and set
+**Publishing access = "Require 2FA and disallow tokens (recommended)"**. On
+GitHub, create the `publish` environment with Required reviewers = you. No
+`NPM_TOKEN` secret is needed.
 
 ## Wire format
 
