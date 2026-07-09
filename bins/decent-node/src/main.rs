@@ -251,6 +251,40 @@ fn detect_ram_gb() -> u32 {
     0 // stub on platforms without a probe
 }
 
+/// Resolve the worker token: explicit `--token` / WORKER_TOKEN env wins,
+/// else the token file written by `decent-node login`. Errors if none.
+fn resolve_token(token: Option<String>) -> anyhow::Result<String> {
+    let token = match token {
+        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => load_token(),
+    };
+    if token.is_empty() {
+        anyhow::bail!(
+            "No worker token. Run `decent-node login` to pair this machine, \
+             or pass --token / set WORKER_TOKEN."
+        );
+    }
+    Ok(token)
+}
+
+/// Build the register message from probed hardware + the real-jobs flag.
+/// Shared by every foreground command (`start`, `tui`).
+fn build_register(allow_real_jobs: bool) -> RegisterMessage {
+    RegisterMessage {
+        tenant: TENANT.into(),
+        protocol_version: PROTOCOL_VERSION,
+        operator: None,
+        platform: Platform::Company,
+        chip: detect_chip(),
+        ram_gb: detect_ram_gb(),
+        supervisor_version: SUPERVISOR_VERSION.into(),
+        payload_version: "none".into(),
+        capabilities: Capabilities {
+            gpu: allow_real_jobs,
+        },
+    }
+}
+
 /** Is the decent-node launchd agent currently loaded? */
 fn launchctl_has_label() -> bool {
     std::process::Command::new("launchctl")
@@ -273,13 +307,21 @@ fn current_uid() -> Option<String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // The TUI runs in the alternate screen; tracing-to-stderr would leave
+    // leftover text on exit. Skip the subscriber in TUI mode — the connection
+    // loop emits its events via the obs.log() channel, which the TUI renders
+    // directly, so nothing important is lost.
+    if !matches!(cli.command, Command::Tui { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info".into()),
+            )
+            .init();
+    }
+
     match cli.command {
         Command::Start {
             dispatch_url,
@@ -287,31 +329,8 @@ async fn main() -> anyhow::Result<()> {
             heartbeat_limit,
             allow_real_jobs,
         } => {
-            // Resolve token: explicit --token / WORKER_TOKEN env, else the
-            // token file written by `decent-node login`.
-            let token = match token {
-                Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-                _ => load_token(),
-            };
-            if token.is_empty() {
-                anyhow::bail!(
-                    "No worker token. Run `decent-node login` to pair this machine, \
-                     or pass --token / set WORKER_TOKEN."
-                );
-            }
-            let register = RegisterMessage {
-                tenant: TENANT.into(),
-                protocol_version: PROTOCOL_VERSION,
-                operator: None,
-                platform: Platform::Company,
-                chip: detect_chip(),
-                ram_gb: detect_ram_gb(),
-                supervisor_version: SUPERVISOR_VERSION.into(),
-                payload_version: "none".into(),
-                capabilities: Capabilities {
-                    gpu: allow_real_jobs,
-                },
-            };
+            let token = resolve_token(token)?;
+            let register = build_register(allow_real_jobs);
             tracing::info!(
                 dispatch_url = %dispatch_url,
                 chip = %register.chip,
@@ -619,29 +638,8 @@ async fn main() -> anyhow::Result<()> {
             token,
             allow_real_jobs,
         } => {
-            let token = match token {
-                Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-                _ => load_token(),
-            };
-            if token.is_empty() {
-                anyhow::bail!(
-                    "No worker token. Run `decent-node login` to pair this machine, \
-                     or pass --token / set WORKER_TOKEN."
-                );
-            }
-            let register = RegisterMessage {
-                tenant: TENANT.into(),
-                protocol_version: PROTOCOL_VERSION,
-                operator: None,
-                platform: Platform::Company,
-                chip: detect_chip(),
-                ram_gb: detect_ram_gb(),
-                supervisor_version: SUPERVISOR_VERSION.into(),
-                payload_version: "none".into(),
-                capabilities: Capabilities {
-                    gpu: allow_real_jobs,
-                },
-            };
+            let token = resolve_token(token)?;
+            let register = build_register(allow_real_jobs);
             let config = ConnectionConfig {
                 heartbeat_limit: None,
                 allow_real_jobs,
