@@ -1,6 +1,6 @@
 [package]
 name = "decent-node"
-version = "0.0.2"
+version = "0.0.3"
 description = "Decent render network node — thin CLI over supervisor-core. The Tauri shell comes later."
 edition.workspace = true
 license.workspace = true
