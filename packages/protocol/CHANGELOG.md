@@ -4,7 +4,7 @@ Notable changes to `@decent-render/protocol`. The package is versioned
 independently of the wire `PROTOCOL_VERSION` (which stays **2**); the wire format
 itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
 
-## [0.1.1] — Unreleased
+## [0.1.1] — 2026-07-10
 
 - **Zod 4 only.** Narrowed the peer-dependency range from `>=3 <5` to `>=4 <5`.
   Zod 3 is no longer a supported consumer. The schema surface was already
