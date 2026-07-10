@@ -32,8 +32,8 @@ import {
 const msg = WorkerMessageSchema.parse(JSON.parse(raw));
 ```
 
-`peerDependency`: `zod >=3 <5`. CI develops against Zod 4; the schema surface
-remains compatible with supported Zod 3 consumers.
+`peerDependency`: `zod >=4 <5` (Zod 4 only). Zod 3 support was dropped in
+0.1.1; the schema surface is tested against Zod 4 exclusively.
 
 ## Develop
 
