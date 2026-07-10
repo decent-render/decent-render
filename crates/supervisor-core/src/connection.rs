@@ -612,10 +612,13 @@ mod tests {
         // Verify the status channel reflects state transitions.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let config = fast_config(port);
+        let mut config = fast_config(port);
+        // This test controls the socket lifetime explicitly. A heartbeat limit
+        // races the Registered assertion against the second heartbeat timeout.
+        config.heartbeat_limit = None;
         let register = test_register();
 
-        let (obs, status_rx, _log_rx) =
+        let (obs, mut status_rx, _log_rx) =
             Observability::channels(crate::status::SupervisorStatus::default());
 
         let client =
@@ -624,13 +627,21 @@ mod tests {
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        // After connect + register, status should be Registered.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // After connect + register, wait for the status event rather than a
+        // wall-clock delay that can also let the connection close.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            status_rx.wait_for(|status| status.connection == ConnectionState::Registered),
+        )
+        .await
+        .expect("status did not reach Registered")
+        .expect("status channel closed before Registered");
         assert_eq!(status_rx.borrow().connection, ConnectionState::Registered);
         assert!(status_rx.borrow().node_identity.is_some());
 
-        // Drain heartbeats until clean close.
-        while ws.next().await.is_some() {}
+        // The server closes the connection; the client must publish the final
+        // Disconnected state before returning.
+        ws.close(None).await.unwrap();
         client.await.unwrap().expect("clean exit");
 
         assert_eq!(status_rx.borrow().connection, ConnectionState::Disconnected);
