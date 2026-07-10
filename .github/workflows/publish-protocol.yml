@@ -65,10 +65,10 @@ jobs:
         working-directory: packages/protocol
         run: npm test
 
-      - name: Dry run (npm pack — no publish)
+      - name: Dry run (full npm publish lifecycle — no publish)
         if: ${{ inputs.dry-run }}
         working-directory: packages/protocol
-        run: npm pack
+        run: npm publish --dry-run --access public
 
       # No NODE_AUTH_TOKEN — the npm CLI auto-detects the GitHub OIDC
       # environment and authenticates via the trusted publisher.

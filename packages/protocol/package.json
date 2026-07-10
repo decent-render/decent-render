@@ -21,7 +21,7 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
     "zod": ">=4 <5"
