@@ -23,7 +23,7 @@
 		"@types/react": "^19",
 		"@types/react-dom": "^19",
 		"@vitejs/plugin-react": "^4",
-		"jsdom": "^25",
+		"jsdom": "^29",
 		"typescript": "^5",
 		"vite": "^6",
 		"vitest": "^3"
