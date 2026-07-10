@@ -28,12 +28,12 @@ dispatch service, and the credit system are separate, closed components.
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/supervisor-core` | The core: wire protocol (v2), outbound WebSocket loop, job-execution orchestration (payload download + sha256 verify + spawn versioned runner + stream progress + upload + cancel), observable status bus, purge rule |
 | `bins/decent-node`       | Thin CLI over the core                                                                                                                                                                                                |
-| `apps/decent-app`        | Tauri v2 desktop app over the same core (**in-repo and maintained — a windowed console for local debugging; the CLI is the primary operator surface**)                                                |
+| `apps/decent-app`        | Tauri v2 desktop app over the same core (**in-repo and maintained — a windowed console for local debugging; the CLI is the primary operator surface**)                                                                |
 
 One core: the CLI is the shipped operator surface. The in-repo Tauri app
 drives the exact same `connection::run` code path with richer observability,
 and is kept maintained as a windowed console for local debugging. The CLI is
-the primary operator surface; a web dashboard (decent-render.com) will be the
+the primary operator surface; a web dashboard (`decent-render.farm`) will be the
 management surface for tracking your machines.
 
 ## Install
@@ -52,6 +52,10 @@ cargo install --git https://github.com/decent-render/decent-render decent-node
 ```
 
 ## Usage
+
+> **Pre-v0.1 compatibility name:** v0.0.4 is installed as `decent-node`. The
+> public CLI will be renamed to `decent` before v0.1, with an upgrade shim that
+> preserves existing token/config/launchd state.
 
 ```sh
 # Store a token issued by the tenant/network you are joining.
@@ -73,6 +77,10 @@ decent-node tui --dispatch-url wss://dispatch.example.com/ws --allow-real-jobs
 Worker tokens are minted by the platform (tenant) you register with. Real jobs
 remain disabled unless the operator explicitly opts in. Do not run the TUI and
 installed daemon simultaneously with the same device token.
+
+The future management surface is `decent-render.farm`: operators manage paired
+machines there; tenants manage API keys, usage, rotation/revocation, and
+webhooks. CLI/manual token scripts are bootstrap and internal-testing paths.
 
 ## Status
 
