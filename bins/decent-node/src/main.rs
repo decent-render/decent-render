@@ -449,17 +449,24 @@ async fn main() -> anyhow::Result<()> {
                             );
                             line(
                                 "current_job_phase",
-                                &job.as_ref().map(|j| format!("{:?}", j.phase)).unwrap_or_default(),
+                                &job.as_ref()
+                                    .map(|j| format!("{:?}", j.phase))
+                                    .unwrap_or_default(),
                             );
                             line(
                                 "current_job_progress",
-                                &job.as_ref().map(|j| j.progress.to_string()).unwrap_or_default(),
+                                &job.as_ref()
+                                    .map(|j| j.progress.to_string())
+                                    .unwrap_or_default(),
                             );
                             line("jobs_completed", &s.jobs_completed.to_string());
                             line("jobs_failed", &s.jobs_failed.to_string());
                             line("jobs_canceled", &s.jobs_canceled.to_string());
                             line("allow_real_jobs", &s.allow_real_jobs.to_string());
-                            line("update_available", s.update_available.as_deref().unwrap_or(""));
+                            line(
+                                "update_available",
+                                s.update_available.as_deref().unwrap_or(""),
+                            );
                             line("updated_at_ms", &now_ms().to_string());
                         }
                         let _ = std::fs::write(&status_path, snap);
@@ -684,9 +691,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Pause => {
             let plist = plist_path()?;
             if !plist.exists() {
-                anyhow::bail!(
-                    "No launchd agent installed — run `decent-node install` first."
-                );
+                anyhow::bail!("No launchd agent installed — run `decent-node install` first.");
             }
             if let Some(uid) = current_uid() {
                 let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
@@ -714,9 +719,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Resume => {
             let plist = plist_path()?;
             if !plist.exists() {
-                anyhow::bail!(
-                    "No launchd agent installed — run `decent-node install` first."
-                );
+                anyhow::bail!("No launchd agent installed — run `decent-node install` first.");
             }
             if let Some(uid) = current_uid() {
                 let domain = format!("gui/{uid}");
@@ -765,8 +768,7 @@ async fn main() -> anyhow::Result<()> {
             };
             // Channels ON: the connection loop emits status snapshots (watch)
             // + log lines (broadcast) that the TUI renders live.
-            let (obs, status_rx, log_rx) =
-                Observability::channels(SupervisorStatus::default());
+            let (obs, status_rx, log_rx) = Observability::channels(SupervisorStatus::default());
             obs.set_allow_real_jobs(allow_real_jobs);
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             let conn = tokio::spawn(async move {

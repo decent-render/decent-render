@@ -14,16 +14,19 @@ permissions:
 
 jobs:
   rust:
-    name: supervisor-core tests (incl. cross-language conformance)
+    name: Rust + CLI quality gates
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Runs every supervisor-core test, including
-      # `cross_language_fixtures_round_trip`, which round-trips the shared
-      # fixtures/v2.json through the Rust protocol types.
-      - run: cargo test -p supervisor-core
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p supervisor-core -p decent-node --all-targets --all-features -- -D warnings
+      # Includes Rust cross-language fixture conformance.
+      - run: cargo test -p supervisor-core -p decent-node
+      - run: cargo build -p decent-node
+      - run: ./target/debug/decent-node --version
+      - run: ./target/debug/decent-node --help
 
   protocol:
     name: protocol package conformance (TS)
@@ -31,9 +34,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
-      # The TS side parses + round-trips the same fixtures/v2.json through the
-      # zod schemas. bun auto-installs the zod peer dependency.
-      - run: bun install
+      - run: bun install --frozen-lockfile
+        working-directory: packages/protocol
+      - run: bun run build
         working-directory: packages/protocol
       - run: bun run test
         working-directory: packages/protocol
+
+  app-frontend:
+    name: Tauri frontend build + tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+        working-directory: apps/decent-app
+      - run: bun run build
+        working-directory: apps/decent-app
+      - run: bun run test
+        working-directory: apps/decent-app

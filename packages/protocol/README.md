@@ -5,12 +5,11 @@ a worker — TypeScript types + zod schemas.
 
 ## Canonical home
 
-This package is the **TS source of truth**, open-source in the
-[decent-render](https://github.com/decent-render/decent-render) repo. The **Rust
-canonical** is `crates/supervisor-core/src/protocol.rs`. The two are kept in sync
-by a **cross-language conformance test**: `fixtures/v2.json` is the shared
-wire-format contract, and both sides assert every fixture round-trips with no
-field drift.
+This package is the **TypeScript consumer API**, open-source in the
+[decent-render](https://github.com/decent-render/decent-render) repo. Rust's
+typed emitter/consumer lives in `crates/supervisor-core/src/protocol.rs`.
+`fixtures/v2.json` is the shared wire-format truth: Rust locks the fixtures and
+both sides assert every fixture round-trips with no field drift.
 
 - TS: `src/__tests__/conformance.test.ts` (parses each fixture with zod,
   re-serializes, asserts deep field-set equality).
@@ -33,7 +32,8 @@ import {
 const msg = WorkerMessageSchema.parse(JSON.parse(raw));
 ```
 
-`peerDependency`: `zod ^3`.
+`peerDependency`: `zod >=3 <5`. CI develops against Zod 4; the schema surface
+remains compatible with supported Zod 3 consumers.
 
 ## Develop
 

@@ -41,7 +41,7 @@ describe('protocol v2 — Rust⇄TS golden-fixture conformance', () => {
 			const schema =
 				c.direction === 'worker' ? WorkerMessageSchema : ServerMessageSchema;
 
-			// 1. TS must ACCEPT what the fixture (canonical = Rust's wire output) carries.
+			// 1. TS must ACCEPT what the shared fixture (locked from Rust) carries.
 			//    If TS requires a field Rust never sends, parse throws here.
 			const parsed = schema.parse(c.wire);
 

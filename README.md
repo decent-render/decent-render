@@ -38,23 +38,41 @@ management surface for tracking your machines.
 
 ## Install
 
-Build from source (requires Rust + Cargo):
+Apple Silicon macOS is the supported release target.
+
+```sh
+brew install decent-render/tap/decent-node
+```
+
+Or install the latest GitHub Release with its generated shell installer. Build
+from source when developing (requires Rust + Cargo):
 
 ```sh
 cargo install --git https://github.com/decent-render/decent-render decent-node
 ```
 
-A Homebrew tap and a crates.io package are coming.
-
 ## Usage
 
 ```sh
-decent-node start --dispatch-url ws://localhost:8790/ws --token <jwt>
-# or via env:
-DISPATCH_URL=wss://dispatch.example.com/ws WORKER_TOKEN=<jwt> decent-node start
+# Store a token issued by the tenant/network you are joining.
+decent-node login --token <worker-jwt>
+
+# Install the unattended launchd daemon against production dispatch.
+decent-node install
+
+# Inspect and control it.
+decent-node status
+decent-node pause
+decent-node resume
+decent-node upgrade
+
+# Or run the foreground terminal dashboard instead of the daemon.
+decent-node tui --dispatch-url wss://dispatch.example.com/ws --allow-real-jobs
 ```
 
-Worker tokens are minted by the platform (tenant) you register with.
+Worker tokens are minted by the platform (tenant) you register with. Real jobs
+remain disabled unless the operator explicitly opts in. Do not run the TUI and
+installed daemon simultaneously with the same device token.
 
 ## Status
 
@@ -80,7 +98,12 @@ controls, the core enforces workdir deletion structurally (`WorkDir::Drop`).
 ## Development
 
 ```sh
-cargo test
-cargo clippy -- -D warnings
-cargo fmt --check
+cargo fmt --all -- --check
+cargo clippy -p supervisor-core -p decent-node --all-targets --all-features -- -D warnings
+cargo test -p supervisor-core -p decent-node
 ```
+
+Read [AGENTS.md](./AGENTS.md) for invariants and the full gate matrix,
+[CONTRIBUTING.md](./CONTRIBUTING.md) before changing code, and
+[RELEASING.md](./RELEASING.md) before creating a tag. User-facing node changes
+are tracked in [CHANGELOG.md](./CHANGELOG.md).

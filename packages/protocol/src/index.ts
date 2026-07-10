@@ -6,11 +6,11 @@
  * pushed down, heartbeats ride the same connection (GitHub-Actions-runner
  * pattern — works behind any NAT, no public worker addresses).
  *
- * CANONICAL HOME: this package (`@decent-render/protocol`) is the TS source of
- * truth, living open-source in the decent-render repo. The Rust canonical lives
- * at `crates/supervisor-core/src/protocol.rs`. A cross-language conformance test
- * (Rust emits golden fixtures in `fixtures/`; this package's test asserts TS
- * matches them) keeps the two from drifting — see `__tests__/conformance.test.ts`.
+ * CONTRACT HOME: this package is the TypeScript consumer surface; Rust's typed
+ * emitter/consumer lives at `crates/supervisor-core/src/protocol.rs`.
+ * `fixtures/v2.json` is the shared wire truth: Rust locks the fixtures and both
+ * languages round-trip them. Neither side may change the wire alone — see
+ * `__tests__/conformance.test.ts`.
  *
  * Every message carries `tenant` — driffs is tenant #1, but the protocol is
  * platform-agnostic by construction.
