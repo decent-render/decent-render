@@ -7,7 +7,7 @@ open wire contract for the Decent render network.
 
 - `crates/supervisor-core/` — protocol types, connection/job orchestration,
   observability, and the purge invariant.
-- `bins/decent-node/` — the primary operator CLI/TUI and launchd integration.
+- `bins/decent/` — the primary operator CLI/TUI and launchd integration.
 - `apps/decent-app/` — maintained secondary Tauri window over the same core.
 - `packages/protocol/` — published TypeScript consumer surface and shared v2
   fixtures.
@@ -50,9 +50,9 @@ Run from the repository root before committing Rust/CLI changes:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy -p supervisor-core -p decent-node --all-targets --all-features -- -D warnings
-cargo test -p supervisor-core -p decent-node
-cargo build -p decent-node
+cargo clippy -p supervisor-core -p decent --all-targets --all-features -- -D warnings
+cargo test -p supervisor-core -p decent
+cargo build -p decent
 ./target/debug/decent-node --version
 ./target/debug/decent-node --help >/dev/null
 ```
@@ -82,7 +82,7 @@ above before declaring the work complete. CI mirrors these commands.
 
 The components are independently versioned:
 
-- `decent-node`: `bins/decent-node/Cargo.toml`
+- `decent`: `bins/decent/Cargo.toml`
 - `supervisor-core`: `crates/supervisor-core/Cargo.toml`
 - Tauri app: `apps/decent-app/package.json` and `src-tauri/Cargo.toml`
 - npm protocol: `packages/protocol/package.json`

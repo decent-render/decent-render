@@ -20,7 +20,7 @@ credit ledger, or render payloads.
 ```sh
 git clone https://github.com/decent-render/decent-render.git
 cd decent-render
-cargo build -p decent-node
+cargo build -p decent
 (cd packages/protocol && bun install --frozen-lockfile)
 (cd apps/decent-app && bun install --frozen-lockfile)
 ```
@@ -31,9 +31,9 @@ Rust/CLI:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy -p supervisor-core -p decent-node --all-targets --all-features -- -D warnings
-cargo test -p supervisor-core -p decent-node
-cargo build -p decent-node
+cargo clippy -p supervisor-core -p decent --all-targets --all-features -- -D warnings
+cargo test -p supervisor-core -p decent
+cargo build -p decent
 ./target/debug/decent-node --version
 ./target/debug/decent-node --help >/dev/null
 ```

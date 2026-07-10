@@ -21,12 +21,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p supervisor-core -p decent-node --all-targets --all-features -- -D warnings
+      - run: cargo clippy -p supervisor-core -p decent --all-targets --all-features -- -D warnings
       # Includes Rust cross-language fixture conformance.
-      - run: cargo test -p supervisor-core -p decent-node
-      - run: cargo build -p decent-node
-      - run: ./target/debug/decent-node --version
-      - run: ./target/debug/decent-node --help
+      - run: cargo test -p supervisor-core -p decent
+      - run: cargo build -p decent
+      - run: ./target/debug/decent --version
+      - run: ./target/debug/decent --help
 
   protocol:
     name: protocol package conformance (TS)

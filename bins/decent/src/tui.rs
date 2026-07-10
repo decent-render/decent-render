@@ -1,4 +1,4 @@
-//! decent-node TUI — the primary node-local operator surface (W3.11).
+//! decent TUI — the primary node-local operator surface (W3.11).
 //!
 //! A live terminal dashboard over the supervisor's observability channels:
 //! connection state, node identity, the current job + progress, job counters,
@@ -159,7 +159,7 @@ fn draw_title_bar(frame: &mut Frame, area: Rect, status: &SupervisorStatus) {
         .node_identity
         .as_ref()
         .map(|i| i.supervisor_version.as_str())
-        .unwrap_or("decent-node");
+        .unwrap_or("decent");
     let update = match &status.update_available {
         Some(v) => format!("  ⚠ update available: {v}"),
         None => String::new(),

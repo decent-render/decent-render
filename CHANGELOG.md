@@ -1,6 +1,6 @@
 # Changelog
 
-All notable user-facing changes to `decent-node` are recorded here. The node,
+All notable user-facing changes to `decent` are recorded here. The node,
 Tauri app, npm protocol package, and wire protocol have independent versions.
 Protocol-package history lives in `packages/protocol/CHANGELOG.md`.
 
@@ -11,10 +11,10 @@ The format follows Keep a Changelog and semantic versioning.
 ### Added
 
 - `pause` and `resume` controls for the installed launchd daemon.
-- Live terminal dashboard via `decent-node tui`.
+- Live terminal dashboard via `decent tui`.
 - Live daemon status snapshot with connection state, active job, progress, and
   session counters.
-- Running `decent-node` without a subcommand now opens status.
+- Running `decent` without a subcommand now opens status.
 
 ### Changed
 

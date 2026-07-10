@@ -707,6 +707,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "decent"
+version = "0.0.4"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "open",
+ "ratatui",
+ "supervisor-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "decent-app"
 version = "0.0.1"
 dependencies = [
@@ -727,18 +742,7 @@ dependencies = [
 
 [[package]]
 name = "decent-node"
-version = "0.0.4"
-dependencies = [
- "anyhow",
- "clap",
- "crossterm",
- "open",
- "ratatui",
- "supervisor-core",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
+version = "0.0.5"
 
 [[package]]
 name = "deranged"

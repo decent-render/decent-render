@@ -4,14 +4,14 @@ Releases are integrity events, not only version bumps. A release is complete
 when the tagged source, manifest version, generated assets, Homebrew artifact,
 and downloaded binary all agree.
 
-## `decent-node` release
+## `decent` release
 
 ### 1. Prepare
 
 1. Start from a clean, synchronized `main`.
 2. Add the user-facing changes under the target version in `CHANGELOG.md`.
-3. Update `bins/decent-node/Cargo.toml`.
-4. Run `cargo check -p decent-node` so `Cargo.lock` records the same version.
+3. Update `bins/decent/Cargo.toml`.
+4. Run `cargo check -p decent` so `Cargo.lock` records the same version.
 5. Run the complete gates from `AGENTS.md`.
 6. Run `bash scripts/release-check.sh X.Y.Z`.
 7. Commit only the version/changelog/lock changes:
@@ -19,7 +19,7 @@ and downloaded binary all agree.
 
 ### 2. Tag and publish
 
-1. Create an annotated tag: `git tag -a vX.Y.Z -m "decent-node vX.Y.Z"`.
+1. Create an annotated tag: `git tag -a vX.Y.Z -m "decent vX.Y.Z"`.
 2. Push the release commit, then the single tag.
 3. Watch the `Release` cargo-dist workflow to completion.
 4. Do not manually upload a partial substitute if the workflow stalls or fails.
@@ -39,15 +39,15 @@ Then verify from a clean download location:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/decent-render/decent-render/releases/download/vX.Y.Z/decent-node-installer.sh \
+  https://github.com/decent-render/decent-render/releases/download/vX.Y.Z/decent-installer.sh \
   | sh
 
-decent-node --version   # must report X.Y.Z
-decent-node --help
-decent-node status
+decent --version   # must report X.Y.Z
+decent --help
+decent status
 ```
 
-Finally update the Homebrew formula and verify `brew upgrade decent-node` on an
+Finally update the Homebrew formula and verify `brew upgrade decent` on an
 Apple Silicon machine. The formula version, URL, and SHA-256 must match the
 GitHub Release.
 

@@ -2,7 +2,7 @@
 
 Open-source node supervisor for the **Decent render network**: a distributed
 render farm for Remotion compositions, including GPU (WebGPU/Metal) renders
-that serverless infrastructure can't do. Operators run the `decent-node` CLI on
+that serverless infrastructure can't do. Operators run the `decent` CLI on
 an Apple-Silicon Mac; the supervisor opens a single **outbound** WebSocket to
 the dispatch service (GitHub-Actions-runner model — works behind any NAT, zero
 router configuration), receives jobs, renders, uploads, and purges.
@@ -27,7 +27,7 @@ dispatch service, and the credit system are separate, closed components.
 | Path                     | What                                                                                                                                                                                                                  |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/supervisor-core` | The core: wire protocol (v2), outbound WebSocket loop, job-execution orchestration (payload download + sha256 verify + spawn versioned runner + stream progress + upload + cancel), observable status bus, purge rule |
-| `bins/decent-node`       | Thin CLI over the core                                                                                                                                                                                                |
+| `bins/decent`       | Thin CLI over the core                                                                                                                                                                                                |
 | `apps/decent-app`        | Tauri v2 desktop app over the same core (**in-repo and maintained — a windowed console for local debugging; the CLI is the primary operator surface**)                                                                |
 
 One core: the CLI is the shipped operator surface. The in-repo Tauri app
@@ -41,37 +41,37 @@ management surface for tracking your machines.
 Apple Silicon macOS is the supported release target.
 
 ```sh
-brew install decent-render/tap/decent-node
+brew install decent-render/tap/decent
 ```
 
 Or install the latest GitHub Release with its generated shell installer. Build
 from source when developing (requires Rust + Cargo):
 
 ```sh
-cargo install --git https://github.com/decent-render/decent-render decent-node
+cargo install --git https://github.com/decent-render/decent-render decent
 ```
 
 ## Usage
 
-> **Pre-v0.1 compatibility name:** v0.0.4 is installed as `decent-node`. The
+> **Pre-v0.1 compatibility name:** v0.0.4 is installed as `decent`. The
 > public CLI will be renamed to `decent` before v0.1, with an upgrade shim that
 > preserves existing token/config/launchd state.
 
 ```sh
 # Store a token issued by the tenant/network you are joining.
-decent-node login --token <worker-jwt>
+decent login --token <worker-jwt>
 
 # Install the unattended launchd daemon against production dispatch.
-decent-node install
+decent install
 
 # Inspect and control it.
-decent-node status
-decent-node pause
-decent-node resume
-decent-node upgrade
+decent status
+decent pause
+decent resume
+decent upgrade
 
 # Or run the foreground terminal dashboard instead of the daemon.
-decent-node tui --dispatch-url wss://dispatch.example.com/ws --allow-real-jobs
+decent tui --dispatch-url wss://dispatch.example.com/ws --allow-real-jobs
 ```
 
 Worker tokens are minted by the platform (tenant) you register with. Real jobs
@@ -107,8 +107,8 @@ controls, the core enforces workdir deletion structurally (`WorkDir::Drop`).
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy -p supervisor-core -p decent-node --all-targets --all-features -- -D warnings
-cargo test -p supervisor-core -p decent-node
+cargo clippy -p supervisor-core -p decent --all-targets --all-features -- -D warnings
+cargo test -p supervisor-core -p decent
 ```
 
 Read [AGENTS.md](./AGENTS.md) for invariants and the full gate matrix,

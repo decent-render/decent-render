@@ -363,7 +363,7 @@ pub async fn run(
                             if reason.starts_with("upgrade-required") {
                                 tracing::warn!(%reason, "dispatch rejected connection (upgrade required)");
                                 eprintln!("\nUPGRADE REQUIRED — {reason}");
-                                eprintln!("Upgrade decent-node and restart.\n");
+                                eprintln!("Upgrade decent and restart.\n");
                                 obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                                 return Ok(());
                             }

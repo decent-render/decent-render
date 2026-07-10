@@ -1,6 +1,6 @@
-//! decent-node — thin CLI over supervisor-core.
+//! decent — thin CLI over supervisor-core.
 //!
-//! `decent-node start --dispatch-url ws://localhost:8790/ws --token <jwt>`
+//! `decent start --dispatch-url ws://localhost:8790/ws --token <jwt>`
 //! (or env vars DISPATCH_URL / WORKER_TOKEN). Registers with the dispatch and
 //! heartbeats; real rendering requires `--allow-real-jobs`.
 //!
@@ -18,14 +18,27 @@ use supervisor_core::status::{Observability, SupervisorStatus};
 const SUPERVISOR_VERSION: &str = concat!("rust-", env!("CARGO_PKG_VERSION"));
 const TENANT: &str = "driffs";
 
-/// Token storage: a 0600 file at ~/.config/decent-node/worker-token. Not the
-/// macOS Keychain — the Keychain prompts on access for an unsigned binary,
-/// which is hostile CLI UX; a revocable per-device worker token is fine in a
-/// user-only file, the way `gh` / `npm` store theirs.
+/// Token storage: a 0600 file at ~/.config/decent/worker-token.
+/// Migrates from the old ~/.config/decent-node/ path if the new path doesn't
+/// exist but the old one does (pre-v0.1 CLI rename backward compat).
 fn token_path() -> anyhow::Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate token file"))?;
-    Ok(std::path::PathBuf::from(home).join(".config/decent-node/worker-token"))
+    let home = std::path::PathBuf::from(
+        std::env::var_os("HOME")
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate token file"))?,
+    );
+
+    let new_path = home.join(".config/decent/worker-token");
+    let old_path = home.join(".config/decent/worker-token");
+
+    // One-time migration: if new path doesn't exist but old path does, copy.
+    if !new_path.exists() && old_path.exists() {
+        if let Some(parent) = new_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::copy(&old_path, &new_path);
+    }
+
+    Ok(new_path)
 }
 
 fn load_token() -> String {
@@ -133,7 +146,8 @@ fn set_owner_only(path: &std::path::Path, mode: u32) {
 fn set_owner_only(_path: &std::path::Path, _mode: u32) {}
 
 /// launchd label for the installed agent.
-const LAUNCHD_LABEL: &str = "com.decent-render.decent-node";
+const LAUNCHD_LABEL: &str = "com.decent-render.decent";
+const LEGACY_LAUNCHD_LABEL: &str = "com.decent-render.decent-node";
 
 fn launch_agents_dir() -> anyhow::Result<std::path::PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
@@ -146,7 +160,7 @@ fn plist_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(launch_agents_dir()?.join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
-/// Build the launchd agent plist: runs `decent-node start --allow-real-jobs` at
+/// Build the launchd agent plist: runs `decent start --allow-real-jobs` at
 /// login against dispatch, restarts on exit (KeepAlive), logs to the config dir.
 fn build_plist(exe: &std::path::Path, dispatch_url: &str, log_path: &std::path::Path) -> String {
     let exe_str = exe.to_string_lossy();
@@ -195,7 +209,7 @@ fn build_plist(exe: &std::path::Path, dispatch_url: &str, log_path: &std::path::
 
 #[derive(Parser)]
 #[command(
-    name = "decent-node",
+    name = "decent",
     version,
     about = "Decent render network node supervisor"
 )]
@@ -212,7 +226,7 @@ enum Command {
         #[arg(long, env = "DISPATCH_URL", default_value = "ws://localhost:8790/ws")]
         dispatch_url: String,
         /// Worker JWT. If omitted (and no WORKER_TOKEN env), reads the token
-        /// stored by `decent-node login` (the token file).
+        /// stored by `decent login` (the token file).
         #[arg(long, env = "WORKER_TOKEN")]
         token: Option<String>,
         /// Exit cleanly after this many heartbeats (smoke-test mode).
@@ -237,9 +251,9 @@ enum Command {
     },
     /// Forget the stored worker token (clears the token file).
     Logout,
-    /// Install as a macOS launchd agent: runs `decent-node start` at login and
+    /// Install as a macOS launchd agent: runs `decent start` at login and
     /// restarts on exit (KeepAlive), so the node renders unattended. Accepts
-    /// real jobs. Run `decent-node login` first to store a token.
+    /// real jobs. Run `decent login` first to store a token.
     Install {
         /// Dispatch WebSocket URL.
         #[arg(
@@ -254,7 +268,7 @@ enum Command {
     /// Show pairing + daemon status: is a token stored? is the launchd agent
     /// installed/loaded?
     Status,
-    /// Upgrade decent-node via Homebrew, then restart the daemon (if loaded)
+    /// Upgrade decent via Homebrew, then restart the daemon (if loaded)
     /// so launchd relaunches it with the new binary. One-command fleet update.
     Upgrade,
     /// Stop the daemon (launchctl bootout): the node disconnects from dispatch
@@ -275,7 +289,7 @@ enum Command {
         #[arg(long, env = "DISPATCH_URL", default_value = "ws://localhost:8790/ws")]
         dispatch_url: String,
         /// Worker JWT. If omitted (and no WORKER_TOKEN env), reads the token
-        /// stored by `decent-node login`.
+        /// stored by `decent login`.
         #[arg(long, env = "WORKER_TOKEN")]
         token: Option<String>,
         /// Opt in to executing real render jobs. Default safety posture refuses
@@ -319,7 +333,7 @@ fn detect_ram_gb() -> u32 {
 }
 
 /// Resolve the worker token: explicit `--token` / WORKER_TOKEN env wins,
-/// else the token file written by `decent-node login`. Errors if none.
+/// else the token file written by `decent login`. Errors if none.
 fn resolve_token(token: Option<String>) -> anyhow::Result<String> {
     let token = match token {
         Some(t) if !t.trim().is_empty() => t.trim().to_string(),
@@ -327,7 +341,7 @@ fn resolve_token(token: Option<String>) -> anyhow::Result<String> {
     };
     if token.is_empty() {
         anyhow::bail!(
-            "No worker token. Run `decent-node login` to pair this machine, \
+            "No worker token. Run `decent login` to pair this machine, \
              or pass --token / set WORKER_TOKEN."
         );
     }
@@ -352,13 +366,29 @@ fn build_register(allow_real_jobs: bool) -> RegisterMessage {
     }
 }
 
-/** Is the decent-node launchd agent currently loaded? */
+/** Is the decent launchd agent currently loaded? Also checks the legacy
+ * com.decent-render.decent-node label for upgraded installs. */
 fn launchctl_has_label() -> bool {
     std::process::Command::new("launchctl")
         .arg("list")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(LAUNCHD_LABEL))
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            out.contains(LAUNCHD_LABEL) || out.contains(LEGACY_LAUNCHD_LABEL)
+        })
         .unwrap_or(false)
+}
+
+/// Unload the legacy decent-node launchd agent if present (one-time migration
+/// during the decent-node → decent rename). No-op if not found.
+fn unload_legacy_agent() {
+    let _ = std::process::Command::new("launchctl")
+        .args([
+            "bootout",
+            &format!("gui/{}", current_uid().unwrap_or_default()),
+            LEGACY_LAUNCHD_LABEL,
+        ])
+        .output();
 }
 
 /// Current numeric UID, for the launchctl `gui/<uid>/<label>` service target.
@@ -376,9 +406,9 @@ fn current_uid() -> Option<String> {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // No subcommand → default to `status` (a friendly entry point: bare
-    // `decent-node` shows you where the node stands).
+    // `decent` shows you where the node stands).
     let command = cli.command.unwrap_or_else(|| {
-        println!("No command given — showing status. Run `decent-node --help` for all commands.\n");
+        println!("No command given — showing status. Run `decent --help` for all commands.\n");
         Command::Status
     });
 
@@ -408,7 +438,7 @@ async fn main() -> anyhow::Result<()> {
                 dispatch_url = %dispatch_url,
                 chip = %register.chip,
                 ram_gb = register.ram_gb,
-                "starting decent-node {SUPERVISOR_VERSION}"
+                "starting decent {SUPERVISOR_VERSION}"
             );
             let config = ConnectionConfig {
                 heartbeat_limit,
@@ -416,7 +446,7 @@ async fn main() -> anyhow::Result<()> {
                 ..ConnectionConfig::new(dispatch_url, token)
             };
             // CLI uses real status channels so a background task can persist
-            // `updateAvailable` for `decent-node status` to surface.
+            // `updateAvailable` for `decent status` to surface.
             let (obs, _status_rx, _log_rx) = Observability::channels(SupervisorStatus::default());
             obs.set_allow_real_jobs(allow_real_jobs);
             // Persist a status snapshot the separate `status` command reads, so an
@@ -477,7 +507,7 @@ async fn main() -> anyhow::Result<()> {
             // CLI never signals shutdown — runs until heartbeat-limit or server close.
             let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             connection::run(&config, &register, &obs, shutdown_rx).await?;
-            tracing::info!("decent-node exited cleanly");
+            tracing::info!("decent exited cleanly");
             Ok(())
         }
 
@@ -491,8 +521,8 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 save_token(&tok)?;
-                println!("Token saved to ~/.config/decent-node/worker-token (0600).");
-                println!("Run `decent-node start`, or `decent-node install` for the daemon.");
+                println!("Token saved to ~/.config/decent/worker-token (0600).");
+                println!("Run `decent start`, or `decent install` for the daemon.");
                 return Ok(());
             }
             let pairing_url = format!("{}/settings/devices", app_url.trim_end_matches('/'));
@@ -508,11 +538,11 @@ async fn main() -> anyhow::Result<()> {
             if token.split('.').count() != 3 {
                 anyhow::bail!(
                     "That doesn't look like a worker token (expected three dot-separated parts). \
-                     Re-run `decent-node login`."
+                     Re-run `decent login`."
                 );
             }
             save_token(&token)?;
-            println!("Token saved to ~/.config/decent-node/worker-token (0600). Run `decent-node start` to connect.");
+            println!("Token saved to ~/.config/decent/worker-token (0600). Run `decent start` to connect.");
             Ok(())
         }
 
@@ -535,15 +565,17 @@ async fn main() -> anyhow::Result<()> {
             // token (start would exit immediately, launchd would restart it).
             if load_token().is_empty() {
                 anyhow::bail!(
-                    "No worker token stored. Run `decent-node login` first, then `decent-node install`."
+                    "No worker token stored. Run `decent login` first, then `decent install`."
                 );
             }
+            // One-time migration: unload the legacy decent-node agent if present.
+            unload_legacy_agent();
             let exe = std::env::current_exe()?;
             let plist = plist_path()?;
             let log_path = token_path()?
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("token file has no parent"))?
-                .join("decent-node.log");
+                .join("decent.log");
             let xml = build_plist(&exe, &dispatch_url, &log_path);
             // Best-effort unload for a clean reinstall (suppress output —
             // "not loaded" is the expected first-install case, not an error).
@@ -566,8 +598,10 @@ async fn main() -> anyhow::Result<()> {
             println!("  binary: {}", exe.display());
             println!("  plist:  {}", plist.display());
             println!("  log:    {}", log_path.display());
-            println!("Runs `decent-node start --allow-real-jobs` at login; restarts on exit (KeepAlive).");
-            println!("Tip: run `decent-node login` first if this machine has no token yet.");
+            println!(
+                "Runs `decent start --allow-real-jobs` at login; restarts on exit (KeepAlive)."
+            );
+            println!("Manage devices at https://decent-render.farm/devices");
             Ok(())
         }
 
@@ -588,7 +622,7 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "token stored : {}",
                 if token.is_empty() {
-                    "NO  — run `decent-node login`"
+                    "NO  — run `decent login`"
                 } else {
                     "yes"
                 }
@@ -596,11 +630,11 @@ async fn main() -> anyhow::Result<()> {
             let plist_present = plist_path().map(|p| p.exists()).unwrap_or(false);
             let loaded = launchctl_has_label();
             let daemon_state = if !plist_present {
-                "not installed — run `decent-node install`"
+                "not installed — run `decent install`"
             } else if loaded {
                 "running"
             } else {
-                "paused — run `decent-node resume` (or `uninstall` to remove)"
+                "paused — run `decent resume` (or `uninstall` to remove)"
             };
             println!("daemon      : {daemon_state}");
             // Live daemon state from the snapshot the running daemon writes.
@@ -622,7 +656,7 @@ async fn main() -> anyhow::Result<()> {
                         "update      : {}",
                         match s.update_available {
                             Some(v) => {
-                                format!("⚠ {v} available — `brew upgrade decent-node` + restart")
+                                format!("⚠ {v} available — `brew upgrade decent` + restart")
                             }
                             None => "up to date".to_string(),
                         }
@@ -643,22 +677,22 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Upgrade => {
-            // 1. brew upgrade decent-node — swaps the binary on disk. The
+            // 1. brew upgrade decent — swaps the binary on disk. The
             //    running `upgrade` process keeps its old in-memory copy; the
             //    NEXT invocation uses the new binary.
             let brew = std::process::Command::new("brew")
-                .args(["upgrade", "decent-node"])
+                .args(["upgrade", "decent"])
                 .status();
             match brew {
                 Ok(s) if s.success() => {}
                 Ok(s) => {
-                    anyhow::bail!("`brew upgrade decent-node` failed (exit {:?})", s.code())
+                    anyhow::bail!("`brew upgrade decent` failed (exit {:?})", s.code())
                 }
                 Err(_) => anyhow::bail!(
                     "Could not run `brew` — is Homebrew installed? Upgrade manually and restart."
                 ),
             }
-            println!("Upgraded decent-node via Homebrew.");
+            println!("Upgraded decent via Homebrew.");
             // 2. Restart the daemon so launchd relaunches with the new binary.
             //    Only if the agent is loaded; KeepAlive makes `kickstart -k`
             //    sufficient (kill + relaunch).
@@ -681,9 +715,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("  launchctl kickstart -k gui/$(id -u)/{LAUNCHD_LABEL}");
                 }
             } else {
-                println!(
-                    "Launchd agent not loaded — run `decent-node start` to use the new version."
-                );
+                println!("Launchd agent not loaded — run `decent start` to use the new version.");
             }
             Ok(())
         }
@@ -691,7 +723,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Pause => {
             let plist = plist_path()?;
             if !plist.exists() {
-                anyhow::bail!("No launchd agent installed — run `decent-node install` first.");
+                anyhow::bail!("No launchd agent installed — run `decent install` first.");
             }
             if let Some(uid) = current_uid() {
                 let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
@@ -706,7 +738,7 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or(false);
                 if stopped {
                     println!("Daemon paused — disconnected from dispatch, not rendering.");
-                    println!("Run `decent-node resume` to start it again.");
+                    println!("Run `decent resume` to start it again.");
                 } else {
                     println!("Daemon wasn't running (already paused).");
                 }
@@ -719,7 +751,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Resume => {
             let plist = plist_path()?;
             if !plist.exists() {
-                anyhow::bail!("No launchd agent installed — run `decent-node install` first.");
+                anyhow::bail!("No launchd agent installed — run `decent install` first.");
             }
             if let Some(uid) = current_uid() {
                 let domain = format!("gui/{uid}");
@@ -744,7 +776,7 @@ async fn main() -> anyhow::Result<()> {
                         println!("Daemon was already loaded — kicked (running).");
                     } else {
                         anyhow::bail!(
-                            "Could not resume the daemon. Try `decent-node install` to reload it."
+                            "Could not resume the daemon. Try `decent install` to reload it."
                         );
                     }
                 }

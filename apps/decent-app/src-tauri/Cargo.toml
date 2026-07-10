@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 # Not distributed via cargo-dist — the Tauri app ships as a .dmg/.app via
-# Tauri's own bundler, not a bare-binary tarball. Only decent-node (the CLI)
+# Tauri's own bundler, not a bare-binary tarball. Only decent (the CLI)
 # goes through the dist release pipeline.
 [package.metadata.dist]
 dist = false

@@ -1,6 +1,6 @@
 # Decent Render — Operator App
 
-A Tauri v2 desktop app that wraps the same `supervisor-core` as the `decent-node`
+A Tauri v2 desktop app that wraps the same `supervisor-core` as the `decent`
 CLI. One core, two skins: the app drives the exact same `connection::run` code
 path, just with status/log channels attached.
 
@@ -46,7 +46,7 @@ the first time). Subsequent runs are fast thanks to incremental compilation.
 
 ## How the app maps to the CLI
 
-| Concern            | CLI (`decent-node`)         | App (`decent-app`)                   |
+| Concern            | CLI (`decent`)         | App (`decent-app`)                   |
 | ------------------ | --------------------------- | ------------------------------------ |
 | Core code path     | `connection::run`           | `connection::run` (same function)    |
 | Observability      | `Observability::default()`  | `Observability::channels()`          |
