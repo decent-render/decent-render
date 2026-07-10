@@ -6,7 +6,7 @@ Protocol-package history lives in `packages/protocol/CHANGELOG.md`.
 
 The format follows Keep a Changelog and semantic versioning.
 
-## [Unreleased]
+## [0.0.4] - 2026-07-10
 
 ### Added
 
@@ -24,6 +24,8 @@ The format follows Keep a Changelog and semantic versioning.
 
 - v0.0.4 must ship through the complete cargo-dist pipeline and restore the
   installer/checksum/manifest asset contract after partial historical releases.
+- The connection-state transition test now synchronizes on status events instead
+  of racing the release suite against its heartbeat shutdown timer.
 
 ## [0.0.3] - 2026-07-09
 
