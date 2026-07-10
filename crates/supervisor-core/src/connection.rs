@@ -641,8 +641,15 @@ mod tests {
 
         // The server closes the connection; the client must publish the final
         // Disconnected state before returning.
-        ws.close(None).await.unwrap();
-        client.await.unwrap().expect("clean exit");
+        tokio::time::timeout(Duration::from_secs(1), ws.close(None))
+            .await
+            .expect("server close handshake timed out")
+            .expect("server close failed");
+        tokio::time::timeout(Duration::from_secs(1), client)
+            .await
+            .expect("client did not exit after server close")
+            .expect("client task panicked")
+            .expect("clean exit");
 
         assert_eq!(status_rx.borrow().connection, ConnectionState::Disconnected);
     }
