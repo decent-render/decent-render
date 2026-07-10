@@ -33,7 +33,7 @@
   },
   "devDependencies": {
     "typescript": "^5.4.0",
-    "vitest": "^1.6.0",
+    "vitest": "^4.1.10",
     "zod": "^4.3.6"
   },
   "keywords": [
