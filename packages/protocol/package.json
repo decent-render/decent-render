@@ -3,6 +3,11 @@
   "version": "0.1.1",
   "description": "Decent render-network wire protocol (v2) — shared TS types and zod schemas, pinned to Rust by shared fixtures and cross-language conformance tests.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/decent-render/decent-render.git",
+    "directory": "packages/protocol"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
