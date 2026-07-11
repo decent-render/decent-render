@@ -8,10 +8,17 @@ cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell"]
+installers = ["shell", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax).
 # Apple-Silicon-only for launch: the render payloads are arm64-compiled, so
 # Intel Macs can't run them; Windows is out of scope; Linux is W3.10 (Phase 2).
 targets = ["aarch64-apple-darwin"]
 # Where to host releases
 hosting = "github"
+
+# Homebrew tap — cargo-dist generates Formula/<crate>.rb and pushes on tag.
+# Requires HOMEBREW_TAP_TOKEN secret in the repo (GitHub PAT with repo scope
+# on decent-render/homebrew-tap).
+[dist.homebrew]
+formula = "decent"
+tap = "decent-render/homebrew-tap"

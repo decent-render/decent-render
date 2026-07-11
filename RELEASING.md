@@ -51,6 +51,11 @@ Finally update the Homebrew formula and verify `brew upgrade decent` on an
 Apple Silicon machine. The formula version, URL, and SHA-256 must match the
 GitHub Release.
 
+cargo-dist auto-generates and pushes `Formula/decent.rb` to the tap on tag
+(configured in `dist-workspace.toml` `[dist.homebrew]`). The deprecated
+`Formula/decent-node.rb` (compatibility shim) is maintained by the
+`update-homebrew-shim.yml` workflow, which runs on release completion.
+
 ## Failed release recovery
 
 - A tag with no GitHub Release is incomplete.

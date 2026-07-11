@@ -1,0 +1,83 @@
+# Auto-update Formula/decent-node.rb (the deprecated compatibility shim) on
+# every successful release. The primary Formula/decent.rb is handled by
+# cargo-dist's built-in homebrew installer.
+#
+# Requires HOMEBREW_TAP_TOKEN secret (GitHub PAT with repo scope on
+# decent-render/homebrew-tap).
+
+name: Update Homebrew Shim Formula
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+    branches:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  update-shim:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Determine version and artifact SHA
+        id: info
+        run: |
+          TAG="${{ github.event.workflow_run.head_branch }}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # Fetch the SHA256 of the shim artifact
+          SHA=$(curl -sL "https://github.com/decent-render/decent-render/releases/download/${TAG}/decent-node-aarch64-apple-darwin.tar.xz.sha256" | awk '{print $1}')
+          if [ -z "$SHA" ]; then
+            echo "Failed to fetch SHA256 for decent-node artifact"
+            exit 1
+          fi
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Update Formula/decent-node.rb
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${{ steps.info.outputs.version }}"
+          TAG="${{ steps.info.outputs.tag }}"
+          SHA="${{ steps.info.outputs.sha256 }}"
+
+          # Fetch existing file SHA (needed for update)
+          EXISTING=$(gh api repos/decent-render/homebrew-tap/contents/Formula/decent-node.rb --jq '.sha' 2>/dev/null || echo "")
+
+          # Build formula content
+          FORMULA="class DecentNode < Formula
+            desc \"DEPRECATED: use 'decent' instead — compatibility shim that forwards to decent\"
+            homepage \"https://github.com/decent-render/decent-render\"
+            url \"https://github.com/decent-render/decent-render/releases/download/${TAG}/decent-node-aarch64-apple-darwin.tar.xz\"
+            sha256 \"${SHA}\"
+            license \"Apache-2.0\"
+
+            depends_on arch: :arm64
+
+            def install
+              bin.install \"decent-node\"
+            end
+
+            test do
+              assert_match \"decent\", shell_output(\"\#{bin}/decent-node --help 2>&1\", 1)
+            end
+          end"
+
+          CONTENT_B64=$(echo -n "$FORMULA" | base64 -w 0)
+
+          ARGS=(
+            --method PUT
+            repos/decent-render/homebrew-tap/contents/Formula/decent-node.rb
+            -f message="decent-node ${TAG} (deprecated shim — auto-updated)"
+            -f content="$CONTENT_B64"
+          )
+          if [ -n "$EXISTING" ]; then
+            ARGS+=(-f sha="$EXISTING")
+          fi
+
+          gh api "${ARGS[@]}" --jq '.commit.html_url'
