@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "decent"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "decent-node"
-version = "0.0.6"
+version = "0.0.7"
 
 [[package]]
 name = "deranged"

@@ -6,6 +6,16 @@ Protocol-package history lives in `packages/protocol/CHANGELOG.md`.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.7] - 2026-07-11
+
+### Changed
+
+- `decent login` now defaults to `https://decent-render.farm/devices` for
+  pairing (was driffs `/settings/devices`). The `--app-url` flag overrides.
+- Removed hardcoded `tenant: "driffs"` from the register message. The farm
+  dispatch identifies workers by token (account → workspace), not tenant.
+- Added `MIN_DISPATCH_VERSION` constant for future version-compat guard.
+
 ## [0.0.6] - 2026-07-11
 
 ### Fixed

@@ -1,6 +1,6 @@
 [package]
 name = "decent-node"
-version = "0.0.6"
+version = "0.0.7"
 description = "Compatibility shim — forwards to the 'decent' binary. Deprecated; will be removed in v0.1."
 edition.workspace = true
 license.workspace = true

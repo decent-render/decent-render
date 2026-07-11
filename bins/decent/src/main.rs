@@ -16,7 +16,9 @@ use supervisor_core::protocol::{Capabilities, Platform, RegisterMessage, PROTOCO
 use supervisor_core::status::{Observability, SupervisorStatus};
 
 const SUPERVISOR_VERSION: &str = concat!("rust-", env!("CARGO_PKG_VERSION"));
-const TENANT: &str = "driffs";
+/// Minimum dispatch server version this client is compatible with.
+#[allow(dead_code)]
+const MIN_DISPATCH_VERSION: &str = "0.0.1";
 
 /// Token storage: a 0600 file at ~/.config/decent/worker-token.
 /// Migrates from the old ~/.config/decent-node/ path if the new path doesn't
@@ -248,7 +250,7 @@ enum Command {
     /// token, and store it in a 0600 file for `start` to use.
     Login {
         /// The web app URL to pair against.
-        #[arg(long, env = "APP_URL", default_value = "https://decent-riffs.com")]
+        #[arg(long, env = "APP_URL", default_value = "https://decent-render.farm")]
         app_url: String,
         /// Store a worker token directly instead of opening the web pairing
         /// page. For company/internal tokens minted via
@@ -359,7 +361,7 @@ fn resolve_token(token: Option<String>) -> anyhow::Result<String> {
 /// Shared by every foreground command (`start`, `tui`).
 fn build_register(allow_real_jobs: bool) -> RegisterMessage {
     RegisterMessage {
-        tenant: TENANT.into(),
+        tenant: String::new(), // no longer used by farm dispatch (kept for protocol compat)
         protocol_version: PROTOCOL_VERSION,
         operator: None,
         platform: Platform::Company,
@@ -557,13 +559,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("Run `decent start`, or `decent install` for the daemon.");
                 return Ok(());
             }
-            let pairing_url = format!("{}/settings/devices", app_url.trim_end_matches('/'));
-            println!("Open this page to issue a worker token for this machine:");
+            // Default to the farm devices page for pairing
+            let pairing_url = format!("{}/devices", app_url.trim_end_matches('/'));
+            println!("Opening your browser to pair this device:");
             println!("  {pairing_url}");
-            // Best-effort browser open (no-op on a headless box); never fatal.
+            // Best-effort browser open
             let _ = open::that(&pairing_url);
             println!();
-            println!("After issuing the token, paste it here (shown once on the page):");
+            println!("After issuing the token on that page, paste it here:");
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
             let token = line.trim().to_string();
