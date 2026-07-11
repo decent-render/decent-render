@@ -6,6 +6,31 @@ Protocol-package history lives in `packages/protocol/CHANGELOG.md`.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.5] - 2026-07-11
+
+### Changed
+
+- **CLI renamed from `decent-node` to `decent`.** The binary, crate, and all
+  user-facing command references use `decent` now. A `decent-node` compatibility
+  shim is published alongside `decent` — it prints a deprecation warning and
+  forwards all arguments to `decent`. The shim will be removed in v0.1.
+- **Config/log path migration:** `~/.config/decent-node/` → `~/.config/decent/`.
+  The token file is auto-migrated on first run if the new path doesn't exist.
+- **Launchd label migration:** `com.decent-render.decent-node` →
+  `com.decent-render.decent`. The legacy agent is automatically unloaded during
+  `decent install`; status checks recognize both labels during transition.
+- Removed misleading post-install login tip (the token guard already catches
+  missing tokens before reaching that line).
+
+### Migration for existing v0.0.4 installs
+
+```bash
+brew upgrade decent-render/tap/decent    # installs the new `decent` binary
+decent status                             # token auto-migrated, daemon label updated
+```
+
+The old `decent-node` command continues to work via the shim.
+
 ## [0.0.4] - 2026-07-10
 
 ### Added

@@ -1,6 +1,6 @@
 [package]
 name = "decent"
-version = "0.0.4"
+version = "0.0.5"
 description = "Decent render network node — CLI and TUI over supervisor-core."
 edition.workspace = true
 license.workspace = true
