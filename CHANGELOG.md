@@ -6,6 +6,38 @@ Protocol-package history lives in `packages/protocol/CHANGELOG.md`.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.6] - 2026-07-11
+
+### Fixed
+
+- **Token migration was dead** — `token_path()` checked the same path for both
+  old and new (`~/.config/decent/` instead of `~/.config/decent-node/`), so the
+  migration condition was always false. Fixed: old path is now correctly
+  `~/.config/decent-node/worker-token`. The token copies on the first command
+  run after upgrade (status, start, install — any command that reads the token).
+- **Legacy daemon detection in `decent status`** — when the old
+  `com.decent-render.decent-node` daemon is still running, status now shows a
+  warning: "Run `decent install` to migrate the token + daemon label."
+- **Legacy plist cleanup** — `decent install` now removes the old plist file
+  after installing the new one, so the legacy daemon doesn't reload on next
+  login.
+- Migration prints a confirmation message: "Migrated token from
+  ~/.config/decent-node/ → ~/.config/decent/"
+
+### Migration from v0.0.5 (broken) or v0.0.4
+
+The v0.0.5 release had the dead migration bug. If `decent status` reports no
+token but the old daemon is still running, the fix is:
+
+```bash
+brew upgrade decent-render/tap/decent    # installs v0.0.6
+decent status                             # auto-migrates token, shows legacy warning
+decent install                            # migrates daemon: unloads old label, loads new
+decent status                             # confirms: token=yes, daemon=running
+```
+
+The old daemon keeps running until `decent install` — no gap in render capacity.
+
 ## [0.0.5] - 2026-07-11
 
 ### Changed

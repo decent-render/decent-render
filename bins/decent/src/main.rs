@@ -28,14 +28,21 @@ fn token_path() -> anyhow::Result<std::path::PathBuf> {
     );
 
     let new_path = home.join(".config/decent/worker-token");
-    let old_path = home.join(".config/decent/worker-token");
+    let old_path = home.join(".config/decent-node/worker-token");
 
     // One-time migration: if new path doesn't exist but old path does, copy.
     if !new_path.exists() && old_path.exists() {
         if let Some(parent) = new_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::copy(&old_path, &new_path);
+        match std::fs::copy(&old_path, &new_path) {
+            Ok(_) => {
+                eprintln!("Migrated token from ~/.config/decent-node/ → ~/.config/decent/");
+            }
+            Err(e) => {
+                eprintln!("Warning: could not migrate token from old path: {e}");
+            }
+        }
     }
 
     Ok(new_path)
@@ -379,6 +386,31 @@ fn launchctl_has_label() -> bool {
         .unwrap_or(false)
 }
 
+/** Is ONLY the legacy decent-node daemon loaded (not the new one)? */
+fn legacy_daemon_is_loaded() -> bool {
+    std::process::Command::new("launchctl")
+        .arg("list")
+        .output()
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            out.contains(LEGACY_LAUNCHD_LABEL) && !out.contains(LAUNCHD_LABEL)
+        })
+        .unwrap_or(false)
+}
+
+/** Path to the legacy plist, if it exists. */
+fn legacy_plist_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let p = std::path::PathBuf::from(home)
+        .join("Library/LaunchAgents")
+        .join(format!("{LEGACY_LAUNCHD_LABEL}.plist"));
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
 /// Unload the legacy decent-node launchd agent if present (one-time migration
 /// during the decent-node → decent rename). No-op if not found.
 fn unload_legacy_agent() {
@@ -602,6 +634,14 @@ async fn main() -> anyhow::Result<()> {
                 "Runs `decent start --allow-real-jobs` at login; restarts on exit (KeepAlive)."
             );
             println!("Manage devices at https://decent-render.farm/devices");
+
+            // Clean up the legacy plist file (the agent was already unloaded
+            // above; remove the old plist so it doesn't reload on next login).
+            if let Some(legacy_plist) = legacy_plist_path() {
+                let _ = std::fs::remove_file(&legacy_plist);
+                println!("Removed legacy plist: {}", legacy_plist.display());
+            }
+
             Ok(())
         }
 
@@ -629,7 +669,7 @@ async fn main() -> anyhow::Result<()> {
             );
             let plist_present = plist_path().map(|p| p.exists()).unwrap_or(false);
             let loaded = launchctl_has_label();
-            let daemon_state = if !plist_present {
+            let daemon_state = if !plist_present && !loaded {
                 "not installed — run `decent install`"
             } else if loaded {
                 "running"
@@ -637,6 +677,16 @@ async fn main() -> anyhow::Result<()> {
                 "paused — run `decent resume` (or `uninstall` to remove)"
             };
             println!("daemon      : {daemon_state}");
+
+            // Legacy daemon detection — the old decent-node agent still running
+            // with its token at ~/.config/decent-node/. This is expected during
+            // migration; tell the user how to complete it.
+            if legacy_daemon_is_loaded() {
+                println!("⚠ legacy    : com.decent-render.decent-node daemon is still running.");
+                println!(
+                    "               Run `decent install` to migrate the token + daemon label."
+                );
+            }
             // Live daemon state from the snapshot the running daemon writes.
             match read_daemon_snapshot() {
                 Some(s) if s.is_fresh() => {
