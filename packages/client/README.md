@@ -37,6 +37,7 @@ Public functions:
 - `getRenderProgress()`
 - `cancelRender()`
 - `getBalance()`
+- `getLatestBundle()`
 - `getVersions()`
 - `verifyWebhookSignature()`
 - `listWebhooks()`, `createWebhook()`, `updateWebhook()`, `deleteWebhook()`

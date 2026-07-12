@@ -78,6 +78,9 @@ export const bundleUploadResponseSchema = z.object({
   alreadyRegistered: z.boolean(),
 });
 export type BundleUploadResponse = z.infer<typeof bundleUploadResponseSchema>;
+
+export const latestBundleResponseSchema = z.object({sha256: sha256Schema});
+export type LatestBundleResponse = z.infer<typeof latestBundleResponseSchema>;
 export const bundleCompleteResponseSchema = z.object({
   sha256: sha256Schema,
   remotionVersion: remotionVersionSchema,

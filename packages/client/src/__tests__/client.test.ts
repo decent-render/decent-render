@@ -11,6 +11,7 @@ import {
   cancelRender,
   getBalance,
   getRenderProgress,
+  getLatestBundle,
   getVersions,
   renderMediaOnFarm,
   verifyWebhookSignature,
@@ -61,6 +62,11 @@ describe('farm client', () => {
       supportedRemotionVersions: [{remotionVersion: '4.0.487', payloadVersion: 'runner-487'}],
     }));
     expect((await getVersions(auth)).supportedRemotionVersions[0]?.remotionVersion).toBe('4.0.487');
+  });
+
+  it('fetches the latest registered bundle', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(response({sha256: 'c'.repeat(64)}));
+    expect(await getLatestBundle(auth)).toEqual({sha256: 'c'.repeat(64)});
   });
 
   it('verifies webhook signatures in constant-time compatible hex form', () => {

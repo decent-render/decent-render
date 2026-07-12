@@ -5,6 +5,7 @@ import {
   balanceResponseSchema,
   bundleCompleteResponseSchema,
   bundleUploadResponseSchema,
+  latestBundleResponseSchema,
   cancelRenderResponseSchema,
   enqueueRenderRequestSchema,
   enqueueRenderResponseSchema,
@@ -15,6 +16,7 @@ import {
   webhookListResponseSchema,
   versionsResponseSchema,
   type BalanceResponse,
+  type LatestBundleResponse,
   type CancelRenderResponse,
   type EnqueueRenderRequest,
   type RenderStatusResponse,
@@ -72,6 +74,10 @@ export function getBalance(options: RequestOptions): Promise<BalanceResponse> {
   return requestJson(options, '/api/v1/balance', balanceResponseSchema);
 }
 
+export function getLatestBundle(options: RequestOptions): Promise<LatestBundleResponse> {
+  return requestJson(options, '/api/v1/bundles/latest', latestBundleResponseSchema);
+}
+
 export function getVersions(options: RequestOptions): Promise<VersionsResponse> {
   return requestJson(options, '/api/v1/versions', versionsResponseSchema);
 }
@@ -79,6 +85,7 @@ export function getVersions(options: RequestOptions): Promise<VersionsResponse> 
 export type RenderMediaOnFarmOptions = RequestOptions & EnqueueRenderRequest & {
   pollIntervalMs?: number;
   timeoutMs?: number;
+  onProgress?: (status: RenderStatusResponse) => void;
   waitForCompletion?: (renderId: string) => Promise<RenderStatusResponse>;
 };
 export type RenderMediaOnFarmResult = {outputUrl: string; renderId: string; creditsSettled: number; verification: RenderStatusResponse['verification']};
@@ -104,6 +111,7 @@ export async function renderMediaOnFarm(options: RenderMediaOnFarmOptions): Prom
     const status = options.waitForCompletion
       ? await options.waitForCompletion(enqueued.renderId)
       : await getRenderProgress({...options, renderId: enqueued.renderId});
+    options.onProgress?.(status);
     if (status.status === 'complete') {
       return {outputUrl: status.outputUrl, renderId: status.renderId, creditsSettled: status.creditsSettled, verification: status.verification};
     }
