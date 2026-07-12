@@ -15,6 +15,7 @@ import {
   webhookEndpointSchema,
   webhookListResponseSchema,
   versionsResponseSchema,
+  workerAvailabilityResponseSchema,
   type BalanceResponse,
   type LatestBundleResponse,
   type CancelRenderResponse,
@@ -22,6 +23,7 @@ import {
   type RenderStatusResponse,
   type WebhookEndpoint,
   type VersionsResponse,
+  type WorkerAvailabilityResponse,
 } from './schemas.js';
 
 export * from './schemas.js';
@@ -76,6 +78,16 @@ export function getBalance(options: RequestOptions): Promise<BalanceResponse> {
 
 export function getLatestBundle(options: RequestOptions): Promise<LatestBundleResponse> {
   return requestJson(options, '/api/v1/bundles/latest', latestBundleResponseSchema);
+}
+
+export function getWorkerAvailability(
+  options: RequestOptions & {operator: string},
+): Promise<WorkerAvailabilityResponse> {
+  return requestJson(
+    options,
+    `/api/v1/workers/availability?operator=${encodeURIComponent(options.operator)}`,
+    workerAvailabilityResponseSchema,
+  );
 }
 
 export function getVersions(options: RequestOptions): Promise<VersionsResponse> {

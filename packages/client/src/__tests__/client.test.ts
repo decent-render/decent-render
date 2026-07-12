@@ -13,6 +13,7 @@ import {
   getRenderProgress,
   getLatestBundle,
   getVersions,
+  getWorkerAvailability,
   renderMediaOnFarm,
   verifyWebhookSignature,
 } from '../index.js';
@@ -67,6 +68,12 @@ describe('farm client', () => {
   it('fetches the latest registered bundle', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(response({sha256: 'c'.repeat(64)}));
     expect(await getLatestBundle(auth)).toEqual({sha256: 'c'.repeat(64)});
+  });
+
+  it('checks operator availability through the scoped farm endpoint', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(response({anyConnected: true}));
+    expect(await getWorkerAvailability({...auth, operator: 'operator/1'})).toEqual({anyConnected: true});
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('operator%2F1');
   });
 
   it('verifies webhook signatures in constant-time compatible hex form', () => {
