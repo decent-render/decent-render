@@ -44,7 +44,9 @@ jobs:
       - name: Dry run
         if: ${{ inputs.dry-run }}
         working-directory: packages/client
-        run: npm publish --dry-run --access public
+        # npm publish --dry-run still rejects an already-published version.
+        # npm pack --dry-run validates the exact package payload repeatably.
+        run: npm pack --dry-run
 
       - name: Publish (OIDC trusted publisher)
         if: ${{ !inputs.dry-run }}

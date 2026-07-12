@@ -68,10 +68,12 @@ jobs:
           node-version: '24' # bundles npm 11 (≥11.5.1 required for trusted publishing)
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Dry run (full npm publish lifecycle — no publish)
-        if: ${{ inputs.dry-run }}
+      - name: Dry run (validate package payload — no publish)
+        if: inputs.dry-run == true
         working-directory: packages/protocol
-        run: npm publish --dry-run --access public
+        # npm publish --dry-run still rejects an already-published version.
+        # npm pack --dry-run validates the exact package payload repeatably.
+        run: npm pack --dry-run
 
       # No NODE_AUTH_TOKEN — the npm CLI auto-detects the GitHub OIDC
       # environment and authenticates via the trusted publisher.
