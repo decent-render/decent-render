@@ -16,6 +16,13 @@ targets = ["aarch64-apple-darwin"]
 # Where to host releases
 hosting = "github"
 
+# cargo-dist owns .github/workflows/release.yml. Pin its generated action
+# references through the supported generator config rather than hand-editing.
+[dist.github-action-commits]
+"actions/checkout" = "df4cb1c069e1874edd31b4311f1884172cec0e10" # v6
+"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" # v7
+"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" # v8
+
 # Homebrew tap — cargo-dist generates Formula/<crate>.rb and pushes on tag.
 # Requires HOMEBREW_TAP_TOKEN secret in the repo (GitHub PAT with repo scope
 # on decent-render/homebrew-tap).

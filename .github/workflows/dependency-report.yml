@@ -1,0 +1,66 @@
+name: Weekly Bun dependency report
+
+on:
+  schedule:
+    - cron: '17 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  report:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+
+      - name: Collect dependency status
+        env:
+          NO_COLOR: '1'
+        run: |
+          REPORT="$RUNNER_TEMP/dependency-report.md"
+          {
+            echo '# Weekly Bun dependency report'
+            echo
+            echo "Updated from commit \`${GITHUB_SHA}\` on $(date -u +'%Y-%m-%d %H:%M UTC')."
+            echo
+            echo 'This issue is read-only reporting. No dependencies are upgraded automatically.'
+          } > "$REPORT"
+
+          for workspace in packages/protocol packages/client apps/decent-app; do
+            {
+              echo
+              echo "## \`$workspace\`"
+              echo
+              echo '```text'
+            } >> "$REPORT"
+            if output=$(cd "$workspace" && bun outdated 2>&1); then
+              printf '%s\n' "${output:-All dependencies are current.}" >> "$REPORT"
+            else
+              printf '%s\n' "$output" >> "$REPORT"
+              echo 'bun outdated exited non-zero; inspect this workspace manually.' >> "$REPORT"
+            fi
+            echo '```' >> "$REPORT"
+          done
+
+      - name: Open or update the pinned report issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: '[dependency-report] Weekly Bun dependency status'
+        run: |
+          REPORT="$RUNNER_TEMP/dependency-report.md"
+          NUMBER=$(gh issue list --state all --limit 100 --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n 1)
+
+          if [ -n "$NUMBER" ]; then
+            gh issue reopen "$NUMBER" >/dev/null 2>&1 || true
+            gh issue edit "$NUMBER" --title "$TITLE" --body-file "$REPORT"
+          else
+            URL=$(gh issue create --title "$TITLE" --body-file "$REPORT")
+            NUMBER=${URL##*/}
+            NODE_ID=$(gh issue view "$NUMBER" --json id --jq .id)
+            gh api graphql -f query='mutation($id: ID!) { pinIssue(input: {issueId: $id}) { issue { id } } }' \
+              -f id="$NODE_ID" >/dev/null || echo 'Issue created; repository pinning was unavailable.'
+          fi

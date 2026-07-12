@@ -20,14 +20,11 @@ jobs:
     environment: publish
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
-        with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Install
         working-directory: packages/client
-        run: npm install
+        run: bun install --frozen-lockfile
 
       - name: Build
         working-directory: packages/client
@@ -36,6 +33,13 @@ jobs:
       - name: Tests
         working-directory: packages/client
         run: npm test
+
+      # Node/npm is only needed for OIDC-authenticated npm publishing. Package
+      # installation above remains reproducible from the committed bun.lock.
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Dry run
         if: ${{ inputs.dry-run }}
