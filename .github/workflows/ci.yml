@@ -41,6 +41,19 @@ jobs:
       - run: bun run test
         working-directory: packages/protocol
 
+  client:
+    name: client package (TS)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install --frozen-lockfile
+        working-directory: packages/client
+      - run: bun run build
+        working-directory: packages/client
+      - run: bun run test
+        working-directory: packages/client
+
   app-frontend:
     name: Tauri frontend build + tests
     runs-on: ubuntu-22.04

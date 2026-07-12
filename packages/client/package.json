@@ -1,0 +1,34 @@
+{
+  "name": "@decent-render/client",
+  "version": "0.1.0",
+  "description": "Type-safe client for uploading Remotion bundles and rendering on the Decent network.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/decent-render/decent-render.git",
+    "directory": "packages/client"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {"types": "./dist/index.d.ts", "default": "./dist/index.js"},
+    "./schemas": {"types": "./dist/schemas.d.ts", "default": "./dist/schemas.js"}
+  },
+  "files": ["dist", "README.md", "CHANGELOG.md"],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm run test"
+  },
+  "dependencies": {"zod": "^4.3.6"},
+  "peerDependencies": {"@remotion/bundler": ">=4 <5"},
+  "peerDependenciesMeta": {"@remotion/bundler": {"optional": true}},
+  "devDependencies": {
+    "@remotion/bundler": "^4.0.349",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  },
+  "keywords": ["decent-render", "remotion", "render-farm", "video"]
+}

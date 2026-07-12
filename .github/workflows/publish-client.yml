@@ -1,0 +1,48 @@
+# Publish @decent-render/client via npm OIDC trusted publishing.
+# One-time npm setup must name this workflow and the `publish` environment.
+name: Publish client package
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "npm pack only (no publish)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    environment: publish
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install
+        working-directory: packages/client
+        run: npm install
+
+      - name: Build
+        working-directory: packages/client
+        run: npm run build
+
+      - name: Tests
+        working-directory: packages/client
+        run: npm test
+
+      - name: Dry run
+        if: ${{ inputs.dry-run }}
+        working-directory: packages/client
+        run: npm publish --dry-run --access public
+
+      - name: Publish (OIDC trusted publisher)
+        if: ${{ !inputs.dry-run }}
+        working-directory: packages/client
+        run: npm publish --access public
