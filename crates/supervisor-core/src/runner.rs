@@ -130,11 +130,13 @@ pub async fn run_job(
     let job_id = assign.job_id.clone();
     let tenant = assign.tenant.clone();
     let output_key = assign.output_key.clone();
+    let attempt = assign.attempt;
     match run_job_inner(assign, &mut cancel_rx, tx.clone()).await {
         Ok(metrics) => {
             let _ = tx.send(WorkerMessage::JobComplete(JobCompleteMessage {
                 tenant,
                 job_id,
+                attempt,
                 output_key,
                 metrics,
             }));
@@ -143,6 +145,7 @@ pub async fn run_job(
             let _ = tx.send(WorkerMessage::JobFailed(JobFailedMessage {
                 tenant,
                 job_id,
+                attempt,
                 reason: err.to_string(),
             }));
         }
@@ -218,6 +221,7 @@ async fn run_job_inner(
                         let _ = tx.send(WorkerMessage::JobProgress(JobProgressMessage {
                             tenant: assign.tenant.clone(),
                             job_id: assign.job_id.clone(),
+                            attempt: assign.attempt,
                             progress,
                         }));
                     }

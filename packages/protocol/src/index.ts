@@ -57,12 +57,14 @@ export const JobAcceptedMessageSchema = z.object({
 	type: z.literal('jobAccepted'),
 	tenant: z.string(),
 	jobId: z.string(),
+	attempt: z.number().int().positive().optional(),
 });
 
 export const JobProgressMessageSchema = z.object({
 	type: z.literal('jobProgress'),
 	tenant: z.string(),
 	jobId: z.string(),
+	attempt: z.number().int().positive().optional(),
 	progress: z.number().min(0).max(1),
 });
 
@@ -79,6 +81,7 @@ export const JobCompleteMessageSchema = z.object({
 	type: z.literal('jobComplete'),
 	tenant: z.string(),
 	jobId: z.string(),
+	attempt: z.number().int().positive().optional(),
 	/** R2 key the worker uploaded the finished output to (via presigned PUT). */
 	outputKey: z.string(),
 	metrics: JobMetricsSchema,
@@ -90,6 +93,7 @@ export const JobFailedMessageSchema = z.object({
 	type: z.literal('jobFailed'),
 	tenant: z.string(),
 	jobId: z.string(),
+	attempt: z.number().int().positive().optional(),
 	reason: z.string(),
 });
 export type JobFailedMessage = z.infer<typeof JobFailedMessageSchema>;
@@ -116,6 +120,7 @@ export const JobAssignMessageSchema = z.object({
 	type: z.literal('jobAssign'),
 	tenant: z.string(),
 	jobId: z.string(),
+	attempt: z.number().int().positive().optional(),
 	kind: z.enum(['standard', 'gpu']),
 	durationFrames: z.number().int(),
 	fps: z.number().int(),

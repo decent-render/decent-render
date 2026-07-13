@@ -63,6 +63,17 @@ describe('protocol v2 — Rust⇄TS golden-fixture conformance', () => {
 		expect(names.some((n) => n.includes('PRESENT'))).toBe(true);
 	});
 
+	it('accepts legacy assignment frames without an attempt lease', () => {
+		const accepted = {type: 'jobAccepted', tenant: 'driffs', jobId: 'legacy-1'};
+		expect(WorkerMessageSchema.parse(accepted)).toEqual(accepted);
+
+		const assign = cases.cases.find((c) => c.name === 'jobAssign');
+		expect(assign).toBeDefined();
+		const legacyAssign = {...assign!.wire as Record<string, unknown>};
+		delete legacyAssign.attempt;
+		expect(ServerMessageSchema.parse(legacyAssign)).toEqual(legacyAssign);
+	});
+
 	it('purgeAfter:false is rejected (privacy rule baked into the type)', () => {
 		const assign = cases.cases.find((c) => c.name === 'jobAssign');
 		expect(assign).toBeDefined();

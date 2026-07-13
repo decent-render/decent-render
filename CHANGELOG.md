@@ -6,6 +6,15 @@ Protocol-package history lives in `packages/protocol/CHANGELOG.md`.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [Unreleased]
+
+### Changed
+
+- The supervisor now echoes the optional assignment-attempt lease on accepted,
+  progress, complete, and failed messages. This lets lifecycle-aware dispatch
+  reject delayed messages from an older retry while retaining protocol-v2
+  compatibility with attempt-less assignments.
+
 ## [0.0.7] - 2026-07-11
 
 ### Changed

@@ -318,6 +318,7 @@ pub async fn run(
                                         sink.send(Message::Text(send(WorkerMessage::JobAccepted(JobAcceptedMessage {
                                             tenant: assign.tenant.clone(),
                                             job_id: assign.job_id.clone(),
+                                            attempt: assign.attempt,
                                         })))).await.context("failed to send jobAccepted")?;
                                         // Transition to rendering phase once the runner starts.
                                         obs.update_status(|s| {

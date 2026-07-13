@@ -4,6 +4,13 @@ Notable changes to `@decent-render/protocol`. The package is versioned
 independently of the wire `PROTOCOL_VERSION` (which stays **2**); the wire format
 itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
 
+## [Unreleased]
+
+- Added an optional positive `attempt` lease to `jobAssign` and its
+  `jobAccepted`, `jobProgress`, `jobComplete`, and `jobFailed` responses. New
+  supervisors echo the lease so dispatch can reject delayed messages from an
+  older assignment; attempt-less v2 frames remain accepted during rollout.
+
 ## [0.1.1] — 2026-07-10
 
 - **Zod 4 only.** Narrowed the peer-dependency range from `>=3 <5` to `>=4 <5`.

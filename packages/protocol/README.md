@@ -40,7 +40,7 @@ const msg = WorkerMessageSchema.parse(JSON.parse(raw));
 ```sh
 cd packages/protocol
 bun install
-bunx vitest run          # TS conformance (13 tests)
+bunx vitest run          # TS conformance (14 tests)
 ```
 
 Rust side, from the repo root:
@@ -81,6 +81,9 @@ Plain JSON, camelCase keys, messages discriminated by `type`.
 - **Worker → server:** `register`, `heartbeat`, `jobAccepted`, `jobProgress`,
   `jobComplete` (metrics: `wallMs`, `frames`, `outputSizeInBytes?`), `jobFailed`.
 - **Server → worker:** `jobAssign`, `cancel`, `ping`, `updateAvailable`.
+- `jobAssign.attempt?` is an assignment lease echoed by accepted, progress,
+  complete, and failed messages. It remains optional in protocol v2 so older
+  supervisors and dispatch versions can be upgraded in either order.
 - `purgeAfter` is a `z.literal(true)` / Rust `PurgeAfter` — the privacy rule
   baked into the type (deserialization rejects `false`).
 

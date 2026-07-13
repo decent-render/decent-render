@@ -61,6 +61,8 @@ pub struct HeartbeatMessage {
 pub struct JobAcceptedMessage {
     pub tenant: String,
     pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,6 +70,8 @@ pub struct JobAcceptedMessage {
 pub struct JobProgressMessage {
     pub tenant: String,
     pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     /// Render progress in `[0, 1]`.
     pub progress: f64,
 }
@@ -90,6 +94,8 @@ pub struct JobMetrics {
 pub struct JobCompleteMessage {
     pub tenant: String,
     pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     /// R2 key the worker uploaded the finished output to (via presigned PUT).
     pub output_key: String,
     pub metrics: JobMetrics,
@@ -100,6 +106,8 @@ pub struct JobCompleteMessage {
 pub struct JobFailedMessage {
     pub tenant: String,
     pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     pub reason: String,
 }
 
@@ -165,6 +173,8 @@ impl<'de> Deserialize<'de> for PurgeAfter {
 pub struct JobAssignMessage {
     pub tenant: String,
     pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     pub kind: JobKind,
     pub duration_frames: u64,
     pub fps: u32,
