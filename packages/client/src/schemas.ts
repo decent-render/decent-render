@@ -20,6 +20,12 @@ export const enqueueRenderRequestSchema = z.object({
   tier: z.enum(['cloud', 'community']).default('cloud'),
   communityConsented: z.boolean().default(false),
   targetOperator: z.string().min(1).optional(),
+  // Intent to render free on infrastructure the caller is entitled to. The farm
+  // gates this by a server-side workspace allowlist (a non-entitled workspace is
+  // rejected, never silently charged) and, when granted, enqueues the job
+  // untargeted so it routes to the company fleet. Distinct from targetOperator,
+  // which pins a job to a specific community operator's own device.
+  selfRender: z.boolean().optional(),
   inputAssetKeys: z.array(z.string()).default([]),
 });
 export type EnqueueRenderRequest = z.infer<typeof enqueueRenderRequestSchema>;
