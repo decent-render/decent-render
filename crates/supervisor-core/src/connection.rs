@@ -234,6 +234,11 @@ pub async fn run(
     let mut heartbeats_sent = 0u32;
     let (worker_tx, mut worker_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerMessage>();
     let mut in_flight: Option<InFlightJob> = None;
+    // Job id of the last dispatch-initiated cancel whose terminal frame has
+    // not been observed yet. Recorded at cancel receipt — BEFORE the runner is
+    // killed — so the render abort that follows is never mistaken for a
+    // genuine failure. Cleared when that job's terminal frame arrives.
+    let mut canceled_job: Option<String> = None;
 
     loop {
         let current_job_count = u32::from(in_flight.is_some());
@@ -276,12 +281,48 @@ pub async fn run(
                 }
             }
             Some(msg) = worker_rx.recv() => {
-                let is_terminal = matches!(msg, WorkerMessage::JobComplete(_) | WorkerMessage::JobFailed(_));
-                emit(obs, &msg);
-                if is_terminal {
-                    in_flight = None;
+                let terminal_job_id = match &msg {
+                    WorkerMessage::JobComplete(c) => Some(c.job_id.clone()),
+                    WorkerMessage::JobFailed(f) => Some(f.job_id.clone()),
+                    _ => None,
+                };
+                // A render failure for a job dispatch already canceled is the
+                // expected outcome of that cancel (the runner was killed), not
+                // a real failure — dispatch has already marked the job
+                // canceled and refunded it. Suppress the jobFailed frame; the
+                // workdir purge already happened in the runner regardless.
+                let suppress_failed = matches!(&msg, WorkerMessage::JobFailed(f)
+                    if canceled_job.as_deref() == Some(f.job_id.as_str()));
+                if let Some(id) = terminal_job_id.as_deref() {
+                    if in_flight.as_ref().map(|j| j.job_id.as_str()) == Some(id) {
+                        in_flight = None;
+                    }
+                    if canceled_job.as_deref() == Some(id) {
+                        canceled_job = None;
+                    }
                 }
-                sink.send(Message::Text(send(msg))).await.context("failed to send worker job frame")?;
+                if suppress_failed {
+                    if let WorkerMessage::JobFailed(f) = &msg {
+                        tracing::info!(
+                            job_id = %f.job_id,
+                            reason = %f.reason,
+                            "render aborted after cancel — suppressing jobFailed"
+                        );
+                        obs.update_status(|s| {
+                            s.jobs_canceled += 1;
+                            if s.current_job.as_ref().is_some_and(|j| j.id == f.job_id) {
+                                s.current_job = None;
+                            }
+                        });
+                        obs.log(LogLine::info(format!(
+                            "Job {} render aborted after cancel — not reporting jobFailed",
+                            f.job_id
+                        )));
+                    }
+                } else {
+                    emit(obs, &msg);
+                    sink.send(Message::Text(send(msg))).await.context("failed to send worker job frame")?;
+                }
             }
             frame = stream.next() => {
                 match frame {
@@ -333,6 +374,11 @@ pub async fn run(
                                             == Some(cancel.job_id.as_str()) =>
                                     {
                                         if let Some(job) = in_flight.take() {
+                                            // Mark the job canceled BEFORE killing the
+                                            // render, so the abort that follows can
+                                            // never race past the marker and surface
+                                            // as a genuine jobFailed.
+                                            canceled_job = Some(job.job_id.clone());
                                             obs.update_status(|s| {
                                                 if let Some(j) = &mut s.current_job {
                                                     j.phase = JobPhase::Canceled;
@@ -504,6 +550,186 @@ mod tests {
                 _ => continue,
             }
         }
+    }
+
+    /// Seed a fake cached render payload so `ensure_payload` short-circuits
+    /// (no download). The "runner" is a shell script standing in for
+    /// `decent-render-runner`. Returns the payload dir for cleanup.
+    #[cfg(unix)]
+    fn seed_fake_payload(sha: &str, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::path::PathBuf::from(std::env::var("HOME").expect("HOME set in tests"))
+            .join(".decent-worker/payloads")
+            .join(sha);
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = dir.join("decent-render-runner");
+        std::fs::write(&runner, script).unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn job_assign_json(job_id: &str, payload_sha: &str) -> String {
+        format!(
+            r#"{{"type":"jobAssign","tenant":"driffs","jobId":"{job_id}","kind":"standard","durationFrames":1,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"{payload_sha}","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}}"#
+        )
+    }
+
+    /// Workdirs (see `WorkDir::new`) still on disk for the given job id.
+    #[cfg(unix)]
+    fn job_workdirs(job_id: &str) -> Vec<std::path::PathBuf> {
+        let prefix = format!("job-{job_id}-");
+        std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix))
+            })
+            .collect()
+    }
+
+    /// (a) Cancel, then the render aborts: the abort is the expected cancel
+    /// outcome — NO jobFailed frame may reach dispatch (which has already
+    /// marked the job canceled + refunded), and the workdir must be purged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_then_render_abort_suppresses_job_failed_and_purges() {
+        let pid = std::process::id();
+        let sha = format!("test-cancel-suppress-{pid}");
+        let job_id = format!("job-cancel-suppress-{pid}");
+        // Runner that renders "forever" — only a cancel ends it.
+        let payload_dir = seed_fake_payload(&sha, "#!/bin/sh\nsleep 30\n");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, mut status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
+            .await
+            .unwrap();
+
+        // Collect frames until the job is accepted (heartbeats may interleave).
+        let mut frames: Vec<serde_json::Value> = Vec::new();
+        loop {
+            let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
+                .await
+                .expect("expected jobAccepted before timeout");
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            let accepted = v["type"] == "jobAccepted";
+            frames.push(v);
+            if accepted {
+                break;
+            }
+        }
+
+        // Dispatch cancels the in-flight job.
+        ws.send(Message::Text(format!(
+            r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+        )))
+        .await
+        .unwrap();
+
+        // The suppressed terminal bumps jobs_canceled and clears current_job —
+        // that is the deterministic "canceled render fully processed" signal.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            status_rx.wait_for(|s| s.jobs_canceled == 1 && s.current_job.is_none()),
+        )
+        .await
+        .expect("canceled render was not processed in time")
+        .expect("status channel closed");
+
+        // Purge still happened (WorkDir dropped in the runner cancel path).
+        assert!(
+            job_workdirs(&job_id).is_empty(),
+            "workdir must be purged after cancel"
+        );
+
+        // Close and drain everything the client ever sent.
+        ws.close(None).await.ok();
+        while let Some(Ok(frame)) = ws.next().await {
+            if let Message::Text(t) = frame {
+                frames.push(serde_json::from_str(&t).unwrap());
+            }
+        }
+        client.await.unwrap().expect("clean exit");
+
+        assert!(
+            frames.iter().all(|v| v["type"] != "jobFailed"),
+            "jobFailed must be suppressed after cancel, got {frames:?}"
+        );
+        std::fs::remove_dir_all(&payload_dir).ok();
+    }
+
+    /// (b) A genuine render failure with no cancel in play must still emit
+    /// jobFailed exactly as before (and purge the workdir).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn genuine_failure_without_cancel_emits_job_failed() {
+        let pid = std::process::id();
+        let sha = format!("test-genuine-failure-{pid}");
+        let job_id = format!("job-genuine-failure-{pid}");
+        let payload_dir = seed_fake_payload(
+            &sha,
+            "#!/bin/sh\necho '{\"type\":\"error\",\"message\":\"render exploded\"}'\nexit 1\n",
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, _status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
+            .await
+            .unwrap();
+
+        // Read until jobFailed shows up (heartbeats/jobAccepted interleave).
+        let failed = loop {
+            let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
+                .await
+                .expect("expected jobFailed before timeout");
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["type"] == "jobFailed" {
+                break v;
+            }
+        };
+        assert_eq!(failed["jobId"], job_id.as_str());
+        assert_eq!(failed["reason"], "render exploded");
+
+        // Workdir purged before the failure was reported.
+        assert!(
+            job_workdirs(&job_id).is_empty(),
+            "workdir must be purged after a genuine failure"
+        );
+
+        ws.close(None).await.ok();
+        while ws.next().await.is_some() {}
+        client.await.unwrap().expect("clean exit");
+        std::fs::remove_dir_all(&payload_dir).ok();
     }
 
     #[tokio::test]
