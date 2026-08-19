@@ -64,33 +64,28 @@ impl ConnectionConfig {
         }
     }
 
-    fn url_with_token(&self) -> String {
-        let sep = if self.dispatch_url.contains('?') {
-            '&'
-        } else {
-            '?'
-        };
-        format!(
-            "{}{}token={}",
-            self.dispatch_url,
-            sep,
-            encode_uri_component(&self.token)
-        )
+    /// The handshake request, carrying the worker token in an Authorization
+    /// header rather than the query string.
+    ///
+    /// `?token=` put a long-lived worker credential into every proxy, CDN and
+    /// platform access log along the path. Dispatch still accepts the query
+    /// parameter for supervisors released before this, so a mixed fleet keeps
+    /// working; nothing here needs to send both, and sending both would put the
+    /// token back in the logs.
+    fn handshake_request(
+        &self,
+    ) -> anyhow::Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = self.dispatch_url.as_str().into_client_request()?;
+        let value = format!("Bearer {}", self.token);
+        request.headers_mut().insert(
+            "authorization",
+            value
+                .parse()
+                .map_err(|_| anyhow!("worker token is not a valid header value"))?,
+        );
+        Ok(request)
     }
-}
-
-/// Percent-encode a URL query component (RFC 3986 unreserved set kept).
-fn encode_uri_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// Connect, register, heartbeat, and process server messages.
@@ -119,7 +114,7 @@ pub async fn run(
     obs: &Observability,
     mut shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let url = config.url_with_token();
+    let request = config.handshake_request()?;
 
     // Initialize status snapshot with identity + dispatch URL.
     obs.update_status(|s| {
@@ -158,7 +153,7 @@ pub async fn run(
                 obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                 return Ok(());
             }
-            result = connect_async(&url) => result,
+            result = connect_async(request.clone()) => result,
         };
         match connect {
             Ok((ws, _resp)) => break ws,
@@ -573,21 +568,41 @@ mod tests {
         }
     }
 
-    async fn accept_ws(listener: &TcpListener) -> (WebSocketStream<TcpStream>, String) {
+    /// What the server saw during the handshake.
+    #[derive(Default, Clone)]
+    struct Handshake {
+        uri: String,
+        authorization: Option<String>,
+    }
+
+    async fn accept_ws_capturing(
+        listener: &TcpListener,
+    ) -> (WebSocketStream<TcpStream>, Handshake) {
         let (tcp, _) = listener.accept().await.unwrap();
-        let uri = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let uri_clone = uri.clone();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Handshake::default()));
+        let seen_clone = seen.clone();
         // tungstenite's handshake callback signature carries a large Err type.
         #[allow(clippy::result_large_err)]
         let callback = move |req: &Request, resp: Response| {
-            *uri_clone.lock().unwrap() = req.uri().to_string();
+            let mut slot = seen_clone.lock().unwrap();
+            slot.uri = req.uri().to_string();
+            slot.authorization = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_string());
             Ok(resp)
         };
         let ws = tokio_tungstenite::accept_hdr_async(tcp, callback)
             .await
             .unwrap();
-        let uri = uri.lock().unwrap().clone();
-        (ws, uri)
+        let seen = seen.lock().unwrap().clone();
+        (ws, seen)
+    }
+
+    async fn accept_ws(listener: &TcpListener) -> (WebSocketStream<TcpStream>, String) {
+        let (ws, handshake) = accept_ws_capturing(listener).await;
+        (ws, handshake.uri)
     }
 
     async fn next_text(ws: &mut WebSocketStream<TcpStream>) -> String {
@@ -823,10 +838,18 @@ mod tests {
         let client =
             tokio::spawn(async move { run(&config, &register, &obs, never_shutdown()).await });
 
-        let (mut ws, uri) = accept_ws(&listener).await;
+        let (mut ws, handshake) = accept_ws_capturing(&listener).await;
+        // The credential rides a header, never the URL: a query-string token is
+        // written verbatim into every proxy and platform access log en route.
+        assert_eq!(
+            handshake.authorization.as_deref(),
+            Some("Bearer test-jwt.token"),
+            "worker token must arrive in the Authorization header"
+        );
         assert!(
-            uri.contains("token=test-jwt.token"),
-            "token must ride the query string, got {uri}"
+            !handshake.uri.contains("test-jwt.token"),
+            "token leaked into the URL: {}",
+            handshake.uri
         );
 
         let first: serde_json::Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
@@ -1139,9 +1162,34 @@ mod tests {
         client.await.unwrap().expect("clean exit on shutdown");
     }
 
+    /// The token travels in a header, and NOT in the URL. A query-string
+    /// credential is copied verbatim into every proxy, CDN and platform access
+    /// log on the path, so this asserts both halves: the header is present and
+    /// the URL is clean.
     #[test]
-    fn encodes_token_for_query() {
-        assert_eq!(encode_uri_component("a.b-c_d~e"), "a.b-c_d~e");
-        assert_eq!(encode_uri_component("a+b/c="), "a%2Bb%2Fc%3D");
+    fn sends_the_token_as_a_header_not_in_the_url() {
+        let config = ConnectionConfig::new("ws://localhost:8790/ws", "tok+en/with=specials");
+        let request = config.handshake_request().expect("build handshake request");
+
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer tok+en/with=specials"
+        );
+        let uri = request.uri().to_string();
+        assert!(
+            !uri.contains("token"),
+            "token must not appear in the URL: {uri}"
+        );
+        assert!(
+            !uri.contains("specials"),
+            "token value leaked into the URL: {uri}"
+        );
+    }
+
+    #[test]
+    fn handshake_request_preserves_an_existing_query_string() {
+        let config = ConnectionConfig::new("ws://localhost:8790/ws?region=eu", "t");
+        let request = config.handshake_request().unwrap();
+        assert!(request.uri().to_string().contains("region=eu"));
     }
 }
