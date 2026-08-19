@@ -218,6 +218,21 @@ pub struct JobAssignMessage {
     /// render_payloads row; the supervisor verifies and caches by sha.
     pub payload_sha256: String,
     pub payload_get_url: String,
+    /// Pinned browser tarball, cached separately from the payload under
+    /// `~/.decent-worker/browsers/<sha>`.
+    ///
+    /// The browser is ~170MB and identical across Remotion versions pinning the
+    /// same Chrome build; splitting it out of the payload means it is fetched
+    /// once per Chrome version rather than once per (Remotion version,
+    /// platform). The tarball root holds an `executable` file naming the
+    /// browser's path relative to that root.
+    ///
+    /// Optional: payloads that still bundle their own browser under `chrome/`
+    /// omit it, and the runner falls back to that in-payload manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_get_url: Option<String>,
     /// Presigned R2 GET for the job's input props JSON
     /// (`{compositionId, inputProps}`). Self-describing — the worker needs no
     /// other job data.
@@ -257,7 +272,9 @@ pub struct UpdateAvailableMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ServerMessage {
-    JobAssign(JobAssignMessage),
+    /// Boxed because it dwarfs every other variant — an unboxed jobAssign makes
+    /// each `ServerMessage`, including a two-field ping, cost its full size.
+    JobAssign(Box<JobAssignMessage>),
     Cancel(CancelMessage),
     Ping(PingMessage),
     UpdateAvailable(UpdateAvailableMessage),

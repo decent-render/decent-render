@@ -62,46 +62,57 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-pub async fn ensure_payload(assign: &JobAssignMessage) -> anyhow::Result<PathBuf> {
-    let dir = home_dir()?
-        .join(".decent-worker/payloads")
-        .join(&assign.payload_sha256);
-    let runner = dir.join("decent-render-runner");
-    if runner.exists() {
-        tracing::info!(payload = %assign.payload_sha256, path = %dir.display(), "payload cached");
+/// Fetch a content-addressed tarball into `~/.decent-worker/<kind>/<sha>`.
+///
+/// Shared by every artifact the supervisor caches (render payloads, browsers)
+/// because the security-relevant steps are the same and must not drift apart:
+/// download, verify the sha256 BEFORE anything is unpacked, extract into a
+/// hidden sibling, then rename into place — so a torn download can never be
+/// mistaken for a complete cache entry.
+///
+/// `marker` is the relative path that must exist for an extracted dir to count
+/// as populated; it is what makes the cache check honest rather than a bare
+/// directory-exists test.
+async fn ensure_artifact(
+    kind: &str,
+    sha256: &str,
+    get_url: &str,
+    marker: &str,
+) -> anyhow::Result<PathBuf> {
+    let dir = home_dir()?.join(".decent-worker").join(kind).join(sha256);
+    if dir.join(marker).exists() {
+        tracing::info!(kind, sha = %sha256, path = %dir.display(), "artifact cached");
         return Ok(dir);
     }
 
     let parent = dir
         .parent()
-        .ok_or_else(|| anyhow!("payload dir has no parent"))?
+        .ok_or_else(|| anyhow!("{kind} dir has no parent"))?
         .to_path_buf();
     tokio::fs::create_dir_all(&parent).await?;
-    let tmp = parent.join(format!(".{}-download", assign.payload_sha256));
+    let tmp = parent.join(format!(".{sha256}-download"));
     if tmp.exists() {
         tokio::fs::remove_dir_all(&tmp).await.ok();
     }
     tokio::fs::create_dir_all(&tmp).await?;
 
-    tracing::info!(payload = %assign.payload_sha256, "downloading payload");
-    let bytes = reqwest::get(&assign.payload_get_url)
+    tracing::info!(kind, sha = %sha256, "downloading artifact");
+    let bytes = reqwest::get(get_url)
         .await
-        .context("payload download request failed")?
+        .with_context(|| format!("{kind} download request failed"))?
         .error_for_status()
-        .context("payload download returned non-2xx")?
+        .with_context(|| format!("{kind} download returned non-2xx"))?
         .bytes()
         .await
-        .context("payload body read failed")?;
+        .with_context(|| format!("{kind} body read failed"))?;
     let actual = sha256_hex(&bytes);
-    if actual != assign.payload_sha256 {
+    if actual != sha256 {
         tokio::fs::remove_dir_all(&tmp).await.ok();
         return Err(anyhow!(
-            "payload sha mismatch: expected {}, got {}",
-            assign.payload_sha256,
-            actual
+            "{kind} sha mismatch: expected {sha256}, got {actual}"
         ));
     }
-    let tar_path = tmp.join("payload.tar.gz");
+    let tar_path = tmp.join("artifact.tar.gz");
     tokio::fs::write(&tar_path, &bytes).await?;
 
     let status = Command::new("tar")
@@ -111,20 +122,92 @@ pub async fn ensure_payload(assign: &JobAssignMessage) -> anyhow::Result<PathBuf
         .arg(&tmp)
         .status()
         .await
-        .context("failed to spawn tar for payload extract")?;
+        .with_context(|| format!("failed to spawn tar for {kind} extract"))?;
     if !status.success() {
         tokio::fs::remove_dir_all(&tmp).await.ok();
-        return Err(anyhow!("payload tar extract failed with {status}"));
+        return Err(anyhow!("{kind} tar extract failed with {status}"));
     }
     tokio::fs::remove_file(&tar_path).await.ok();
+    if !tmp.join(marker).exists() {
+        tokio::fs::remove_dir_all(&tmp).await.ok();
+        return Err(anyhow!("{kind} {sha256} is missing {marker} after extract"));
+    }
     if dir.exists() {
         tokio::fs::remove_dir_all(&dir).await.ok();
     }
     tokio::fs::rename(&tmp, &dir)
         .await
         .or_else(|_| std::fs::rename(&tmp, &dir).map_err(anyhow::Error::from))?;
-    tracing::info!(payload = %assign.payload_sha256, path = %dir.display(), "payload extracted");
+    tracing::info!(kind, sha = %sha256, path = %dir.display(), "artifact extracted");
     Ok(dir)
+}
+
+pub async fn ensure_payload(assign: &JobAssignMessage) -> anyhow::Result<PathBuf> {
+    ensure_artifact(
+        "payloads",
+        &assign.payload_sha256,
+        &assign.payload_get_url,
+        "decent-render-runner",
+    )
+    .await
+}
+
+/// Resolve the browser for this job, fetching it if this node has not cached
+/// that sha before.
+///
+/// `Ok(None)` means the assignment named no browser — the payload is expected
+/// to carry its own under `chrome/` and the runner resolves it from there.
+/// A named-but-unusable browser is an error, never a silent fallback: falling
+/// back would make Remotion download ~1GB into the per-job workdir and lose it
+/// to the purge on every job, which is far worse than failing the job loudly.
+pub async fn ensure_browser(assign: &JobAssignMessage) -> anyhow::Result<Option<PathBuf>> {
+    let (Some(sha), Some(url)) = (
+        assign.browser_sha256.as_deref(),
+        assign.browser_get_url.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let dir = ensure_artifact("browsers", sha, url, "executable").await?;
+    browser_executable_in(&dir).map(Some)
+}
+
+/// Read a browser artifact's `executable` manifest and resolve it to a path.
+///
+/// The manifest names the browser relative to the artifact root, because the
+/// publisher knows exactly what it downloaded and the supervisor should not be
+/// guessing per-platform nested layouts (`.../mac-arm64/chrome-mac-arm64/Google
+/// Chrome for Testing.app/Contents/MacOS/...`) that differ per OS.
+fn browser_executable_in(dir: &Path) -> anyhow::Result<PathBuf> {
+    let manifest = dir.join("executable");
+    let contents = std::fs::read_to_string(&manifest)
+        .with_context(|| format!("read browser manifest {}", manifest.display()))?;
+    let relative = contents.trim();
+    if relative.is_empty() {
+        return Err(anyhow!("browser manifest {} is empty", manifest.display()));
+    }
+    // This path gets executed, so it must stay inside the artifact: an absolute
+    // path or a `..` hop would let a tarball point the supervisor at any binary
+    // on the node. The sha is verified, so this only bites when the publisher is
+    // wrong or compromised — precisely the case worth surviving.
+    let candidate = Path::new(relative);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "browser manifest {} escapes the artifact: {relative}",
+            manifest.display()
+        ));
+    }
+    let executable = dir.join(candidate);
+    if !executable.exists() {
+        return Err(anyhow!(
+            "browser manifest points at {}, which does not exist",
+            executable.display()
+        ));
+    }
+    Ok(executable)
 }
 
 pub async fn run_job(
@@ -170,9 +253,17 @@ async fn run_job_inner(
             runner.display()
         ));
     }
+    let browser = ensure_browser(&assign).await?;
     let workdir = WorkDir::new(&format!("job-{}", assign.job_id)).context("create workdir")?;
     let purged_path = workdir.path().to_path_buf();
-    let mut child = Command::new(&runner)
+    let mut command = Command::new(&runner);
+    // The wire carries a sha and a URL; the local filesystem path is this
+    // node's business alone, so it is handed over out-of-band rather than
+    // being spliced into the jobAssign frame the runner parses.
+    if let Some(ref executable) = browser {
+        command.env("DECENT_BROWSER_EXECUTABLE", executable);
+    }
+    let mut child = command
         .current_dir(workdir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -281,5 +372,102 @@ async fn terminate_child(child: &mut Child) {
     }
 }
 
-#[allow(dead_code)]
-fn _assert_path(_: &Path) {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch artifact dir, cleaned up on drop.
+    struct Artifact(PathBuf);
+
+    impl Artifact {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("decent-browser-test-{name}"));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn manifest(&self, contents: &str) -> &Self {
+            std::fs::write(self.0.join("executable"), contents).unwrap();
+            self
+        }
+        fn file(&self, relative: &str) -> &Self {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"#!/bin/sh\n").unwrap();
+            self
+        }
+    }
+
+    impl Drop for Artifact {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    #[test]
+    fn resolves_a_nested_browser_from_the_manifest() {
+        let a = Artifact::new("nested");
+        a.file("mac-arm64/Chrome.app/Contents/MacOS/chrome")
+            .manifest("mac-arm64/Chrome.app/Contents/MacOS/chrome\n");
+        let resolved = browser_executable_in(&a.0).unwrap();
+        assert_eq!(
+            resolved,
+            a.0.join("mac-arm64/Chrome.app/Contents/MacOS/chrome")
+        );
+    }
+
+    #[test]
+    fn rejects_a_manifest_that_escapes_the_artifact() {
+        let a = Artifact::new("escape");
+        a.manifest("../../../../bin/sh\n");
+        let err = browser_executable_in(&a.0).unwrap_err().to_string();
+        assert!(err.contains("escapes the artifact"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_an_absolute_manifest() {
+        let a = Artifact::new("absolute");
+        a.manifest("/bin/sh\n");
+        let err = browser_executable_in(&a.0).unwrap_err().to_string();
+        assert!(err.contains("escapes the artifact"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_an_empty_manifest() {
+        let a = Artifact::new("empty");
+        a.manifest("   \n");
+        let err = browser_executable_in(&a.0).unwrap_err().to_string();
+        assert!(err.contains("is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_a_manifest_pointing_at_a_missing_file() {
+        let a = Artifact::new("missing");
+        a.manifest("chrome/does-not-exist\n");
+        let err = browser_executable_in(&a.0).unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    /// An assignment with no browser fields must resolve to `None` rather than
+    /// erroring — payloads published before the split bundle their own browser
+    /// under `chrome/` and the runner falls back to that manifest.
+    #[tokio::test]
+    async fn no_browser_in_assignment_resolves_to_none() {
+        let assign: JobAssignMessage = serde_json::from_str(
+            r#"{"type":"jobAssign","tenant":"driffs","jobId":"j","kind":"standard","durationFrames":1,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#,
+        )
+        .unwrap();
+        assert!(ensure_browser(&assign).await.unwrap().is_none());
+    }
+
+    /// Half a browser reference is a publisher bug; treat it as "none" rather
+    /// than fetching from an unverifiable URL or verifying a sha we cannot get.
+    #[tokio::test]
+    async fn a_half_specified_browser_is_ignored() {
+        let assign: JobAssignMessage = serde_json::from_str(
+            r#"{"type":"jobAssign","tenant":"driffs","jobId":"j","kind":"standard","durationFrames":1,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","browserSha256":"abc","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#,
+        )
+        .unwrap();
+        assert!(ensure_browser(&assign).await.unwrap().is_none());
+    }
+}

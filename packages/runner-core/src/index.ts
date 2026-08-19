@@ -27,6 +27,43 @@ export {renderJob} from './render-job.js';
 export type {MinimalComposition, RendererApi} from './renderer-api.js';
 
 /**
+ * Where the browser is, in preference order.
+ *
+ * 1. `DECENT_BROWSER_EXECUTABLE` — the supervisor fetched a standalone,
+ *    sha-verified browser artifact and resolved it to a local path. This is the
+ *    production path: the browser is ~170MB and identical across Remotion
+ *    versions pinning the same Chrome, so it is cached once per Chrome version
+ *    instead of being re-shipped inside every payload.
+ * 2. `chrome/executable` next to the runner binary — a payload that bundles its
+ *    own browser. The manifest holds the path relative to the payload root, so
+ *    the runner never guesses a platform-specific nested layout. Kept for
+ *    payloads published before the split, and used by the bench harness.
+ *
+ * Returning null is a correctness hazard, not a fallback: Remotion would then
+ * download ~1GB into the per-job workdir and lose it to the purge on every job
+ * (measured 2026-08-19). Callers must treat null as a broken setup, not a
+ * default.
+ *
+ * Exported so the tests exercise this function rather than a copy of it.
+ */
+export function resolveBrowserExecutable(
+  payloadRoot: string,
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const injected = env.DECENT_BROWSER_EXECUTABLE;
+  // An injected path that does not exist falls through to the payload rather
+  // than failing: the supervisor already verified the artifact, so a stale or
+  // hand-set variable should not take a working payload offline.
+  if (injected && existsSync(injected)) return injected;
+  const manifest = path.join(payloadRoot, 'chrome', 'executable');
+  if (!existsSync(manifest)) return null;
+  const relative = readFileSync(manifest, 'utf8').trim();
+  if (!relative) return null;
+  const resolved = path.join(payloadRoot, relative);
+  return existsSync(resolved) ? resolved : null;
+}
+
+/**
  * Full runner main loop: reads a jobAssign frame from stdin, renders it with
  * the injected `@remotion/renderer` functions, emits protocol frames on
  * stdout, and exits. Each versioned runner app's entry point is just:
@@ -53,33 +90,13 @@ export async function runRunner<TComposition extends MinimalComposition>(rendere
     return existsSync(path.join(dir, 'remotion')) ? dir : null;
   };
 
-  /**
-   * The browser shipped in the payload, next to this binary. The payload writes
-   * `chrome/executable` containing the path to the browser relative to the
-   * payload root — the publish step knows exactly what it downloaded, so the
-   * runner never has to guess a platform-specific nested layout.
-   *
-   * Returning null is a correctness hazard, not a fallback: Remotion would then
-   * download ~1GB into the per-job workdir and lose it to the purge on every
-   * job (measured 2026-08-19). Callers should treat null as a broken payload.
-   */
-  const browserExecutable = () => {
-    const payloadRoot = path.dirname(process.execPath);
-    const manifest = path.join(payloadRoot, 'chrome', 'executable');
-    if (!existsSync(manifest)) return null;
-    const relative = readFileSync(manifest, 'utf8').trim();
-    if (!relative) return null;
-    const resolved = path.join(payloadRoot, relative);
-    return existsSync(resolved) ? resolved : null;
-  };
-
   try {
     const frame = ServerMessageSchema.parse(JSON.parse((await readStdin()).trim()));
     if (frame.type !== 'jobAssign') throw new Error(`Expected jobAssign frame, got ${frame.type}`);
-    const chrome = browserExecutable();
+    const chrome = resolveBrowserExecutable(path.dirname(process.execPath));
     if (chrome === null) {
       console.error(
-        'WARNING: no browser in payload (chrome/executable missing) — Remotion will download one into the per-job workdir and lose it to the purge on every job.',
+        'WARNING: no browser resolved (DECENT_BROWSER_EXECUTABLE unset and no chrome/executable in payload) — Remotion will download one into the per-job workdir and lose it to the purge on every job.',
       );
     }
     // Liveness, independent of render progress.

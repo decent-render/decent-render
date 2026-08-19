@@ -23,6 +23,7 @@ vi.mock('node:os', async (importOriginal) => {
 });
 
 const {renderJob} = await import('../render-job.js');
+const {resolveBrowserExecutable} = await import('../index.js');
 const bundle = makeBundleArchive();
 
 type SelectOptions = Parameters<Parameters<typeof renderJob>[1]['selectComposition']>[0];
@@ -88,48 +89,74 @@ describe('payload-supplied browser', () => {
 	});
 });
 
-describe('chrome/executable manifest resolution', () => {
-	/** Mirrors runRunner's browserExecutable() resolution against a fake payload. */
-	const resolve = async (payloadRoot: string) => {
-		const {existsSync, readFileSync} = await import('node:fs');
-		const manifest = path.join(payloadRoot, 'chrome', 'executable');
-		if (!existsSync(manifest)) return null;
-		const relative = readFileSync(manifest, 'utf8').trim();
-		if (!relative) return null;
-		const resolved = path.join(payloadRoot, relative);
-		return existsSync(resolved) ? resolved : null;
-	};
-
+describe('browser resolution', () => {
 	const payload = () => mkdtempSync(path.join(tmpdir(), 'runner-core-payload-'));
 
-	it('resolves a browser recorded by the publish step', async () => {
+	/** A payload with a browser bundled inside it, as published before the split. */
+	const payloadWithBundledBrowser = () => {
 		const root = payload();
 		mkdirSync(path.join(root, 'chrome', 'nested'), {recursive: true});
 		writeFileSync(path.join(root, 'chrome', 'nested', 'browser'), '#!/bin/sh\n');
 		writeFileSync(path.join(root, 'chrome', 'executable'), 'chrome/nested/browser\n');
+		return root;
+	};
 
-		expect(await resolve(root)).toBe(path.join(root, 'chrome/nested/browser'));
+	/** A standalone browser artifact, as fetched and resolved by the supervisor. */
+	const standaloneBrowser = () => {
+		const dir = mkdtempSync(path.join(tmpdir(), 'runner-core-browser-'));
+		const exe = path.join(dir, 'chrome');
+		writeFileSync(exe, '#!/bin/sh\n');
+		return exe;
+	};
+
+	it('prefers the supervisor-injected browser over one bundled in the payload', () => {
+		const injected = standaloneBrowser();
+		const root = payloadWithBundledBrowser();
+
+		expect(resolveBrowserExecutable(root, {DECENT_BROWSER_EXECUTABLE: injected})).toBe(injected);
 	});
 
-	it('returns null when the manifest is absent', async () => {
-		expect(await resolve(payload())).toBeNull();
+	it('uses the injected browser when the payload bundles none', () => {
+		const injected = standaloneBrowser();
+
+		expect(resolveBrowserExecutable(payload(), {DECENT_BROWSER_EXECUTABLE: injected})).toBe(injected);
 	});
 
-	it('returns null when the manifest points at a missing file', async () => {
+	it('falls back to the payload when the injected path does not exist', () => {
+		// A stale or hand-set variable must not take a working payload offline;
+		// the supervisor already verified whatever it actually fetched.
+		const root = payloadWithBundledBrowser();
+
+		expect(resolveBrowserExecutable(root, {DECENT_BROWSER_EXECUTABLE: '/nope/chrome'})).toBe(
+			path.join(root, 'chrome/nested/browser'),
+		);
+	});
+
+	it('resolves a browser recorded by the publish step', () => {
+		const root = payloadWithBundledBrowser();
+
+		expect(resolveBrowserExecutable(root, {})).toBe(path.join(root, 'chrome/nested/browser'));
+	});
+
+	it('returns null when neither source has a browser', () => {
+		expect(resolveBrowserExecutable(payload(), {})).toBeNull();
+	});
+
+	it('returns null when the manifest points at a missing file', () => {
 		// A truncated or mis-built payload must not be treated as usable: the
 		// caller warns loudly instead of silently falling back to a 1GB download.
 		const root = payload();
 		mkdirSync(path.join(root, 'chrome'), {recursive: true});
 		writeFileSync(path.join(root, 'chrome', 'executable'), 'chrome/does-not-exist\n');
 
-		expect(await resolve(root)).toBeNull();
+		expect(resolveBrowserExecutable(root, {})).toBeNull();
 	});
 
-	it('returns null when the manifest is empty', async () => {
+	it('returns null when the manifest is empty', () => {
 		const root = payload();
 		mkdirSync(path.join(root, 'chrome'), {recursive: true});
 		writeFileSync(path.join(root, 'chrome', 'executable'), '   \n');
 
-		expect(await resolve(root)).toBeNull();
+		expect(resolveBrowserExecutable(root, {})).toBeNull();
 	});
 });

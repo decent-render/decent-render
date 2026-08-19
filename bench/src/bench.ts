@@ -26,11 +26,27 @@ import {serve} from './serve.ts';
 const root = path.resolve(import.meta.dir, '..');
 const benchDir = path.join(root, '.bench');
 // --payload-root points the harness at an extracted production payload
-// (decent-render-runner + remotion-binaries/ + chrome/), so a tarball built by
-// farm-web's publish script can be verified before it is published.
+// (decent-render-runner + remotion-binaries/), so a tarball built by farm-web's
+// publish script can be verified before it is published.
 const payloadRoot =
 	process.argv.find((a) => a.startsWith('--payload-root='))?.slice('--payload-root='.length) ?? benchDir;
 const runnerBin = path.join(payloadRoot, 'decent-render-runner');
+// --browser-root points at an extracted browser artifact, which since the split
+// ships separately from the payload. The supervisor resolves the `executable`
+// manifest and hands the runner an absolute path via DECENT_BROWSER_EXECUTABLE;
+// the bench does exactly the same so it exercises the production path rather
+// than a payload-local fallback.
+const browserRoot = process.argv
+	.find((a) => a.startsWith('--browser-root='))
+	?.slice('--browser-root='.length);
+const browserExecutable = ((): string | undefined => {
+	if (!browserRoot) return undefined;
+	const manifest = path.join(browserRoot, 'executable');
+	if (!existsSync(manifest)) throw new Error(`no executable manifest in ${browserRoot}`);
+	const resolved = path.join(browserRoot, readFileSync(manifest, 'utf8').trim());
+	if (!existsSync(resolved)) throw new Error(`browser manifest points at missing ${resolved}`);
+	return resolved;
+})();
 const archive = path.join(benchDir, 'bundle.tar.gz');
 
 const flag = (name: string, fallback: string): string => {
@@ -172,7 +188,11 @@ async function runOnce(concurrency: number): Promise<Sample> {
 	const child = spawn(runnerBin, [], {
 		cwd: workdir,
 		stdio: ['pipe', 'pipe', 'pipe'],
-		env: {...process.env, DECENT_BENCH_CONCURRENCY: String(concurrency)},
+		env: {
+			...process.env,
+			DECENT_BENCH_CONCURRENCY: String(concurrency),
+			...(browserExecutable ? {DECENT_BROWSER_EXECUTABLE: browserExecutable} : {}),
+		},
 	});
 
 	const sampler = setInterval(async () => {

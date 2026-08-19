@@ -57,27 +57,56 @@ describe('protocol v2 — Rust⇄TS golden-fixture conformance', () => {
 		});
 	}
 
+	/**
+	 * Fixture cases are found by wire `type`, never by their display name — the
+	 * names carry human explanation and get reworded, and a test that silently
+	 * stops finding its subject is worse than no test.
+	 */
+	const casesOfType = (type: string) =>
+		cases.cases.filter(
+			(c) => (c.wire as {type?: string}).type === type,
+		);
+	const firstOfType = (type: string) => {
+		const [found] = casesOfType(type);
+		expect(found, `no ${type} fixture`).toBeDefined();
+		return found!.wire as Record<string, unknown>;
+	};
+
 	it('fixtures cover the outputSizeInBytes drift scar both ways', () => {
-		const names = cases.cases.map((c) => c.name);
+		// Scoped to jobComplete on purpose: other cases now use ABSENT/PRESENT in
+		// their names too, so an unscoped search would keep passing after the
+		// jobComplete pair — the actual scar — was deleted.
+		const names = casesOfType('jobComplete').map((c) => c.name);
 		expect(names.some((n) => n.includes('ABSENT'))).toBe(true);
 		expect(names.some((n) => n.includes('PRESENT'))).toBe(true);
+	});
+
+	it('fixtures cover the browser artifact both split out and bundled', () => {
+		const assigns = casesOfType('jobAssign');
+		expect(assigns.some((c) => 'browserSha256' in (c.wire as object))).toBe(true);
+		expect(assigns.some((c) => !('browserSha256' in (c.wire as object)))).toBe(true);
+	});
+
+	it('accepts assignments with no browser artifact (payload ships its own)', () => {
+		const withBrowser = casesOfType('jobAssign')
+			.map((c) => c.wire as Record<string, unknown>)
+			.find((w) => 'browserSha256' in w);
+		expect(withBrowser).toBeDefined();
+		const {browserSha256, browserGetUrl, ...without} = withBrowser!;
+		expect(ServerMessageSchema.parse(without)).toEqual(without);
 	});
 
 	it('accepts legacy assignment frames without an attempt lease', () => {
 		const accepted = {type: 'jobAccepted', tenant: 'driffs', jobId: 'legacy-1'};
 		expect(WorkerMessageSchema.parse(accepted)).toEqual(accepted);
 
-		const assign = cases.cases.find((c) => c.name === 'jobAssign');
-		expect(assign).toBeDefined();
-		const legacyAssign = {...assign!.wire as Record<string, unknown>};
+		const legacyAssign = {...firstOfType('jobAssign')};
 		delete legacyAssign.attempt;
 		expect(ServerMessageSchema.parse(legacyAssign)).toEqual(legacyAssign);
 	});
 
 	it('purgeAfter:false is rejected (privacy rule baked into the type)', () => {
-		const assign = cases.cases.find((c) => c.name === 'jobAssign');
-		expect(assign).toBeDefined();
-		const bad = {...(assign!.wire as object), purgeAfter: false};
+		const bad = {...firstOfType('jobAssign'), purgeAfter: false};
 		expect(() => ServerMessageSchema.parse(bad)).toThrow();
 	});
 });

@@ -409,7 +409,7 @@ pub async fn run(
                                                 job.phase = JobPhase::Rendering;
                                             }
                                         });
-                                        tokio::spawn(run_job(assign, cancel_rx, worker_tx.clone()));
+                                        tokio::spawn(run_job(*assign, cancel_rx, worker_tx.clone()));
                                     }
                                     ServerMessage::Cancel(cancel)
                                         if in_flight.as_ref().map(|j| j.job_id.as_str())

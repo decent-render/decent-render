@@ -161,6 +161,25 @@ export const JobAssignMessageSchema = z.object({
 	payloadSha256: z.string(),
 	payloadGetUrl: z.string(),
 	/**
+	 * Pinned browser tarball, cached separately from the payload.
+	 *
+	 * The browser is ~170MB and is identical across Remotion versions that pin
+	 * the same Chrome build, so bundling it into every payload would re-ship it
+	 * per Remotion version per platform. Splitting it out means an operator
+	 * downloads a given Chrome once, no matter how many payloads reference it.
+	 *
+	 * The tarball root contains an `executable` file holding the browser's path
+	 * relative to that root — the publisher knows exactly what it downloaded, so
+	 * the supervisor never guesses a platform-specific nested layout.
+	 *
+	 * Optional for compatibility with payloads that still bundle their own
+	 * browser under `chrome/`. When absent the runner falls back to that
+	 * in-payload manifest; when BOTH are absent Remotion downloads ~1GB into the
+	 * per-job workdir and loses it to the purge on every job.
+	 */
+	browserSha256: z.string().optional(),
+	browserGetUrl: z.string().optional(),
+	/**
 	 * Presigned R2 GET for the job's input props JSON:
 	 * `{compositionId, inputProps}`. Self-describing — the worker needs no other
 	 * job data.

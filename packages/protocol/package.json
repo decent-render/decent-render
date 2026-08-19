@@ -1,6 +1,6 @@
 {
   "name": "@decent-render/protocol",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Decent render-network wire protocol (v2) — shared TS types and zod schemas, pinned to Rust by shared fixtures and cross-language conformance tests.",
   "license": "Apache-2.0",
   "repository": {

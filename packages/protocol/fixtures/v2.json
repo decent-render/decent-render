@@ -114,7 +114,7 @@
       }
     },
     {
-      "name": "jobAssign",
+      "name": "jobAssign (browser ABSENT — payload bundles its own chrome/)",
       "direction": "server",
       "wire": {
         "type": "jobAssign",
@@ -129,6 +129,33 @@
         "bundleGetUrl": "https://r2.example.com/bundles/9f86.tar.gz?sig=1",
         "payloadSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "payloadGetUrl": "https://r2.example.com/render-payloads/aaaa.tar.gz?sig=payload",
+        "inputPropsGetUrl": "https://r2.example.com/renders/t1/input-props.json?sig=2",
+        "assetGetUrls": [
+          "https://r2.example.com/assets/a.png?sig=3"
+        ],
+        "outputPutUrl": "https://r2.example.com/renders/t1/out.mp4?sig=4",
+        "outputKey": "renders/t1/out.mp4",
+        "purgeAfter": true
+      }
+    },
+    {
+      "name": "jobAssign (browser split out — standalone content-addressed browser artifact)",
+      "direction": "server",
+      "wire": {
+        "type": "jobAssign",
+        "tenant": "driffs",
+        "jobId": "job-render-abc123",
+        "attempt": 1,
+        "kind": "gpu",
+        "durationFrames": 300,
+        "fps": 30,
+        "codec": "h264",
+        "bundleSha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "bundleGetUrl": "https://r2.example.com/bundles/9f86.tar.gz?sig=1",
+        "payloadSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "payloadGetUrl": "https://r2.example.com/render-payloads/aaaa.tar.gz?sig=payload",
+        "browserSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "browserGetUrl": "https://r2.example.com/render-browsers/bbbb.tar.gz?sig=browser",
         "inputPropsGetUrl": "https://r2.example.com/renders/t1/input-props.json?sig=2",
         "assetGetUrls": [
           "https://r2.example.com/assets/a.png?sig=3"

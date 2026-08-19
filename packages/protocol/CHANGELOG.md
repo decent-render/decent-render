@@ -6,6 +6,13 @@ itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
 
 ## [Unreleased]
 
+- Added optional `browserSha256` / `browserGetUrl` to `jobAssign`. The browser is
+  now a standalone content-addressed artifact rather than part of the render
+  payload: it is ~170MB and identical across Remotion versions that pin the same
+  Chrome (4.0.487 and 4.0.506 both pin 149.0.7790.0), so bundling re-shipped it
+  per version per platform. Absent fields mean the payload carries its own
+  browser under `chrome/`, so existing payloads keep working.
+
 - Added an optional positive `attempt` lease to `jobAssign` and its
   `jobAccepted`, `jobProgress`, `jobComplete`, and `jobFailed` responses. New
   supervisors echo the lease so dispatch can reject delayed messages from an
