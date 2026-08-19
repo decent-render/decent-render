@@ -25,7 +25,12 @@ import {serve} from './serve.ts';
 
 const root = path.resolve(import.meta.dir, '..');
 const benchDir = path.join(root, '.bench');
-const runnerBin = path.join(benchDir, 'decent-render-runner');
+// --payload-root points the harness at an extracted production payload
+// (decent-render-runner + remotion-binaries/ + chrome/), so a tarball built by
+// farm-web's publish script can be verified before it is published.
+const payloadRoot =
+	process.argv.find((a) => a.startsWith('--payload-root='))?.slice('--payload-root='.length) ?? benchDir;
+const runnerBin = path.join(payloadRoot, 'decent-render-runner');
 const archive = path.join(benchDir, 'bundle.tar.gz');
 
 const flag = (name: string, fallback: string): string => {
