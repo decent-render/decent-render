@@ -154,6 +154,27 @@ fn set_owner_only(path: &std::path::Path, mode: u32) {
 #[cfg(not(unix))]
 fn set_owner_only(_path: &std::path::Path, _mode: u32) {}
 
+/// Wait for the first termination signal, returning its name.
+///
+/// SIGTERM is what launchd (and systemd) send on stop/shutdown; SIGINT is
+/// Ctrl-C in a foreground `decent start`. Both must reach the graceful path so
+/// the in-flight job's workdir is purged — `Drop` does not run on signal death.
+#[cfg(unix)]
+async fn await_termination() -> Option<&'static str> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).ok()?;
+    let mut sigint = signal(SignalKind::interrupt()).ok()?;
+    tokio::select! {
+        _ = sigterm.recv() => Some("SIGTERM"),
+        _ = sigint.recv() => Some("SIGINT"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn await_termination() -> Option<&'static str> {
+    tokio::signal::ctrl_c().await.ok().map(|()| "ctrl-c")
+}
+
 /// launchd label for the installed agent.
 const LAUNCHD_LABEL: &str = "com.decent-render.decent";
 const LEGACY_LAUNCHD_LABEL: &str = "com.decent-render.decent-node";
@@ -538,8 +559,22 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
-            // CLI never signals shutdown — runs until heartbeat-limit or server close.
-            let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            // SIGTERM/SIGINT must reach the graceful path, or the purge rule is
+            // not a guarantee: Rust does NOT run `Drop` on signal death, so a
+            // machine shutdown (launchd SIGTERMs the agent) would kill the
+            // process with the job workdir — user content — still on disk.
+            // Operators who power the node down nightly hit that every day.
+            //
+            // Firing `shutdown_tx` makes connection::run cancel the in-flight
+            // job (SIGTERM the runner → WorkDir::drop purges), send a Close
+            // frame so dispatch requeues promptly, and return.
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            tokio::spawn(async move {
+                if let Some(signal) = await_termination().await {
+                    tracing::info!(%signal, "termination signal — shutting down gracefully");
+                    let _ = shutdown_tx.send(());
+                }
+            });
             connection::run(&config, &register, &obs, shutdown_rx).await?;
             tracing::info!("decent exited cleanly");
             Ok(())

@@ -30,6 +30,11 @@ enum RunnerEvent {
     Progress {
         progress: f64,
     },
+    /// Liveness only — the runner is alive but has no progress to report (a
+    /// heavy composition can exceed the 5% reporting delta by more than
+    /// [`SILENCE_TIMEOUT`]). Receiving it resets the silence timer; nothing is
+    /// forwarded to dispatch.
+    Heartbeat,
     Done {
         #[serde(rename = "outputSizeInBytes")]
         output_size_in_bytes: u64,
@@ -217,6 +222,9 @@ async fn run_job_inner(
                     }
                 };
                 match event {
+                    RunnerEvent::Heartbeat => {
+                        tracing::trace!(job_id = %assign.job_id, "runner heartbeat");
+                    }
                     RunnerEvent::Progress { progress } => {
                         let _ = tx.send(WorkerMessage::JobProgress(JobProgressMessage {
                             tenant: assign.tenant.clone(),
