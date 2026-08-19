@@ -1,0 +1,5 @@
+# Build + measurement artifacts: compiled runner, bundled compositions, the
+# packed browser (~800MB), Chrome seed, and rendered outputs. All reproducible
+# via `bun run bundle && bun run build:runner`.
+.bench/
+node_modules/
