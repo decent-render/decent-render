@@ -277,8 +277,25 @@ async fn run_job_inner(
         obj.insert("type".into(), serde_json::Value::String("jobAssign".into()));
     }
     let input = serde_json::to_vec(&input_frame)?;
-    stdin.write_all(&input).await?;
-    stdin.shutdown().await?;
+    // A failed write is NOT the job's failure reason.
+    //
+    // If the runner exits before reading its stdin — which is exactly what the
+    // error path does — this write races with that exit and loses on Linux with
+    // EPIPE (macOS buffers the frame and the write succeeds, which is why this
+    // only ever failed in CI). Propagating that error replaced the runner's real
+    // message with "Broken pipe (os error 32)", destroying the only useful
+    // diagnostic the operator would ever see.
+    //
+    // So: record it and keep going. The runner's own `error` event, or its exit
+    // status, is the authoritative reason. This is only reported if nothing else
+    // explains the failure.
+    let stdin_error = match stdin.write_all(&input).await {
+        Ok(()) => stdin.shutdown().await.err(),
+        Err(e) => Some(e),
+    };
+    if let Some(ref e) = stdin_error {
+        tracing::warn!(job_id = %assign.job_id, error = %e, "writing jobAssign to runner stdin failed; deferring to the runner's own report");
+    }
     drop(stdin);
 
     let stdout = child.stdout.take().context("runner stdout missing")?;
@@ -348,7 +365,12 @@ async fn run_job_inner(
     if !status.success() {
         return Err(anyhow!("runner exited with {status}"));
     }
-    done_metrics.ok_or_else(|| anyhow!("runner exited without done event"))
+    done_metrics.ok_or_else(|| match stdin_error {
+        // Only now is the failed stdin write the best explanation available: the
+        // runner exited cleanly, said nothing, and never got its assignment.
+        Some(e) => anyhow!("runner never received its assignment: {e}"),
+        None => anyhow!("runner exited without done event"),
+    })
 }
 
 async fn terminate_child(child: &mut Child) {

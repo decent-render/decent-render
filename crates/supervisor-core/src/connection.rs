@@ -730,6 +730,11 @@ mod tests {
         let pid = std::process::id();
         let sha = format!("test-genuine-failure-{pid}");
         let job_id = format!("job-genuine-failure-{pid}");
+        // Deliberately never reads stdin, and exits at once. That races the
+        // supervisor's write of the jobAssign frame and loses with EPIPE on
+        // Linux (macOS buffers it, which is why this only failed in CI). The
+        // runner's own message must still win over the write error — otherwise
+        // the operator sees "Broken pipe" instead of what actually went wrong.
         let payload_dir = seed_fake_payload(
             &sha,
             "#!/bin/sh\necho '{\"type\":\"error\",\"message\":\"render exploded\"}'\nexit 1\n",
