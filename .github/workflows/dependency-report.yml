@@ -29,7 +29,7 @@ jobs:
             echo 'This issue is read-only reporting. No dependencies are upgraded automatically.'
           } > "$REPORT"
 
-          for workspace in packages/protocol packages/client apps/decent-app; do
+          for workspace in packages/protocol packages/client packages/runner-core apps/decent-app; do
             {
               echo
               echo "## \`$workspace\`"

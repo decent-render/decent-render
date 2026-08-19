@@ -1,0 +1,46 @@
+{
+  "name": "@decent-render/runner-core",
+  "version": "0.1.0",
+  "description": "Render-payload core for the Decent render network — the runner main loop and render job (bundle sha256 verify, Remotion render, presigned upload, workdir purge). The renderer is injected, so no Remotion version is pinned here.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/decent-render/decent-render.git",
+    "directory": "packages/runner-core"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm run test"
+  },
+  "dependencies": {
+    "@decent-render/protocol": "^0.1.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  },
+  "keywords": [
+    "decent-render",
+    "render-farm",
+    "remotion",
+    "runner",
+    "render-payload"
+  ]
+}
