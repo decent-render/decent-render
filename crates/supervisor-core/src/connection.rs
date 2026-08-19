@@ -23,7 +23,8 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::protocol::{
-    HeartbeatMessage, JobAcceptedMessage, RegisterMessage, ServerMessage, WorkerMessage,
+    HeartbeatMessage, JobAcceptedMessage, JobRejectedMessage, RegisterMessage, RejectReason,
+    ServerMessage, WorkerMessage,
 };
 use crate::runner::{run_job, InFlightJob};
 use crate::status::{ConnectionState, JobPhase, JobStatus, LogLine, Observability};
@@ -106,8 +107,12 @@ fn encode_uri_component(s: &str) -> String {
 ///
 /// `shutdown` is a oneshot receiver that triggers graceful shutdown: cancels
 /// any in-flight job (SIGTERM runner → purge workdir), sends a Close frame,
-/// and returns `Ok(())`. The CLI never fires it (runs to completion); the
-/// Tauri app fires it from the Stop button.
+/// and returns `Ok(())`. The CLI fires it on SIGTERM/SIGINT — without that the
+/// process dies on the signal and `Drop` never runs, leaving the job workdir
+/// (user content) on disk. The Tauri app fires it from the Stop button.
+///
+/// It is honoured during the initial connect-retry loop too, so a node
+/// signalled while dispatch is unreachable still exits cleanly.
 pub async fn run(
     config: &ConnectionConfig,
     register: &RegisterMessage,
@@ -140,7 +145,22 @@ pub async fn run(
     let mut attempts = 0u32;
     let ws = loop {
         attempts += 1;
-        match connect_async(&url).await {
+        // Shutdown must be honoured while we are still trying to connect. With
+        // `max_connect_attempts` retries this loop can run for many seconds, and
+        // a node signalled during it (machine shutdown while dispatch is
+        // unreachable) would otherwise be killed outright rather than exiting.
+        // No job can be in flight yet, so there is nothing to purge — this is
+        // about exiting cleanly instead of dying on the signal.
+        let connect = tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received before connect — exiting");
+                obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                return Ok(());
+            }
+            result = connect_async(&url) => result,
+        };
+        match connect {
             Ok((ws, _resp)) => break ws,
             Err(e) if attempts < config.max_connect_attempts => {
                 tracing::info!(
@@ -153,7 +173,15 @@ pub async fn run(
                     "Dispatch unreachable (attempt {}/{}), retrying…",
                     attempts, config.max_connect_attempts
                 )));
-                tokio::time::sleep(config.connect_retry_delay).await;
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown => {
+                        tracing::info!("shutdown signal received while retrying — exiting");
+                        obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep(config.connect_retry_delay) => {}
+                }
             }
             Err(e) => {
                 let msg = format!(
@@ -338,10 +366,24 @@ pub async fn run(
                                                 "Job {} assigned but refused — \"Accept real jobs\" is OFF",
                                                 assign.job_id
                                             )));
+                                            // Tell dispatch, or the job sits assigned until it is
+                                            // hard-failed ~10 minutes later.
+                                            let _ = worker_tx.send(WorkerMessage::JobRejected(JobRejectedMessage {
+                                                tenant: assign.tenant.clone(),
+                                                job_id: assign.job_id.clone(),
+                                                attempt: assign.attempt,
+                                                reason: RejectReason::NotAccepting,
+                                            }));
                                             continue;
                                         }
                                         if in_flight.is_some() {
                                             tracing::warn!(job_id = %assign.job_id, "refusing jobAssign while busy");
+                                            let _ = worker_tx.send(WorkerMessage::JobRejected(JobRejectedMessage {
+                                                tenant: assign.tenant.clone(),
+                                                job_id: assign.job_id.clone(),
+                                                attempt: assign.attempt,
+                                                reason: RejectReason::Busy,
+                                            }));
                                             continue;
                                         }
                                         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
@@ -732,6 +774,34 @@ mod tests {
         std::fs::remove_dir_all(&payload_dir).ok();
     }
 
+    /// Shutdown during the connect-retry loop must exit cleanly rather than
+    /// leaving the process to be killed by the signal. No job is in flight yet,
+    /// so nothing is purged — this is purely about a clean exit.
+    #[tokio::test]
+    async fn shutdown_during_connect_retries_exits_cleanly() {
+        // Port with nothing listening: run() stays in the retry loop.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        let mut config = fast_config(port);
+        config.max_connect_attempts = 1000;
+        config.connect_retry_delay = Duration::from_millis(20);
+        let register = test_register();
+        let obs = Observability::default();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let client = tokio::spawn(async move { run(&config, &register, &obs, shutdown_rx).await });
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        shutdown_tx.send(()).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("must not hang after shutdown");
+        result.unwrap().expect("clean exit, not a connect error");
+    }
+
     #[tokio::test]
     async fn registers_heartbeats_and_closes_cleanly() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -800,11 +870,64 @@ mod tests {
         }
         client.await.unwrap().expect("clean exit");
 
-        // The skeleton must NOT accept the job (no jobAccepted frame).
+        // The node must NOT accept the job when allow_real_jobs is off…
         assert!(
-            sent_types.iter().all(|t| t == "heartbeat"),
-            "only heartbeats expected after register, got {sent_types:?}"
+            !sent_types.iter().any(|t| t == "jobAccepted"),
+            "must not accept a job with allow_real_jobs off, got {sent_types:?}"
         );
+        // …but it MUST say so. Staying silent (the behaviour this test used to
+        // assert) left the job assigned until dispatch hard-failed it after
+        // max(10min, expected × 20).
+        assert_eq!(
+            sent_types.iter().filter(|t| *t == "jobRejected").count(),
+            1,
+            "exactly one jobRejected expected, got {sent_types:?}"
+        );
+        assert!(
+            sent_types
+                .iter()
+                .all(|t| t == "heartbeat" || t == "jobRejected"),
+            "only heartbeats and the rejection expected, got {sent_types:?}"
+        );
+    }
+
+    /// The rejection has to carry the reason and the assignment's attempt, or
+    /// dispatch cannot fence it against a newer assignment of the same job.
+    #[tokio::test]
+    async fn rejects_with_reason_and_attempt_when_not_accepting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = fast_config(port);
+        let register = test_register();
+        let obs = Observability::default();
+
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+        ws.send(Message::Text(
+			r#"{"type":"jobAssign","tenant":"driffs","jobId":"job-render-x","attempt":3,"kind":"gpu","durationFrames":10,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#.into(),
+		))
+		.await
+		.unwrap();
+
+        let mut rejection = None;
+        while let Some(Ok(frame)) = ws.next().await {
+            if let Message::Text(t) = frame {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "jobRejected" {
+                    rejection = Some(v);
+                }
+            }
+        }
+        client.await.unwrap().expect("clean exit");
+
+        let rejection = rejection.expect("a jobRejected frame");
+        assert_eq!(rejection["jobId"], "job-render-x");
+        assert_eq!(rejection["attempt"], 3);
+        assert_eq!(rejection["reason"], "not-accepting");
+        assert_eq!(rejection["tenant"], "driffs");
     }
 
     #[tokio::test]

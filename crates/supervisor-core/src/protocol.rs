@@ -111,6 +111,32 @@ pub struct JobFailedMessage {
     pub reason: String,
 }
 
+/// Why a worker declined an assignment it never started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RejectReason {
+    /// The operator has not opted in to executing real jobs.
+    NotAccepting,
+    /// A job is already in flight on this node.
+    Busy,
+}
+
+/// A job was declined **without being started** — distinct from
+/// [`JobFailedMessage`], which reports a render that ran and failed.
+///
+/// Dispatch should requeue immediately without counting an attempt: nothing was
+/// consumed and no work was lost. Before this existed, a refusing node stayed
+/// silent and dispatch hard-failed the job after `max(10min, expected × 20)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobRejectedMessage {
+    pub tenant: String,
+    pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    pub reason: RejectReason,
+}
+
 /// All worker → server messages, discriminated by the `type` field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -121,6 +147,7 @@ pub enum WorkerMessage {
     JobProgress(JobProgressMessage),
     JobComplete(JobCompleteMessage),
     JobFailed(JobFailedMessage),
+    JobRejected(JobRejectedMessage),
 }
 
 // ── Server → worker ─────────────────────────────────────────────────────────

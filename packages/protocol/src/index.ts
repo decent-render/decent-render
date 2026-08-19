@@ -98,6 +98,23 @@ export const JobFailedMessageSchema = z.object({
 });
 export type JobFailedMessage = z.infer<typeof JobFailedMessageSchema>;
 
+/**
+ * A job declined **without being started** — distinct from `jobFailed`, which
+ * reports a render that ran and failed.
+ *
+ * Dispatch should requeue immediately and NOT count an attempt: no work was
+ * consumed and nothing was lost. Before this existed a refusing node stayed
+ * silent, and dispatch hard-failed the job after `max(10min, expected × 20)`.
+ */
+export const JobRejectedMessageSchema = z.object({
+	type: z.literal('jobRejected'),
+	tenant: z.string(),
+	jobId: z.string(),
+	attempt: z.number().int().positive().optional(),
+	reason: z.enum(['not-accepting', 'busy']),
+});
+export type JobRejectedMessage = z.infer<typeof JobRejectedMessageSchema>;
+
 export const WorkerMessageSchema = z.discriminatedUnion('type', [
 	RegisterMessageSchema,
 	HeartbeatMessageSchema,
@@ -105,6 +122,7 @@ export const WorkerMessageSchema = z.discriminatedUnion('type', [
 	JobProgressMessageSchema,
 	JobCompleteMessageSchema,
 	JobFailedMessageSchema,
+	JobRejectedMessageSchema,
 ]);
 export type WorkerMessage = z.infer<typeof WorkerMessageSchema>;
 
