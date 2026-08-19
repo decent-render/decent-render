@@ -2,6 +2,11 @@
 
 ## 0.1.1
 
+- Requires `@decent-render/protocol` ^0.1.1. The browser fields added in
+  protocol 0.1.2 are optional and unread here — the supervisor resolves the
+  browser and passes a path — so this package does not gate on that release.
+  Publish order stays protocol first, then runner-core.
+
 - The browser may now come from outside the payload. `resolveBrowserExecutable`
   is exported and prefers `DECENT_BROWSER_EXECUTABLE` — set by the supervisor
   after it fetches and verifies a standalone browser artifact — falling back to
