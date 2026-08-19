@@ -16,6 +16,7 @@
 //! - [`purge`] — the purge rule as a type: per-job workdirs that cannot
 //!   outlive the job. Auditable source is the point.
 
+pub mod capabilities;
 pub mod connection;
 pub mod protocol;
 pub mod purge;

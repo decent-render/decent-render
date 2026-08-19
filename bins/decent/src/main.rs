@@ -11,8 +11,9 @@
 mod tui;
 
 use clap::{Parser, Subcommand};
+use supervisor_core::capabilities::detect_capabilities;
 use supervisor_core::connection::{self, ConnectionConfig};
-use supervisor_core::protocol::{Capabilities, Platform, RegisterMessage, PROTOCOL_VERSION};
+use supervisor_core::protocol::{Platform, RegisterMessage, PROTOCOL_VERSION};
 use supervisor_core::status::{Observability, SupervisorStatus};
 
 const SUPERVISOR_VERSION: &str = concat!("rust-", env!("CARGO_PKG_VERSION"));
@@ -378,9 +379,14 @@ fn resolve_token(token: Option<String>) -> anyhow::Result<String> {
     Ok(token)
 }
 
-/// Build the register message from probed hardware + the real-jobs flag.
+/// Build the register message from probed hardware.
+///
+/// Deliberately takes no arguments: it used to accept `allow_real_jobs` and
+/// report it as the GPU capability, so a node's willingness to work was
+/// advertised as hardware. Capability is a property of the machine.
+///
 /// Shared by every foreground command (`start`, `tui`).
-fn build_register(allow_real_jobs: bool) -> RegisterMessage {
+fn build_register() -> RegisterMessage {
     RegisterMessage {
         tenant: String::new(), // no longer used by farm dispatch (kept for protocol compat)
         protocol_version: PROTOCOL_VERSION,
@@ -390,9 +396,10 @@ fn build_register(allow_real_jobs: bool) -> RegisterMessage {
         ram_gb: detect_ram_gb(),
         supervisor_version: SUPERVISOR_VERSION.into(),
         payload_version: "none".into(),
-        capabilities: Capabilities {
-            gpu: allow_real_jobs,
-        },
+        // Probed hardware, NOT the operator's willingness switch. Wiring gpu to
+        // allow_real_jobs meant any node with the switch on advertised itself as
+        // GPU-capable, so dispatch would send it work it could not render.
+        capabilities: detect_capabilities(),
     }
 }
 
@@ -488,7 +495,7 @@ async fn main() -> anyhow::Result<()> {
             allow_real_jobs,
         } => {
             let token = resolve_token(token)?;
-            let register = build_register(allow_real_jobs);
+            let register = build_register();
             tracing::info!(
                 dispatch_url = %dispatch_url,
                 chip = %register.chip,
@@ -880,7 +887,7 @@ async fn main() -> anyhow::Result<()> {
             allow_real_jobs,
         } => {
             let token = resolve_token(token)?;
-            let register = build_register(allow_real_jobs);
+            let register = build_register();
             let config = ConnectionConfig {
                 heartbeat_limit: None,
                 allow_real_jobs,

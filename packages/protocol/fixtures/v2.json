@@ -3,7 +3,7 @@
   "description": "Canonical wire-format fixtures for the decent render-network protocol v2. Rust (crates/supervisor-core) and TS (@decent-render/protocol) BOTH assert against these — a field present in a fixture but missing from an implementation fails that implementation's test. This is the drift tripwire (the outputSizeInBytes scar is covered by the two jobComplete variants).",
   "cases": [
     {
-      "name": "register",
+      "name": "register (capabilities without the newer hardware fields)",
       "direction": "worker",
       "wire": {
         "type": "register",
@@ -17,6 +17,27 @@
         "payloadVersion": "none",
         "capabilities": {
           "gpu": true
+        }
+      }
+    },
+    {
+      "name": "register (full capabilities — hardware, not willingness)",
+      "direction": "worker",
+      "wire": {
+        "type": "register",
+        "tenant": "driffs",
+        "protocolVersion": 2,
+        "operator": null,
+        "platform": "company",
+        "chip": "Apple M4 Max (darwin)",
+        "ramGb": 64,
+        "supervisorVersion": "spike-0.0.2",
+        "payloadVersion": "none",
+        "capabilities": {
+          "gpu": true,
+          "maxConcurrentJobs": 1,
+          "os": "macos",
+          "arch": "aarch64"
         }
       }
     },

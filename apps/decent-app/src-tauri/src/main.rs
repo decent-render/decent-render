@@ -17,8 +17,9 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use supervisor_core::capabilities::detect_capabilities;
 use supervisor_core::connection::{self, ConnectionConfig};
-use supervisor_core::protocol::{Capabilities, Platform, RegisterMessage, PROTOCOL_VERSION};
+use supervisor_core::protocol::{Platform, RegisterMessage, PROTOCOL_VERSION};
 use supervisor_core::status::{ConnectionState, LogLine, Observability, SupervisorStatus};
 use tauri::{Emitter, State};
 use tokio::sync::{oneshot, Mutex};
@@ -135,7 +136,9 @@ fn detect_ram_gb() -> u32 {
     0
 }
 
-fn make_register(allow_real_jobs: bool) -> RegisterMessage {
+/// Deliberately takes no arguments — see build_register in bins/decent: the
+/// GPU capability must not be the operator's willingness switch.
+fn make_register() -> RegisterMessage {
     RegisterMessage {
         tenant: TENANT.into(),
         protocol_version: PROTOCOL_VERSION,
@@ -145,9 +148,10 @@ fn make_register(allow_real_jobs: bool) -> RegisterMessage {
         ram_gb: detect_ram_gb(),
         supervisor_version: SUPERVISOR_VERSION.into(),
         payload_version: "none".into(),
-        capabilities: Capabilities {
-            gpu: allow_real_jobs,
-        },
+        // Probed hardware, NOT the operator's willingness switch. Wiring gpu to
+        // allow_real_jobs meant any node with the switch on advertised itself as
+        // GPU-capable, so dispatch would send it work it could not render.
+        capabilities: detect_capabilities(),
     }
 }
 
@@ -251,7 +255,7 @@ async fn start_connection(
     save_token(&token);
 
     let obs = state.obs.clone();
-    let register = make_register(obs.allows_real_jobs());
+    let register = make_register();
     let config = ConnectionConfig::new(dispatch_url, token);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 

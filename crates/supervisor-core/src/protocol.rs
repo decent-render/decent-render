@@ -29,9 +29,30 @@ pub enum Platform {
 }
 
 /// What this node can render.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// A statement about HARDWARE, not about willingness. `gpu` used to be wired to
+/// the operator's "accept real jobs" toggle, which meant a Raspberry-class node
+/// with the switch on advertised itself as GPU-capable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Capabilities {
+    /// Can this node render the GPU path (`chromiumOptions: {gl: 'angle'}`)?
     pub gpu: bool,
+    /// How many jobs this node will run at once.
+    ///
+    /// Optional so frames from supervisors predating this field still parse;
+    /// dispatch treats `None` as 1, which is what it always assumed anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_jobs: Option<u32>,
+    /// `std::env::consts::OS` — "macos", "linux".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// `std::env::consts::ARCH` — "aarch64", "x86_64".
+    ///
+    /// Reported so dispatch can stop handing a darwin-arm64 payload to a Linux
+    /// box once the platform matrix lands. Nothing consumes it for routing yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
 }
 
 /// First message after connect — the worker introduces itself.

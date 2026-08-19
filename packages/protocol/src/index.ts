@@ -43,7 +43,21 @@ export const RegisterMessageSchema = z.object({
 	ramGb: z.number().int(),
 	supervisorVersion: z.string(),
 	payloadVersion: z.string(),
-	capabilities: z.object({gpu: z.boolean()}),
+	/**
+	 * What the node's HARDWARE can do — not what its operator is willing to do.
+	 * `gpu` was previously wired to the supervisor's "accept real jobs" toggle,
+	 * so any node with the switch on advertised itself as GPU-capable.
+	 *
+	 * The extra fields are optional so frames from supervisors predating them
+	 * still parse; a missing `maxConcurrentJobs` means 1.
+	 */
+	capabilities: z.object({
+		gpu: z.boolean(),
+		maxConcurrentJobs: z.number().int().positive().optional(),
+		/** Node's OS/arch, for matching platform-specific payloads. */
+		os: z.string().optional(),
+		arch: z.string().optional(),
+	}),
 });
 export type RegisterMessage = z.infer<typeof RegisterMessageSchema>;
 

@@ -554,7 +554,12 @@ mod tests {
             ram_gb: 8,
             supervisor_version: "rust-0.0.1".into(),
             payload_version: "none".into(),
-            capabilities: Capabilities { gpu: false },
+            capabilities: Capabilities {
+                gpu: false,
+                max_concurrent_jobs: None,
+                os: None,
+                arch: None,
+            },
         }
     }
 
