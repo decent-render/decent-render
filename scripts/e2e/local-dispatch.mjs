@@ -30,6 +30,10 @@ const arg = (n) => process.argv.find((a) => a.startsWith(`--${n}=`))?.slice(n.le
 const ART = arg('artifacts') || '/tmp/p3-artifacts';
 const PORT = Number(arg('port') || 8790);
 const CANCEL_AFTER = Number(arg('cancel-after') || 0);
+// PACKET 5: hard-drop the WebSocket this many ms after sending cancel —
+// models dispatch redeploys / network blips DURING the supervisor's
+// CANCEL_GRACE window. The supervisor must still finish killing the tree.
+const DROP_CONNECTION_AFTER = Number(arg('drop-connection-after') || 0);
 const OUT = path.join(ART, 'uploaded-output.mp4');
 
 const log = (...a) => console.error(`[dispatch]`, ...a);
@@ -161,9 +165,20 @@ const server = Bun.serve({
             log(`⇒ cancel job-p3-proof (at progress ${frame.progress})`);
             ws.send(JSON.stringify({type: 'cancel', tenant: 'driffs', jobId: 'job-p3-proof'}));
             cancelSent = true;
+            if (DROP_CONNECTION_AFTER > 0) {
+              // RIP THE SOCKET mid-grace. The supervisor's drain must still
+              // complete: TERM -> grace -> KILL -> sweep -> purge. The
+              // harness exits only after observing the orphan accounting
+              // window (below), so this drop is observable from outside.
+              setTimeout(() => {
+                log(`⇒ HARD-DROPPING WebSocket (drop-connection-after=${DROP_CONNECTION_AFTER}ms)`);
+                ws.close(1001, 'dispatch redeploy');
+                server.stop(true); // kill the TCP listener too — hard drop
+              }, DROP_CONNECTION_AFTER);
+            }
             setTimeout(() => {
               clearTimeout(timer);
-              finish(0, `cancel settled: completeAfterCancel=${sawAccepted} failedLeaked=${result === 'failed'}`);
+              finish(0, `cancel settled + ws dropped: completeAfterCancel=${sawAccepted} failedLeaked=${result === 'failed'}`);
             }, 25_000);
           }
           break;

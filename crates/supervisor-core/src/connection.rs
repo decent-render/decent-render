@@ -276,6 +276,39 @@ pub async fn run(
     // genuine failure. Cleared when that job's terminal frame arrives.
     let mut canceled_job: Option<String> = None;
 
+    // PACKET 5: a dispatch-canceled job whose terminate is still running.
+    // The Cancel arm hands the job here instead of dropping its task handle —
+    // `run()` awaits it on EVERY exit path so the TERM -> grace -> SIGKILL ->
+    // browser-sweep -> purge sequence cannot be abandoned when the socket
+    // dies mid-grace (dispatch redeploy / network blip).
+    let mut draining: Option<InFlightJob> = None;
+
+    // PACKET 5: teardown completion guarantee. Every exit path must cancel
+    // the in-flight job AND await its task to completion before run() returns.
+    // The terminate sequence (group TERM -> CANCEL_GRACE -> group KILL ->
+    // pidfile sweep -> purge) runs inside the job task; returning while it is
+    // mid-grace drops the future at its await point and strands a live render
+    // tree. In start mode the process then exits, so a detached spawn cannot
+    // save it — the await is the only completion guarantee. Bounded by
+    // construction: TERM-grace(10s) + KILL + wait + sweep are all bounded.
+    async fn drain_in_flight_jobs(
+        in_flight: &mut Option<InFlightJob>,
+        draining: &mut Option<InFlightJob>,
+    ) {
+        if let Some(mut job) = in_flight.take() {
+            let _ = job.cancel.take().map(|tx| tx.send(()));
+            // The job already had its chance to report; the socket is gone.
+            let _ = job.handle.await;
+        }
+        // A job canceled by dispatch moments before the socket died: its
+        // terminate (TERM -> grace -> SIGKILL -> sweep -> purge) is still
+        // running inside the job task. Await it to completion — abandoning
+        // it here is exactly the stranded-tree defect this packet fixes.
+        if let Some(job) = draining.take() {
+            let _ = job.handle.await;
+        }
+    }
+
     loop {
         let current_job_count = u32::from(in_flight.is_some());
         tokio::select! {
@@ -283,20 +316,22 @@ pub async fn run(
             _ = &mut shutdown => {
                 tracing::info!("shutdown signal received — closing connection");
                 obs.log(LogLine::info("Shutting down connection…"));
-                if let Some(job) = in_flight.take() {
+                if in_flight.is_some() {
                     obs.update_status(|s| {
                         if let Some(j) = &mut s.current_job {
                             j.phase = JobPhase::Canceled;
                         }
                     });
-                    let _ = job.cancel.send(());
                     obs.log(LogLine::warn(
-                        "In-flight job canceled by shutdown — workdir purged".to_string(),
+                        "In-flight job canceled by shutdown — draining before exit".to_string(),
                     ));
                 }
                 sink.send(Message::Close(None)).await.ok();
                 obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                 obs.log(LogLine::info("Connection closed"));
+                // Close the socket FIRST so dispatch can requeue immediately;
+                // then finish killing what we started before returning.
+                drain_in_flight_jobs(&mut in_flight, &mut draining).await;
                 return Ok(());
             }
             _ = heartbeat.tick() => {
@@ -304,7 +339,15 @@ pub async fn run(
                     tenant: register.tenant.clone(),
                     current_job_count,
                 });
-                sink.send(Message::Text(send(msg))).await.context("failed to send heartbeat")?;
+                if let Err(e) = sink.send(Message::Text(send(msg))).await {
+                    // PACKET 5: the socket died with a job still in flight —
+                    // cancel and drain it BEFORE returning, or the render tree
+                    // is stranded live on the operator machine.
+                    let _ = e;
+                    obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                    drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                    return Err(anyhow::Error::from(e).context("failed to send heartbeat"));
+                }
                 heartbeats_sent += 1;
                 if let Some(limit) = config.heartbeat_limit {
                     if heartbeats_sent >= limit {
@@ -312,6 +355,7 @@ pub async fn run(
                         obs.log(LogLine::info("Heartbeat limit reached — closing"));
                         sink.send(Message::Close(None)).await.ok();
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                        drain_in_flight_jobs(&mut in_flight, &mut draining).await;
                         return Ok(());
                     }
                 }
@@ -357,7 +401,12 @@ pub async fn run(
                     }
                 } else {
                     emit(obs, &msg);
-                    sink.send(Message::Text(send(msg))).await.context("failed to send worker job frame")?;
+                    if let Err(e) = sink.send(Message::Text(send(msg))).await {
+                        // PACKET 5: drain before returning — see heartbeat arm.
+                        obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                        drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                        return Err(anyhow::Error::from(e).context("failed to send worker job frame"));
+                    }
                 }
             }
             frame = stream.next() => {
@@ -395,7 +444,8 @@ pub async fn run(
                                             continue;
                                         }
                                         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-                                        in_flight = Some(InFlightJob { job_id: assign.job_id.clone(), cancel: cancel_tx });
+                                        let mut pending_cancel = Some(cancel_tx);
+                                        let job_id_owned = assign.job_id.clone();
                                         let tier = format!("{:?}", assign.kind).to_lowercase();
                                         obs.update_status(|s| {
                                             s.current_job = Some(JobStatus {
@@ -417,13 +467,19 @@ pub async fn run(
                                                 job.phase = JobPhase::Rendering;
                                             }
                                         });
-                                        tokio::spawn(run_job(*assign, cancel_rx, worker_tx.clone()));
+                                        let handle = tokio::spawn(run_job(*assign, cancel_rx, worker_tx.clone()));
+                                        // PACKET 5: keep the JoinHandle — every exit path awaits it.
+                                        in_flight = Some(InFlightJob {
+                                            job_id: job_id_owned,
+                                            cancel: pending_cancel.take(),
+                                            handle,
+                                        });
                                     }
                                     ServerMessage::Cancel(cancel)
                                         if in_flight.as_ref().map(|j| j.job_id.as_str())
                                             == Some(cancel.job_id.as_str()) =>
                                     {
-                                        if let Some(job) = in_flight.take() {
+                                        if let Some(mut job) = in_flight.take() {
                                             // Mark the job canceled BEFORE killing the
                                             // render, so the abort that follows can
                                             // never race past the marker and surface
@@ -434,8 +490,13 @@ pub async fn run(
                                                     j.phase = JobPhase::Canceled;
                                                 }
                                             });
-                                            let _ = job.cancel.send(());
+                                            let _ = job.cancel.take().map(|tx| tx.send(()));
                                             obs.log(LogLine::warn(format!("Job {} canceled by dispatch", cancel.job_id)));
+                                            // PACKET 5: keep ownership of the task. The
+                                            // terminate sequence runs INSIDE this task;
+                                            // dropping the handle here would orphan it
+                                            // mid-grace if the socket dies next.
+                                            draining = Some(job);
                                         }
                                     }
                                     ServerMessage::Cancel(_) => {}
@@ -470,6 +531,9 @@ pub async fn run(
                         }
                         obs.log(LogLine::info("Socket closed by server"));
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                        // PACKET 5: the tree we started still needs killing
+                        // before this task returns — mid-grace drop strands it.
+                        drain_in_flight_jobs(&mut in_flight, &mut draining).await;
                         return Ok(());
                     }
                     // tungstenite answers Ping frames automatically.
@@ -481,12 +545,14 @@ pub async fn run(
                             s.last_error = Some(msg.clone());
                         });
                         obs.log(LogLine::error(&msg));
+                        drain_in_flight_jobs(&mut in_flight, &mut draining).await;
                         return Err(anyhow!(e).context("websocket error"));
                     }
                     None => {
                         tracing::info!("socket stream ended");
                         obs.log(LogLine::info("Socket stream ended"));
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                        drain_in_flight_jobs(&mut in_flight, &mut draining).await;
                         return Ok(());
                     }
                 }
@@ -1724,6 +1790,192 @@ while true; do sleep 5; done
         ws.close(None).await.ok();
         while let Some(Ok(_)) = ws.next().await {}
         client.await.unwrap().expect("clean exit");
+        std::fs::remove_dir_all(&payload_dir).ok();
+        std::fs::remove_dir_all(&browser_dir).ok();
+    }
+
+    /// PACKET 5: the terminate path must run to completion even when the
+    /// dispatch WebSocket dies MID-GRACE. Pre-fix, `run()` returned Err on
+    /// the WS error, dropping the terminate future: no SIGKILL escalation,
+    /// no browser sweep, no purge — runner + daemonized browser survived.
+    /// This is the production shape: dispatch redeploys or the network
+    /// blips during a cancel grace window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ws_drop_mid_grace_still_kills_tree_and_purges() {
+        use std::os::unix::fs::PermissionsExt;
+        let pid = std::process::id();
+        let sha = format!("test-wsdrop-{pid}");
+        let job_id = format!("job-wsdrop-{pid}");
+
+        // Daemonizing browser stand-in: python os.setsid() (macOS has no
+        // setsid(1)) — new session AND group, pgid == own pid, exactly
+        // Remotion's detached Chrome. Bounded at 120s so a broken test
+        // cannot leak it forever.
+        let browser_stand_in = std::env::temp_dir().join(format!("decent-chrome-wsdrop-{pid}.py"));
+        let started = std::env::temp_dir().join(format!("decent-chrome-wsdrop-{pid}.started"));
+        let _ = std::fs::remove_file(&started);
+        std::fs::write(
+            &browser_stand_in,
+            format!(
+                "#!/usr/bin/env python3\nimport os, sys, time\nos.setsid()\nopen({m:?}, 'w').close()\ntime.sleep(120)\n",
+                m = started.display().to_string()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&browser_stand_in, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let browser_sha = format!("test-chrome-wsdrop-{pid}");
+        let browser_dir =
+            std::path::PathBuf::from(std::env::var("HOME").expect("HOME set in tests"))
+                .join(".decent-worker/browsers")
+                .join(&browser_sha);
+        std::fs::create_dir_all(&browser_dir).unwrap();
+        std::fs::copy(&browser_stand_in, browser_dir.join("chrome-stand-in.sh")).unwrap();
+        std::fs::write(browser_dir.join("executable"), "chrome-stand-in.sh").unwrap();
+
+        // The runner spawns the supervisor wrapper (DECENT_BROWSER_EXECUTABLE)
+        // exactly as Remotion spawns Chrome, reports progress, then WEDGES:
+        // traps TERM and freezes the event loop. The supervisor cannot get a
+        // graceful exit; it must ride the 10s grace to SIGKILL — and that
+        // ride now spans a dead WebSocket.
+        let payload_script = r#"#!/bin/sh
+trap '' TERM INT
+"$DECENT_BROWSER_EXECUTABLE" about:blank --user-data-dir=/tmp >/dev/null 2>&1 &
+echo '{"type":"progress","progress":0.5}'
+while true; do sleep 5; done
+"#;
+        let payload_dir = seed_fake_payload(&sha, payload_script);
+
+        let assign = format!(
+            r#"{{"type":"jobAssign","tenant":"driffs","jobId":"{job_id}","kind":"standard","durationFrames":1,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"{sha}","payloadGetUrl":"u","browserSha256":"{browser_sha}","browserGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}}"#
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, _status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let mut client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(assign)).await.unwrap();
+
+        // Wait for full daemonization: marker touched INSIDE the setsid'd child.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "browser stand-in never daemonized"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Daemon pid from the containment's own data source.
+        let workdirs = job_workdirs(&job_id);
+        assert!(!workdirs.is_empty(), "job workdir not found");
+        let pidfile_contents = std::fs::read_to_string(workdirs[0].join(".decent-browser-pids"))
+            .expect("wrapper never recorded the browser pid — containment data source missing");
+        let daemon_pid: u32 = pidfile_contents
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .parse()
+            .expect("pidfile holds a pid");
+
+        // Prove the daemon REALLY daemonized: own group, pgid == pid.
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "pgid=", "-p", &daemon_pid.to_string()])
+            .output()
+            .unwrap();
+        let daemon_pgid: u32 = String::from_utf8_lossy(&ps.stdout).trim().parse().unwrap();
+        assert_eq!(
+            daemon_pgid, daemon_pid,
+            "stand-in failed to model Chrome: pgid must equal its own pid"
+        );
+
+        // Sanity: alive, and outside any runner group.
+        assert!(
+            unsafe { libc::kill(daemon_pid as libc::pid_t, 0) } == 0,
+            "daemonized browser must be alive before cancel"
+        );
+
+        // CANCEL. The runner ignores TERM (trap ''); the supervisor enters
+        // the 10s CANCEL_GRACE.
+        ws.send(Message::Text(format!(
+            r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+        )))
+        .await
+        .unwrap();
+
+        // Give the supervisor a moment to enter the grace window (TERM sent,
+        // waiting on the child), then RIP THE SOCKET — the production shape:
+        // dispatch redeploys mid-grace. Hard abort of the server side.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        drop(ws);
+
+        // THE assertion, part 1: `run()` must not give up. Pre-fix it
+        // returned Err immediately when the WS died (ws error -> `?`),
+        // dropping the terminate future. Post-fix it drains the job to
+        // completion: TERM -> 10s grace -> SIGKILL -> browser sweep -> purge.
+        // The drain necessarily takes ~10s (grace) — a fast pass here means
+        // the grace path was never exercised.
+        let t0 = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(45), &mut client)
+            .await
+            .expect("run() hung — drain did not complete in 45s")
+            .expect("client task panicked");
+        let elapsed = t0.elapsed();
+        let ran_for = elapsed.as_secs_f64();
+        assert!(
+            ran_for >= 7.0,
+            "drain finished in {ran_for:.1}s — the grace path was not exercised (a dropped job returns ~0s; the 10s grace minus the 1.5s pre-drop cancel lead is ~8.5s)"
+        );
+        // The WS error itself is honest (the socket really died); what matters
+        // is that run() did not RETURN until the drain finished. Ok(()) or
+        // Err(websocket error) are both acceptable — the tree assertions
+        // below are the load-bearing proof.
+        match &outcome {
+            Ok(()) => {}
+            Err(e) => assert!(
+                format!("{e:#}").contains("websocket error"),
+                "unexpected error from run(): {e:#}"
+            ),
+        }
+
+        // THE assertion, part 2: the whole tree is dead — the wedged runner
+        // (group SIGKILL) AND the daemonized browser (pidfile sweep), which
+        // no group signal can reach.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let alive = unsafe { libc::kill(daemon_pid as libc::pid_t, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemonized browser survived a WS drop mid-grace — teardown was abandoned"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // THE assertion, part 3: purge invariant held — no workdir remains.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            job_workdirs(&job_id).is_empty(),
+            "workdir survived a WS drop mid-grace — purge invariant violated"
+        );
+
         std::fs::remove_dir_all(&payload_dir).ok();
         std::fs::remove_dir_all(&browser_dir).ok();
     }

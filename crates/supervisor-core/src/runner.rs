@@ -21,7 +21,15 @@ const CANCEL_GRACE: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 pub struct InFlightJob {
     pub job_id: String,
-    pub cancel: oneshot::Sender<()>,
+    pub cancel: Option<oneshot::Sender<()>>,
+    /// The run_job task itself. The connection loop MUST await this on every
+    /// exit path (PACKET 5): cancel triggers teardown, but teardown runs to
+    /// completion INSIDE the task — TERM → CANCEL_GRACE → KILL → pidfile
+    /// sweep → purge. Dropping the JoinHandle (or returning while it is
+    /// mid-grace) aborts the future at its await point and strands a live
+    /// render tree on the operator machine. Observed in packet 4's wedge run:
+    /// wedged runner + ffmpeg + 8 Chrome, alive until killed by hand.
+    pub handle: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -169,6 +169,8 @@ mod imp {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
     <key>StandardOutPath</key>
     <string>{log}</string>
     <key>StandardErrorPath</key>
@@ -407,6 +409,7 @@ mod imp {
              ExecStart={exe} start --dispatch-url {url} --allow-real-jobs\n\
              Restart=always\n\
              RestartSec=10\n\
+             TimeoutStopSec=30\n\
              Environment=RUST_LOG=info\n\
              StandardOutput=append:{log}\n\
              StandardError=append:{log}\n\
