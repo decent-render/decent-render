@@ -31,17 +31,39 @@ export type OutputProbe = {
 };
 
 /**
- * Every ffmpeg/ffprobe invocation runs with `cwd` set to the binaries
- * directory. Remotion's binaries are dynamically linked against sibling
- * dylibs (`libavdevice.dylib` and friends) resolved RELATIVE TO THE CURRENT
- * WORKING DIRECTORY. The runner renders from a per-job mkdtemp workdir, so
- * spawning them from there dies with a dyld "Library not loaded" error —
- * which this module would otherwise have reported as "output does not
- * decode", failing every good render on every node. Verified 2026-08-21 on
- * the shipped darwin-arm64 payload.
+ * How Remotion's shipped binaries find their own shared libraries.
+ *
+ * macOS: the dylibs carry BARE install names and the executables have no
+ * `LC_RPATH`, so dyld's only route to them is its fallback of searching the
+ * current working directory. The runner renders from a per-job mkdtemp
+ * workdir, so spawning from there dies with "Library not loaded:
+ * libavdevice.dylib" — which this module would otherwise have reported as
+ * "output does not decode", failing every good render on every node.
+ *
+ * Linux: every shipped variant carries `RPATH $ORIGIN` (old-style transitive
+ * `DT_RPATH`, so the inter-libav dependencies resolve too), which makes the
+ * libraries resolve relative to the BINARY and needs neither of these.
+ *
+ * We set both anyway — harmless on Linux, and `cwd` + `*_LIBRARY_PATH` is
+ * exactly what Remotion's own `callFf()` does, so this stays aligned with
+ * upstream rather than depending on a dyld fallback.
+ *
+ * Verified 2026-08-21: darwin-arm64 by running the shipped payload here;
+ * linux-{x64,arm64}-{gnu,musl} at the pinned 4.0.506 by executing the real
+ * binaries in Docker (ELF headers + `env -i`, cwd=/).
  */
+function ffEnv(binariesDirectory: string): NodeJS.ProcessEnv {
+  const prepend = (existing: string | undefined) =>
+    existing === undefined || existing === '' ? binariesDirectory : `${binariesDirectory}:${existing}`;
+  return {
+    ...process.env,
+    DYLD_LIBRARY_PATH: prepend(process.env.DYLD_LIBRARY_PATH),
+    LD_LIBRARY_PATH: prepend(process.env.LD_LIBRARY_PATH),
+  };
+}
+
 function runFf(binary: string, args: string[], binariesDirectory: string) {
-  return spawnSync(binary, args, {cwd: binariesDirectory, encoding: 'utf8'});
+  return spawnSync(binary, args, {cwd: binariesDirectory, env: ffEnv(binariesDirectory), encoding: 'utf8'});
 }
 
 export type VerifyOptions = {
@@ -150,11 +172,18 @@ const SAMPLE_HEIGHT = 36;
  * amount of scaling, and 2.3KB per frame keeps this free.
  *
  * One seek per sample rather than a `select` filter: Remotion ships a
- * STRIPPED ffmpeg (50 filters; `scale` and `format` are present, `select` is
- * NOT — verified 2026-08-21 against the shipped darwin-arm64 payload), so a
- * select-based sampler works on a developer's homebrew ffmpeg and fails on
- * every production node. Seeking also decodes only around each sample instead
- * of walking the whole file.
+ * STRIPPED ffmpeg, configured with `--disable-filters/--disable-muxers/
+ * --disable-encoders` plus explicit allowlists. `scale` and `format` are
+ * present, `select` is NOT, and `rawvideo` exists as an encoder but not as a
+ * muxer — so a select-based sampler works on a developer's homebrew ffmpeg
+ * and fails on every production node. Seeking also decodes only around each
+ * sample instead of walking the whole file.
+ *
+ * The allowlist is IDENTICAL on darwin-arm64 and on all four Linux variants
+ * (x64/arm64 × gnu/musl) at the pinned 4.0.506 — verified 2026-08-21 by
+ * running the real binaries, not by reading about them. Everything this
+ * sampler depends on (`scale`, `format`, the `image2pipe` muxer, the
+ * `rawvideo` encoder) is present on every one of them.
  */
 function sampleFrames(
   ffmpeg: string,
@@ -182,7 +211,7 @@ function sampleFrames(
         '-c:v', 'rawvideo',
         '-',
       ],
-      {cwd: binariesDirectory, encoding: 'buffer', maxBuffer: 16 * 1024 * 1024},
+      {cwd: binariesDirectory, env: ffEnv(binariesDirectory), encoding: 'buffer', maxBuffer: 16 * 1024 * 1024},
     );
     if (result.status !== 0) {
       const stderr = Buffer.isBuffer(result.stderr) ? result.stderr.toString('utf8') : '';
