@@ -61,6 +61,37 @@ fn home_dir() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow!("HOME is not set"))
 }
 
+/// Test-only redirection of the worker state root. Never set in production.
+static WORKER_ROOT_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Root of this node's cached state — payloads, browsers — normally
+/// `~/.decent-worker`.
+///
+/// Exists as a seam because the tests used to seed fake payloads and browsers
+/// directly into the REAL directory. That is live operator state, not scratch:
+/// it holds the sha-named artifacts an actual node renders with. The tests
+/// name their fixtures `test-*` to avoid collisions, but cleaning up then
+/// means `rm -rf` globs pointed at the real cache, and one slightly wrong glob
+/// deletes a real payload. Redirecting the root removes the hazard entirely
+/// rather than managing it.
+fn worker_root() -> anyhow::Result<PathBuf> {
+    if let Some(root) = WORKER_ROOT_OVERRIDE.get() {
+        return Ok(root.clone());
+    }
+    Ok(home_dir()?.join(".decent-worker"))
+}
+
+/// Point the worker state root at `root` for the rest of this process.
+///
+/// Idempotent and first-write-wins (`OnceLock::set`), which is what makes it
+/// safe to call from every test in a multi-threaded test binary without
+/// ordering assumptions — unlike `set_var("HOME", ...)`, which races and would
+/// leak into anything else reading the environment.
+#[cfg(test)]
+pub(crate) fn set_worker_root_for_tests(root: PathBuf) {
+    let _ = WORKER_ROOT_OVERRIDE.set(root);
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
@@ -87,7 +118,7 @@ async fn ensure_artifact(
     get_url: &str,
     marker: &str,
 ) -> anyhow::Result<PathBuf> {
-    let dir = home_dir()?.join(".decent-worker").join(kind).join(sha256);
+    let dir = worker_root()?.join(kind).join(sha256);
     if dir.join(marker).exists() {
         tracing::info!(kind, sha = %sha256, path = %dir.display(), "artifact cached");
         return Ok(dir);

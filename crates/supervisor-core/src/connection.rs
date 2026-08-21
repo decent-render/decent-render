@@ -709,11 +709,65 @@ mod tests {
     /// (no download). The "runner" is a shell script standing in for
     /// `decent-render-runner`. Returns the payload dir for cleanup.
     #[cfg(unix)]
+    /// Per-process worker state root for tests, redirected away from the real
+    /// `~/.decent-worker`.
+    ///
+    /// That directory is LIVE OPERATOR STATE — it holds the sha-named payloads
+    /// and browsers a real node renders with. Seeding fixtures into it meant
+    /// every cleanup was an `rm -rf` glob aimed at the real cache, and it had
+    /// accumulated ~55 stray `test-*` payload dirs against 9 real ones by the
+    /// time this was fixed. First call wins and installs the redirect, so no
+    /// test needs to run first.
+    #[cfg(unix)]
+    fn test_worker_root() -> std::path::PathBuf {
+        static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            let root =
+                std::env::temp_dir().join(format!("decent-test-worker-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("test worker root");
+            crate::runner::set_worker_root_for_tests(root.clone());
+            root
+        })
+        .clone()
+    }
+
+    /// The tests must never write into the real `~/.decent-worker`.
+    ///
+    /// Guards the seam directly rather than trusting it: if the redirect is
+    /// ever dropped, seeding silently starts writing sha-named fixtures into
+    /// live operator state again and every cleanup becomes an `rm -rf` glob
+    /// pointed at a real node's payload cache.
+    ///
+    /// Note this is not the only proof — every containment test seeds a
+    /// payload and then relies on the SUPERVISOR's own `ensure_artifact` to
+    /// find it. If production and test disagreed about the root, those tests
+    /// would try to download from a dummy URL and fail. This test just makes
+    /// the invariant explicit and cheap to diagnose.
+    #[cfg(unix)]
+    #[test]
+    fn tests_never_seed_into_live_operator_state() {
+        let real = std::path::PathBuf::from(std::env::var("HOME").expect("HOME set in tests"))
+            .join(".decent-worker");
+        let seeded = seed_fake_payload("test-root-isolation-probe", "#!/bin/sh\nexit 0\n");
+
+        assert!(
+            seeded.starts_with(test_worker_root()),
+            "payload was seeded outside the test root: {}",
+            seeded.display()
+        );
+        assert!(
+            !seeded.starts_with(&real),
+            "payload was seeded into LIVE operator state at {}",
+            seeded.display()
+        );
+
+        std::fs::remove_dir_all(&seeded).ok();
+    }
+
+    #[cfg(unix)]
     fn seed_fake_payload(sha: &str, script: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::path::PathBuf::from(std::env::var("HOME").expect("HOME set in tests"))
-            .join(".decent-worker/payloads")
-            .join(sha);
+        let dir = test_worker_root().join("payloads").join(sha);
         std::fs::create_dir_all(&dir).unwrap();
         let runner = dir.join("decent-render-runner");
         std::fs::write(&runner, script).unwrap();
@@ -1648,10 +1702,7 @@ while true; do sleep 5; done
         // Seed a browser artifact so ensure_browser resolves: the manifest
         // points at the stand-in "executable" above.
         let browser_sha = format!("test-chrome-{pid}");
-        let browser_dir =
-            std::path::PathBuf::from(std::env::var("HOME").expect("HOME set in tests"))
-                .join(".decent-worker/browsers")
-                .join(&browser_sha);
+        let browser_dir = test_worker_root().join("browsers").join(&browser_sha);
         std::fs::create_dir_all(&browser_dir).unwrap();
         // The manifest must name the executable RELATIVE to the artifact
         // root — absolute paths are rejected by the escape guard in
@@ -1839,10 +1890,7 @@ while true; do sleep 5; done
             .unwrap();
 
         let browser_sha = format!("test-chrome-wsdrop-{pid}");
-        let browser_dir =
-            std::path::PathBuf::from(std::env::var("HOME").expect("HOME set in tests"))
-                .join(".decent-worker/browsers")
-                .join(&browser_sha);
+        let browser_dir = test_worker_root().join("browsers").join(&browser_sha);
         std::fs::create_dir_all(&browser_dir).unwrap();
         std::fs::copy(&browser_stand_in, browser_dir.join("chrome-stand-in.sh")).unwrap();
         std::fs::write(browser_dir.join("executable"), "chrome-stand-in.sh").unwrap();
