@@ -106,9 +106,27 @@ workflow and verify the complete asset set.
 
 ## Operator-platform scope
 
-The released node target is Apple Silicon macOS (`aarch64-apple-darwin`). Linux
-and Windows support is not implied by portable core code. The Tauri app is
-maintained but secondary; CLI/TUI is the primary node-local surface.
+Released node targets are Apple Silicon macOS (`aarch64-apple-darwin`) and Linux
+glibc on `x86_64` and `aarch64`. Windows is out of scope, and musl is not
+supported — the render payloads pin glibc compositors, so a musl node would
+install and then fail to execute one.
+
+Distribution differs by platform on purpose: macOS goes through the Homebrew tap
+(`decent upgrade` is `brew upgrade`), Linux through the cargo-dist shell
+installer (`decent upgrade` re-runs it). Do not add a Linux Homebrew path.
+
+`aarch64` Linux is **not** a GPU target: `chrome-for-testing` ships no stable
+`linux-arm64` build, so Remotion substitutes a Playwright chromium.
+`capabilities.rs` reports `gpu: false` there deliberately — do not "fix" it.
+
+Daemon supervision is the one genuinely OS-specific area, and it lives behind
+`bins/decent/src/service.rs` (launchd on macOS, systemd user units on Linux).
+Add platform behaviour there rather than `#[cfg]`-ing command bodies in
+`main.rs`. `supervisor-core` is platform-free apart from `capabilities.rs`;
+keep it that way.
+
+The Tauri app is maintained but secondary; CLI/TUI is the primary node-local
+surface.
 
 ## Documentation map
 

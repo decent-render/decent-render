@@ -7,3 +7,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+
+# macOS only, even though the workspace now builds for Linux too.
+#
+# This shim exists for exactly one reason: `decent-node` was renamed to `decent`
+# before v0.1, and macOS operators who installed the old name need to be told.
+# `decent-node` never existed on Linux, so a Linux shim would print a
+# deprecation notice for a command nobody there has ever run — and would add a
+# decent-node Linux tarball plus a Linux branch in the shim formula to every
+# release. Narrowing is allowed; a package may not widen past the workspace set.
+#
+# Deleted wholesale at v0.1 along with the crate and update-homebrew-shim.yml.
+[package.metadata.dist]
+targets = ["aarch64-apple-darwin"]

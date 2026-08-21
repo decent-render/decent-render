@@ -59,30 +59,54 @@ management surface for tracking your machines.
 
 ## Install
 
-Apple Silicon macOS is the supported release target.
+Apple Silicon macOS and Linux (x86_64 and aarch64, glibc).
+
+**macOS** — Homebrew, which is also how `decent upgrade` works:
 
 ```sh
 brew install decent-render/tap/decent
 ```
 
-Or install the latest GitHub Release with its generated shell installer. Build
-from source when developing (requires Rust + Cargo):
+**Linux** — the installer published with each release:
+
+```sh
+curl -LsSf https://github.com/decent-render/decent-render/releases/latest/download/decent-installer.sh | sh
+```
+
+Homebrew does run on Linux and the formula would work there, but effectively no
+one operating a headless render box has it installed, so the installer is the
+supported Linux path. `decent upgrade` re-runs it for you.
+
+Build from source when developing (requires Rust + Cargo):
 
 ```sh
 cargo install --git https://github.com/decent-render/decent-render decent
 ```
 
+### What a Linux node can and cannot do
+
+Both architectures render. Only x86_64 can use the GPU path: `chrome-for-testing`
+has no stable `linux-arm64` build, so on ARM, Remotion substitutes a Playwright
+chromium. `decent` detects this and reports `gpu: false`, which means dispatch
+sends it standard jobs only — that is correct behaviour, not a misconfiguration.
+On x86_64 the GPU path needs a DRM render node (`/dev/dri/renderD*`); without
+one, `decent` again reports `gpu: false`.
+
+Alpine and other musl distributions are not supported: the render payloads are
+built against glibc, so a musl node would install and then fail to run them.
+
 ## Usage
 
-> **Pre-v0.1 compatibility name:** v0.0.4 is installed as `decent`. The
-> public CLI will be renamed to `decent` before v0.1, with an upgrade shim that
-> preserves existing token/config/launchd state.
+> **Renamed from `decent-node`:** the CLI is `decent` as of v0.0.5. A
+> `decent-node` shim still forwards to it on macOS and is removed at v0.1;
+> `decent install` migrates the token and the daemon label for you.
 
 ```sh
 # Store a token issued by the tenant/network you are joining.
 decent login --token <worker-jwt>
 
-# Install the unattended launchd daemon against production dispatch.
+# Install the unattended daemon against production dispatch.
+# launchd agent on macOS; systemd user unit (with lingering) on Linux.
 decent install
 
 # Inspect and control it.

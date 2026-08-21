@@ -10,9 +10,25 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax).
-# Apple-Silicon-only for launch: the render payloads are arm64-compiled, so
-# Intel Macs can't run them; Windows is out of scope; Linux is W3.10 (Phase 2).
-targets = ["aarch64-apple-darwin"]
+#
+# Intel Macs are excluded because the render payloads are arm64-compiled.
+# Windows is out of scope.
+#
+# GNU rather than musl, deliberately. The usual advice is to ship both and let
+# the installer pick, but the render payloads pin
+# `@remotion/compositor-linux-{arm64,x64}-gnu` — a musl node would install
+# cleanly and then download a glibc payload it cannot execute. musl is a second
+# payload lane, not a supervisor target; adding one here without the other would
+# just move the failure later.
+#
+# aarch64 Linux is supported but is NOT a GPU target: chrome-for-testing has no
+# stable linux-arm64 build, so Remotion substitutes a Playwright chromium.
+# `capabilities.rs` reports `gpu: false` there, which is correct, not a bug.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
 # Where to host releases
 hosting = "github"
 
@@ -26,6 +42,16 @@ hosting = "github"
 # Homebrew tap — cargo-dist generates Formula/<crate>.rb and pushes on tag.
 # Requires HOMEBREW_TAP_TOKEN secret in the repo (GitHub PAT with repo scope
 # on decent-render/homebrew-tap).
+#
+# The tap is the macOS story: `decent upgrade` is `brew upgrade` there. Linux
+# operators get the generated shell installer instead. Homebrew does run on
+# Linux, but effectively nobody operating a headless render box has it, and
+# bootstrapping it to serve one formula is a worse ask than the installer.
+#
+# Now that Linux targets exist, cargo-dist emits on_macos/on_linux blocks in the
+# formula. That also fixes a latent bug in the single-target formula: it carried
+# `depends_on arch: :arm64` with no `depends_on :macos`, so Homebrew-on-Linux
+# arm64 would have installed a Mach-O binary that cannot exec.
 [dist.homebrew]
 formula = "decent"
 tap = "decent-render/homebrew-tap"

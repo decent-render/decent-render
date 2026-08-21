@@ -8,9 +8,11 @@
 //! The only difference: the CLI passes `Observability::default()` (tracing
 //! only), the app passes one with status/log channels attached.
 
+mod service;
 mod tui;
 
 use clap::{Parser, Subcommand};
+use service::{DaemonState, ServiceSpec};
 use supervisor_core::capabilities::detect_capabilities;
 use supervisor_core::connection::{self, ConnectionConfig};
 use supervisor_core::protocol::{Platform, RegisterMessage, PROTOCOL_VERSION};
@@ -176,68 +178,6 @@ async fn await_termination() -> Option<&'static str> {
     tokio::signal::ctrl_c().await.ok().map(|()| "ctrl-c")
 }
 
-/// launchd label for the installed agent.
-const LAUNCHD_LABEL: &str = "com.decent-render.decent";
-const LEGACY_LAUNCHD_LABEL: &str = "com.decent-render.decent-node";
-
-fn launch_agents_dir() -> anyhow::Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-    let dir = std::path::PathBuf::from(home).join("Library/LaunchAgents");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-fn plist_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(launch_agents_dir()?.join(format!("{LAUNCHD_LABEL}.plist")))
-}
-
-/// Build the launchd agent plist: runs `decent start --allow-real-jobs` at
-/// login against dispatch, restarts on exit (KeepAlive), logs to the config dir.
-fn build_plist(exe: &std::path::Path, dispatch_url: &str, log_path: &std::path::Path) -> String {
-    let exe_str = exe.to_string_lossy();
-    let mut args = String::new();
-    for &arg in &[
-        exe_str.as_ref(),
-        "start",
-        "--dispatch-url",
-        dispatch_url,
-        "--allow-real-jobs",
-    ] {
-        args.push_str("        <string>");
-        args.push_str(arg);
-        args.push_str("</string>\n");
-    }
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-{args}    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{log}</string>
-    <key>StandardErrorPath</key>
-    <string>{log}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>RUST_LOG</key>
-        <string>info</string>
-    </dict>
-</dict>
-</plist>
-"#,
-        label = LAUNCHD_LABEL,
-        log = log_path.display(),
-    )
-}
-
 #[derive(Parser)]
 #[command(
     name = "decent",
@@ -282,9 +222,11 @@ enum Command {
     },
     /// Forget the stored worker token (clears the token file).
     Logout,
-    /// Install as a macOS launchd agent: runs `decent start` at login and
-    /// restarts on exit (KeepAlive), so the node renders unattended. Accepts
-    /// real jobs. Run `decent login` first to store a token.
+    /// Install the unattended daemon: a launchd agent on macOS, a systemd user
+    /// unit on Linux. Runs `decent start` and restarts on exit, so the node
+    /// renders unattended and accepts real jobs. Run `decent login` first to
+    /// store a token. On Linux this also enables lingering, without which the
+    /// node would not survive a reboot on a headless machine.
     Install {
         /// Dispatch WebSocket URL.
         #[arg(
@@ -294,21 +236,20 @@ enum Command {
         )]
         dispatch_url: String,
     },
-    /// Uninstall the launchd agent (stops it and removes the plist).
+    /// Uninstall the daemon: stops it and removes the unit file.
     Uninstall,
-    /// Show pairing + daemon status: is a token stored? is the launchd agent
-    /// installed/loaded?
+    /// Show pairing + daemon status: is a token stored? is the daemon
+    /// installed and running?
     Status,
-    /// Upgrade decent via Homebrew, then restart the daemon (if loaded)
-    /// so launchd relaunches it with the new binary. One-command fleet update.
+    /// Upgrade decent — Homebrew on macOS, the release installer on Linux —
+    /// then restart the daemon so it runs the new binary. One-command update.
     Upgrade,
-    /// Stop the daemon (launchctl bootout): the node disconnects from dispatch
-    /// and stops rendering, but the launchd agent stays installed. Use
-    /// `resume` to start it again. Note: launchd re-loads LaunchAgents at
-    /// login, so a paused daemon restarts after reboot — use `uninstall`
-    /// for an off state that survives reboot.
+    /// Stop the daemon: the node disconnects from dispatch and stops
+    /// rendering, but stays installed. Use `resume` to start it again.
+    /// Note that a paused daemon comes back after a reboot on both platforms —
+    /// use `uninstall` for an off state that survives one.
     Pause,
-    /// Start the daemon again after `pause` (launchctl bootstrap).
+    /// Start the daemon again after `pause`.
     Resume,
     /// Live terminal dashboard (W3.11): connection state, node identity,
     /// current job + progress, counters, and a scrolling log tail. A
@@ -330,7 +271,7 @@ enum Command {
     },
 }
 
-/// Best-effort hardware probe: sysctl on macOS, stubs elsewhere.
+/// Best-effort hardware probe: sysctl on macOS, /proc on Linux, stub elsewhere.
 /// (Deliberately no sysinfo crate — the small auditable footprint is the point.)
 fn detect_chip() -> String {
     #[cfg(target_os = "macos")]
@@ -345,7 +286,34 @@ fn detect_chip() -> String {
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(model) = linux_cpu_model() {
+            return format!("{model} ({})", std::env::consts::OS);
+        }
+    }
     format!("{} ({})", std::env::consts::ARCH, std::env::consts::OS)
+}
+
+/// First usable CPU name from /proc/cpuinfo.
+///
+/// x86 exposes `model name`; ARM usually does not, and a Pi-class board reports
+/// `Model` in /proc/device-tree or `Hardware` instead — so try several keys
+/// before giving up rather than reporting a bare "aarch64".
+#[cfg(target_os = "linux")]
+fn linux_cpu_model() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    for key in ["model name", "Model", "Hardware", "cpu model"] {
+        if let Some(value) = text.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name.trim().eq_ignore_ascii_case(key)).then(|| value.trim().to_string())
+        }) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 fn detect_ram_gb() -> u32 {
@@ -360,7 +328,79 @@ fn detect_ram_gb() -> u32 {
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        // MemTotal is in kB. Rounds to nearest rather than truncating: an 8GB
+        // board reports ~7.7GiB of usable RAM once firmware carve-outs are
+        // subtracted, and reporting "7" for an 8GB machine reads like a fault.
+        if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+            if let Some(kb) = text.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                rest.split_whitespace().next()?.parse::<u64>().ok()
+            }) {
+                return ((kb as f64 / (1024.0 * 1024.0)).round()) as u32;
+            }
+        }
+    }
     0 // stub on platforms without a probe
+}
+
+/// Replace the installed binary with the newest release.
+///
+/// macOS installs come from the Homebrew tap, so `brew upgrade` is the honest
+/// mechanism there — self-replacing a brew-managed file would leave brew's
+/// metadata lying about what is installed.
+///
+/// Linux has no equivalent: the supported channel is the shell installer
+/// cargo-dist publishes with every release, which is idempotent and installs
+/// the latest version, so re-running it IS the upgrade.
+fn upgrade_binary() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        match std::process::Command::new("brew")
+            .args(["upgrade", "decent"])
+            .status()
+        {
+            Ok(s) if s.success() => {
+                println!("Upgraded decent via Homebrew.");
+                Ok(())
+            }
+            Ok(s) => anyhow::bail!("`brew upgrade decent` failed (exit {:?})", s.code()),
+            Err(_) => anyhow::bail!(
+                "Could not run `brew` — is Homebrew installed? Upgrade manually and restart."
+            ),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        const INSTALLER: &str =
+            "https://github.com/decent-render/decent-render/releases/latest/download/decent-installer.sh";
+        // Piped straight to sh, exactly as the documented install line does —
+        // this is the same script from the same release, not a second channel.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("curl -LsSf {INSTALLER} | sh"))
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                println!("Upgraded decent via the release installer.");
+                Ok(())
+            }
+            Ok(s) => anyhow::bail!(
+                "The release installer failed (exit {:?}). Re-run it manually:\n  \
+                 curl -LsSf {INSTALLER} | sh",
+                s.code()
+            ),
+            Err(e) => anyhow::bail!(
+                "Could not run the installer ({e}). Is `curl` installed? Re-run manually:\n  \
+                 curl -LsSf {INSTALLER} | sh"
+            ),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        anyhow::bail!("`decent upgrade` is supported on macOS and Linux only.")
+    }
 }
 
 /// Resolve the worker token: explicit `--token` / WORKER_TOKEN env wins,
@@ -401,67 +441,6 @@ fn build_register() -> RegisterMessage {
         // GPU-capable, so dispatch would send it work it could not render.
         capabilities: detect_capabilities(),
     }
-}
-
-/** Is the decent launchd agent currently loaded? Also checks the legacy
- * com.decent-render.decent-node label for upgraded installs. */
-fn launchctl_has_label() -> bool {
-    std::process::Command::new("launchctl")
-        .arg("list")
-        .output()
-        .map(|o| {
-            let out = String::from_utf8_lossy(&o.stdout);
-            out.contains(LAUNCHD_LABEL) || out.contains(LEGACY_LAUNCHD_LABEL)
-        })
-        .unwrap_or(false)
-}
-
-/** Is ONLY the legacy decent-node daemon loaded (not the new one)? */
-fn legacy_daemon_is_loaded() -> bool {
-    std::process::Command::new("launchctl")
-        .arg("list")
-        .output()
-        .map(|o| {
-            let out = String::from_utf8_lossy(&o.stdout);
-            out.contains(LEGACY_LAUNCHD_LABEL) && !out.contains(LAUNCHD_LABEL)
-        })
-        .unwrap_or(false)
-}
-
-/** Path to the legacy plist, if it exists. */
-fn legacy_plist_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let p = std::path::PathBuf::from(home)
-        .join("Library/LaunchAgents")
-        .join(format!("{LEGACY_LAUNCHD_LABEL}.plist"));
-    if p.exists() {
-        Some(p)
-    } else {
-        None
-    }
-}
-
-/// Unload the legacy decent-node launchd agent if present (one-time migration
-/// during the decent-node → decent rename). No-op if not found.
-fn unload_legacy_agent() {
-    let _ = std::process::Command::new("launchctl")
-        .args([
-            "bootout",
-            &format!("gui/{}", current_uid().unwrap_or_default()),
-            LEGACY_LAUNCHD_LABEL,
-        ])
-        .output();
-}
-
-/// Current numeric UID, for the launchctl `gui/<uid>/<label>` service target.
-fn current_uid() -> Option<String> {
-    std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 #[tokio::main]
@@ -645,60 +624,33 @@ async fn main() -> anyhow::Result<()> {
                     "No worker token stored. Run `decent login` first, then `decent install`."
                 );
             }
-            // One-time migration: unload the legacy decent-node agent if present.
-            unload_legacy_agent();
             let exe = std::env::current_exe()?;
-            let plist = plist_path()?;
-            let log_path = token_path()?
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("token file has no parent"))?
-                .join("decent.log");
-            let xml = build_plist(&exe, &dispatch_url, &log_path);
-            // Best-effort unload for a clean reinstall (suppress output —
-            // "not loaded" is the expected first-install case, not an error).
-            let _ = std::process::Command::new("launchctl")
-                .args(["unload", &plist.to_string_lossy()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            std::fs::write(&plist, xml)?;
-            let status = std::process::Command::new("launchctl")
-                .args(["load", &plist.to_string_lossy()])
-                .status()?;
-            if !status.success() {
-                anyhow::bail!(
-                    "launchctl load failed; inspect the plist at {}",
-                    plist.display()
-                );
-            }
-            println!("Installed launchd agent {LAUNCHD_LABEL}.");
+            let log_path = service::default_log_path(&token_path()?)?;
+            let report = service::install(&ServiceSpec {
+                exe: exe.clone(),
+                dispatch_url,
+                log_path: log_path.clone(),
+            })?;
+
+            println!("Installed the {} daemon.", service::manager_name());
             println!("  binary: {}", exe.display());
-            println!("  plist:  {}", plist.display());
+            println!("  unit:   {}", report.unit_path.display());
             println!("  log:    {}", log_path.display());
-            println!(
-                "Runs `decent start --allow-real-jobs` at login; restarts on exit (KeepAlive)."
-            );
-            println!("Manage devices at https://decent-render.farm/devices");
-
-            // Clean up the legacy plist file (the agent was already unloaded
-            // above; remove the old plist so it doesn't reload on next login).
-            if let Some(legacy_plist) = legacy_plist_path() {
-                let _ = std::fs::remove_file(&legacy_plist);
-                println!("Removed legacy plist: {}", legacy_plist.display());
+            println!("Runs `decent start --allow-real-jobs` and restarts on exit.");
+            for note in report.notes {
+                println!("  {note}");
             }
-
+            println!("Manage devices at https://decent-render.farm/devices");
             Ok(())
         }
 
         Command::Uninstall => {
-            let plist = plist_path()?;
-            let _ = std::process::Command::new("launchctl")
-                .args(["unload", &plist.to_string_lossy()])
-                .status();
-            if plist.exists() {
-                std::fs::remove_file(&plist)?;
-            }
-            println!("Uninstalled launchd agent {LAUNCHD_LABEL}.");
+            let unit = service::uninstall()?;
+            println!(
+                "Uninstalled the {} daemon ({}).",
+                service::manager_name(),
+                unit.display()
+            );
             Ok(())
         }
 
@@ -712,21 +664,18 @@ async fn main() -> anyhow::Result<()> {
                     "yes"
                 }
             );
-            let plist_present = plist_path().map(|p| p.exists()).unwrap_or(false);
-            let loaded = launchctl_has_label();
-            let daemon_state = if !plist_present && !loaded {
-                "not installed — run `decent install`"
-            } else if loaded {
-                "running"
-            } else {
-                "paused — run `decent resume` (or `uninstall` to remove)"
+            let daemon = service::state();
+            let daemon_state = match daemon {
+                DaemonState::NotInstalled => "not installed — run `decent install`",
+                DaemonState::Running => "running",
+                DaemonState::Paused => "paused — run `decent resume` (or `uninstall` to remove)",
             };
-            println!("daemon      : {daemon_state}");
+            println!("daemon      : {daemon_state} ({})", service::manager_name());
 
             // Legacy daemon detection — the old decent-node agent still running
             // with its token at ~/.config/decent-node/. This is expected during
             // migration; tell the user how to complete it.
-            if legacy_daemon_is_loaded() {
+            if service::legacy_daemon_is_loaded() {
                 println!("⚠ legacy    : com.decent-render.decent-node daemon is still running.");
                 println!(
                     "               Run `decent install` to migrate the token + daemon label."
@@ -751,7 +700,7 @@ async fn main() -> anyhow::Result<()> {
                         "update      : {}",
                         match s.update_available {
                             Some(v) => {
-                                format!("⚠ {v} available — `brew upgrade decent` + restart")
+                                format!("⚠ {v} available — run `decent upgrade`")
                             }
                             None => "up to date".to_string(),
                         }
@@ -762,7 +711,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("update      : up to date");
                 }
                 None => {
-                    if loaded {
+                    if daemon == DaemonState::Running {
                         println!("connection  : (no live snapshot — daemon starting, or an older binary)");
                     }
                     println!("update      : up to date");
@@ -772,113 +721,37 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Upgrade => {
-            // 1. brew upgrade decent — swaps the binary on disk. The
-            //    running `upgrade` process keeps its old in-memory copy; the
-            //    NEXT invocation uses the new binary.
-            let brew = std::process::Command::new("brew")
-                .args(["upgrade", "decent"])
-                .status();
-            match brew {
-                Ok(s) if s.success() => {}
-                Ok(s) => {
-                    anyhow::bail!("`brew upgrade decent` failed (exit {:?})", s.code())
-                }
-                Err(_) => anyhow::bail!(
-                    "Could not run `brew` — is Homebrew installed? Upgrade manually and restart."
+            // 1. Swap the binary on disk. The running `upgrade` process keeps
+            //    its old in-memory copy; the NEXT invocation uses the new one.
+            upgrade_binary()?;
+            // 2. Restart the daemon so the supervisor picks up the new binary.
+            match service::restart() {
+                Ok(true) => println!("Daemon restarted — new binary loaded."),
+                Ok(false) => println!(
+                    "Daemon not running — run `decent start` (or `decent install`) to use the new version."
                 ),
-            }
-            println!("Upgraded decent via Homebrew.");
-            // 2. Restart the daemon so launchd relaunches with the new binary.
-            //    Only if the agent is loaded; KeepAlive makes `kickstart -k`
-            //    sufficient (kill + relaunch).
-            if launchctl_has_label() {
-                if let Some(uid) = current_uid() {
-                    let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
-                    let kicked = std::process::Command::new("launchctl")
-                        .args(["kickstart", "-k", &target])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
-                    if kicked {
-                        println!("Daemon restarted (kickstart -k {target}) — new binary loaded.");
-                    } else {
-                        println!("launchctl kickstart failed; restart manually:");
-                        println!("  launchctl kickstart -k gui/$(id -u)/{LAUNCHD_LABEL}");
-                    }
-                } else {
-                    println!("Could not determine UID; restart the daemon manually:");
-                    println!("  launchctl kickstart -k gui/$(id -u)/{LAUNCHD_LABEL}");
+                Err(e) => {
+                    println!("Could not restart the daemon automatically ({e:#}). Run:");
+                    println!("  {}", service::manual_restart_hint());
                 }
-            } else {
-                println!("Launchd agent not loaded — run `decent start` to use the new version.");
             }
             Ok(())
         }
 
         Command::Pause => {
-            let plist = plist_path()?;
-            if !plist.exists() {
-                anyhow::bail!("No launchd agent installed — run `decent install` first.");
-            }
-            if let Some(uid) = current_uid() {
-                let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
-                // bootout returns non-zero if the agent isn't loaded — that's
-                // "already stopped", not an error.
-                let stopped = std::process::Command::new("launchctl")
-                    .args(["bootout", &target])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if stopped {
-                    println!("Daemon paused — disconnected from dispatch, not rendering.");
-                    println!("Run `decent resume` to start it again.");
-                } else {
-                    println!("Daemon wasn't running (already paused).");
-                }
-                Ok(())
+            if service::pause()? {
+                println!("Daemon paused — disconnected from dispatch, not rendering.");
+                println!("Run `decent resume` to start it again.");
             } else {
-                anyhow::bail!("Could not determine UID.")
+                println!("Daemon wasn't running (already paused).");
             }
+            Ok(())
         }
 
         Command::Resume => {
-            let plist = plist_path()?;
-            if !plist.exists() {
-                anyhow::bail!("No launchd agent installed — run `decent install` first.");
-            }
-            if let Some(uid) = current_uid() {
-                let domain = format!("gui/{uid}");
-                let bootstrapped = std::process::Command::new("launchctl")
-                    .args(["bootstrap", &domain, &plist.to_string_lossy()])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if bootstrapped {
-                    println!("Daemon resumed — reconnecting to dispatch.");
-                } else {
-                    // bootstrap fails if already loaded — kick it instead.
-                    let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
-                    let kicked = std::process::Command::new("launchctl")
-                        .args(["kickstart", &target])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
-                    if kicked {
-                        println!("Daemon was already loaded — kicked (running).");
-                    } else {
-                        anyhow::bail!(
-                            "Could not resume the daemon. Try `decent install` to reload it."
-                        );
-                    }
-                }
-                Ok(())
-            } else {
-                anyhow::bail!("Could not determine UID.")
-            }
+            service::resume()?;
+            println!("Daemon resumed — reconnecting to dispatch.");
+            Ok(())
         }
 
         Command::Tui {
