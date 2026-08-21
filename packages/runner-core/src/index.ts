@@ -33,6 +33,8 @@ function heartbeatIntervalMs(): number {
 }
 
 export {renderJob} from './render-job.js';
+export {verifyRenderedOutput} from './verify-output.js';
+export type {OutputProbe, VerifyOptions} from './verify-output.js';
 export type {MinimalComposition, RendererApi} from './renderer-api.js';
 
 /**

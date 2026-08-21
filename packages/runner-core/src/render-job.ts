@@ -5,6 +5,7 @@ import {existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync}
 import os from 'node:os';
 import path from 'node:path';
 import type {MinimalComposition, RendererApi} from './renderer-api.js';
+import {verifyRenderedOutput} from './verify-output.js';
 
 const bundleCacheDir = path.join(os.homedir(), '.decent-worker', 'bundles');
 const defaultLog = (message: string) => process.stderr.write(`${message}\n`);
@@ -106,10 +107,24 @@ export async function renderJob<TComposition extends MinimalComposition>(
         }
       },
     });
+    // Verify BEFORE the upload, and fail the job rather than uploading
+    // something we already know is broken: nothing we can detect as garbage
+    // should ever reach R2 and be reported as a success.
+    const probe = verifyRenderedOutput({
+      outputLocation,
+      expectedFrames: composition.durationInFrames,
+      expectedWidth: composition.width,
+      expectedHeight: composition.height,
+      binariesDirectory: options.binariesDirectory ?? null,
+      log,
+    });
     const output = readFileSync(outputLocation);
     const uploaded = await fetch(assign.outputPutUrl, {method: 'PUT', body: output, headers: {'content-type': assign.codec === 'vp8' ? 'video/webm' : 'video/mp4'}});
     if (!uploaded.ok) throw new Error(`output upload failed: HTTP ${uploaded.status}`);
-    return {wallMs: Date.now() - started, frames: composition.durationInFrames, outputSizeInBytes: output.byteLength};
+    // `frames` is the MEASURED count from the file, not the composition's
+    // declared duration — the whole point of verifying is that the two can
+    // disagree, and the claim is what used to be reported.
+    return {wallMs: Date.now() - started, frames: probe.frames, outputSizeInBytes: output.byteLength};
   } finally {
     activeWorkDir = null;
     rmSync(workDir, {recursive: true, force: true});

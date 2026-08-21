@@ -9,9 +9,18 @@
  * and where hoisting could otherwise pick an arbitrary version).
  */
 
-/** The subset of a Remotion composition that runner-core reads. */
+/**
+ * The subset of a Remotion composition that runner-core reads.
+ *
+ * `width`/`height` are optional so this stays backward compatible for any
+ * caller already implementing the type; a real Remotion composition always
+ * carries them, so the production path gets the dimension check and only
+ * hand-built test doubles skip it (which `verifyRenderedOutput` logs).
+ */
 export type MinimalComposition = {
   durationInFrames: number;
+  width?: number;
+  height?: number;
 };
 
 type SharedRenderOptions = {
