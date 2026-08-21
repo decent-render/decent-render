@@ -523,6 +523,18 @@ pub async fn run(
                                 eprintln!("\nUPGRADE REQUIRED — {reason}");
                                 eprintln!("Upgrade decent and restart.\n");
                                 obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                                // PACKET 5 FOLLOW-UP: this branch is an eighth
+                                // exit path and it held a live job too. It is
+                                // reached exactly when dispatch redeploys with
+                                // a raised minimum protocol version and closes
+                                // live connections — i.e. while nodes are
+                                // mid-render. Worse than the generic close: it
+                                // exits deliberately without retry, so in
+                                // `start` mode the process dies and takes the
+                                // runtime with it, leaving a wedged runner and
+                                // a daemonized Chrome with nothing left to
+                                // escalate. Drain before giving up.
+                                drain_in_flight_jobs(&mut in_flight, &mut draining).await;
                                 return Ok(());
                             }
                             tracing::info!(%reason, "socket closed by server");
@@ -1978,6 +1990,131 @@ while true; do sleep 5; done
 
         std::fs::remove_dir_all(&payload_dir).ok();
         std::fs::remove_dir_all(&browser_dir).ok();
+    }
+
+    /// PACKET 5 FOLLOW-UP (orchestrator verification finding V-3): the
+    /// `upgrade-required` close is an EIGHTH exit path, and packet 5's own
+    /// exit inventory classified it into neither bucket — not among the seven
+    /// that drain, not among the pre-loop returns deemed unreachable with a
+    /// live job. It returned `Ok(())` while holding one.
+    ///
+    /// Reachable exactly when dispatch redeploys with a raised minimum
+    /// protocol version and closes live connections — i.e. while nodes are
+    /// mid-render. Worse than the generic close path: this branch exits
+    /// deliberately without retry, so in `start` mode the process dies and
+    /// takes the runtime with it, leaving the render tree with nothing left
+    /// to escalate it.
+    ///
+    /// Focused by design: the drain MECHANISM (browser sweep, group KILL) is
+    /// already proven by `ws_drop_mid_grace_still_kills_tree_and_purges`. What
+    /// was unproven is whether THIS branch calls it, so the load-bearing
+    /// signals here are the grace timing and the purge invariant.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upgrade_required_close_mid_grace_still_drains() {
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+        let pid = std::process::id();
+        let sha = format!("test-upgrade-drain-{pid}");
+        let job_id = format!("job-upgrade-drain-{pid}");
+
+        // Wedged runner: traps TERM so the supervisor cannot get a graceful
+        // exit and must ride the full 10s CANCEL_GRACE to SIGKILL. It records
+        // its own pid first — gating on the WORKDIR is not enough, because
+        // the supervisor creates that before it ever spawns the runner, so a
+        // runner that died instantly would still sail past the gate and leave
+        // this test asserting on an empty drain.
+        let pid_file = std::env::temp_dir().join(format!("{job_id}.runner-pid"));
+        let _ = std::fs::remove_file(&pid_file);
+        let payload_script = format!(
+            r#"#!/bin/sh
+trap '' TERM INT
+echo $$ > "{pidfile}"
+echo '{{"type":"progress","progress":0.5}}'
+while true; do sleep 5; done
+"#,
+            pidfile = pid_file.display()
+        );
+        let payload_dir = seed_fake_payload(&sha, &payload_script);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, _status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let mut client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
+            .await
+            .unwrap();
+
+        // Gate on the runner REALLY running — its own pid, written by itself.
+        let runner_pid = wait_for_pid_file(&pid_file).await;
+        assert!(
+            unsafe { libc::kill(runner_pid as libc::pid_t, 0) } == 0,
+            "runner must be alive before cancel"
+        );
+
+        ws.send(Message::Text(format!(
+            r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+        )))
+        .await
+        .unwrap();
+
+        // Let the supervisor enter the grace window, then close the way a
+        // version-bumping dispatch redeploy does.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // We must genuinely be MID-grace: TERM has landed and been ignored,
+        // SIGKILL has not. If the runner were already dead here the drain
+        // would have nothing to await and the timing assert below would pass
+        // for the wrong reason.
+        assert!(
+            unsafe { libc::kill(runner_pid as libc::pid_t, 0) } == 0,
+            "runner died before the close — not mid-grace, so this test would prove nothing"
+        );
+        ws.send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "upgrade-required: protocol 3 or newer".into(),
+        })))
+        .await
+        .unwrap();
+
+        // THE assertion: `run()` must not return until the drain finishes.
+        // Pre-fix it returned immediately, dropping the terminate future.
+        let t0 = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(45), &mut client)
+            .await
+            .expect("run() hung — drain did not complete in 45s")
+            .expect("client task panicked");
+        let ran_for = t0.elapsed().as_secs_f64();
+        assert!(
+            ran_for >= 7.0,
+            "run() returned in {ran_for:.1}s — the upgrade-required branch abandoned the grace (a dropped job returns ~0s; 10s grace minus the 1.5s cancel lead is ~8.5s)"
+        );
+        outcome.expect("upgrade-required close is a clean exit");
+
+        // Purge invariant: teardown ran to completion, not just far enough.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            job_workdirs(&job_id).is_empty(),
+            "workdir survived an upgrade-required close mid-grace — teardown was abandoned"
+        );
+        assert!(
+            unsafe { libc::kill(runner_pid as libc::pid_t, 0) } != 0,
+            "wedged runner survived an upgrade-required close mid-grace — escalation was abandoned"
+        );
+
+        let _ = std::fs::remove_file(&pid_file);
+        std::fs::remove_dir_all(&payload_dir).ok();
     }
 
     /// ITEM 4: an `error` event does not imply the runner exited. This fake
