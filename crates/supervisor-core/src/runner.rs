@@ -263,6 +263,13 @@ async fn run_job_inner(
     if let Some(ref executable) = browser {
         command.env("DECENT_BROWSER_EXECUTABLE", executable);
     }
+    // Containment: the runner gets its OWN process group (see
+    // `terminate_process_group` for the sign convention) so a cancel can
+    // reach Chrome, which the runner spawns as a grandchild. Spawning
+    // without a group left terminate able to signal only the runner pid,
+    // orphaning Chrome on every cancel/silence-kill/shutdown.
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command
         .current_dir(workdir.path())
         .stdin(Stdio::piped())
@@ -318,7 +325,14 @@ async fn run_job_inner(
                         tracing::warn!(job_id = %assign.job_id, purged = !purged_path.exists(), "runner silent and workdir purged");
                         return Err(anyhow!("runner silent"));
                     }
-                    Ok(Err(e)) => return Err(anyhow!(e).context("runner stdout read failed")),
+                    Ok(Err(e)) => {
+                        // ITEM 4: the stdout pipe failed, not the runner —
+                        // the child may still be running and writing into
+                        // the workdir. Kill it BEFORE `Drop` purges the
+                        // directory out from under it.
+                        terminate_child(&mut child).await;
+                        return Err(anyhow!(e).context("runner stdout read failed"));
+                    }
                     Ok(Ok(None)) => break,
                     Ok(Ok(Some(line))) => line,
                 };
@@ -353,7 +367,14 @@ async fn run_job_inner(
                         m.output_size_in_bytes = Some(output_size_in_bytes);
                         done_metrics = Some(m);
                     }
-                    RunnerEvent::Error { message } => return Err(anyhow!(message)),
+                    RunnerEvent::Error { message } => {
+                        // ITEM 4: an `error` event does not imply exit — the
+                        // runner may keep running (or keep Chrome running)
+                        // after emitting it. Kill it BEFORE `Drop` purges the
+                        // workdir out from under a live tree.
+                        terminate_child(&mut child).await;
+                        return Err(anyhow!(message));
+                    }
                 }
             }
         }
@@ -373,14 +394,41 @@ async fn run_job_inner(
     })
 }
 
+/// Signal the runner's process group and wait out the grace period.
+///
+/// ITEM 1 sign convention — read before touching:
+///
+/// * At spawn, `Command::process_group(0)` puts the runner in a NEW process
+///   group whose pgid EQUALS the runner's own pid. That pgid is what we
+///   signal here — never literal 0, never the negative of anything, never a
+///   pgid we did not derive from the child we spawned.
+///
+/// * We call `libc::killpg(pgid, sig)` with a STRICTLY POSITIVE pgid that
+///   came from `child.id()`. `killpg(0, …)` would mean "the caller's own
+///   group" (the supervisor + the operator's shell) — catastrophic. The
+///   runtime guard below rejects pgid 0 and our own pid before signalling,
+///   so a future edit that loses the sign/type cannot kill the supervisor.
+///
+/// * Why a group at all: Chrome is a grandchild (spawned by Remotion inside
+///   the runner). Signalling only the runner pid — the old behaviour — left
+///   Chrome running on every cancel, silence-kill, and shutdown.
+///
+/// Two-stage behaviour is preserved: TERM → `CANCEL_GRACE` (10s) → KILL.
 async fn terminate_child(child: &mut Child) {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status()
-            .await;
+    {
+        if let Some(pid) = child.id() {
+            // Belt-and-braces: pid 0 is never a valid target for us, and the
+            // supervisor's own pid must never be signalled, even if a future
+            // refactor hands terminate a pid it did not spawn.
+            let safe = pid != 0 && pid != std::process::id();
+            if safe {
+                let rc = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) };
+                tracing::info!(pid, rc, "TERM sent to process group");
+            } else {
+                tracing::warn!(pid, "refusing to signal unsafe process group");
+            }
+        }
     }
     #[cfg(not(unix))]
     let _ = child.start_kill();
@@ -388,6 +436,14 @@ async fn terminate_child(child: &mut Child) {
     match tokio::time::timeout(CANCEL_GRACE, child.wait()).await {
         Ok(_) => {}
         Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                let safe = pid != 0 && pid != std::process::id();
+                if safe {
+                    let _ = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+                }
+            }
+            #[cfg(not(unix))]
             let _ = child.start_kill();
             let _ = child.wait().await;
         }

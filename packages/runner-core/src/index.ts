@@ -2,7 +2,7 @@ import {ServerMessageSchema} from '@decent-render/protocol';
 import {existsSync, readFileSync} from 'node:fs';
 import path from 'node:path';
 import type {MinimalComposition, RendererApi} from './renderer-api.js';
-import {renderJob} from './render-job.js';
+import {renderJob, purgeActiveWorkDir} from './render-job.js';
 
 /**
  * How often the runner proves it is alive when no progress is being reported.
@@ -17,6 +17,15 @@ import {renderJob} from './render-job.js';
  * the path in milliseconds instead of waiting out the real interval.
  */
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
+
+/**
+ * Hard ceiling on how long the SIGTERM/SIGINT handler may take before the
+ * process force-exits (9). The handler's only synchronous work is an rmSync
+ * of the workdir, which is normally sub-second; the ceiling exists so a
+ * pathological dir (or a wedged event loop) can never leave a canceled job's
+ * process lingering after the operator asked twice.
+ */
+const SIGNAL_EXIT_DEADLINE_MS = 5_000;
 
 function heartbeatIntervalMs(): number {
   const override = Number(process.env.DECENT_RUNNER_HEARTBEAT_MS ?? '');
@@ -89,6 +98,41 @@ export async function runRunner<TComposition extends MinimalComposition>(rendere
     const dir = path.join(path.dirname(process.execPath), 'remotion-binaries');
     return existsSync(path.join(dir, 'remotion')) ? dir : null;
   };
+
+  // Cancel containment: the supervisor terminates the whole process group on
+  // cancel, which delivers SIGTERM to this process. Without a handler, the
+  // default disposition kills Bun instantly and renderJob's `finally` (which
+  // purges the mkdtemp workdir — customer content) never runs. Handling the
+  // signal makes the purge happen, then we exit non-zero as a canceled job
+  // must. The supervisor ignores our exit status after a cancel (its
+  // canceled_job marker suppresses the spurious jobFailed), so a clean
+  // non-zero exit is correct here.
+  //
+  // Hardened against re-entry and hangs:
+  // - a second signal force-exits immediately (the purge may be slow on a
+  //   huge dir; the operator's second Ctrl-C must always win);
+  // - purge errors are swallowed-and-logged — exiting is still more urgent
+  //   than a perfect purge;
+  // - a watchdog ARMED ONLY ON SIGNAL RECEIPT force-exits if the handler
+  //   somehow exceeds SIGNAL_EXIT_DEADLINE_MS. Arming at startup would kill
+  //   every render longer than the deadline, which is why it lives inside
+  //   the handler.
+  let handlingSignal = false;
+  const exitFromSignal = (signal: NodeJS.Signals, code: number) => {
+    if (handlingSignal) {
+      process.exit(9);
+    }
+    handlingSignal = true;
+    setTimeout(() => process.exit(9), SIGNAL_EXIT_DEADLINE_MS);
+    try {
+      purgeActiveWorkDir();
+    } catch (error) {
+      process.stderr.write(`workdir purge on ${signal} failed: ${String(error)}\n`);
+    }
+    process.exit(code);
+  };
+  process.on('SIGTERM', () => exitFromSignal('SIGTERM', 143));
+  process.on('SIGINT', () => exitFromSignal('SIGINT', 130));
 
   try {
     const frame = ServerMessageSchema.parse(JSON.parse((await readStdin()).trim()));

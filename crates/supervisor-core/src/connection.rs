@@ -196,6 +196,19 @@ pub async fn run(
     obs.update_status(|s| s.connection = ConnectionState::Connected);
     obs.log(LogLine::info("Connected to dispatch"));
 
+    // Startup sweep (ITEM 3): SIGKILL/power-loss killed a previous
+    // supervisor before WorkDir::Drop could run, orphaning job workdirs
+    // (customer content) under the temp dir. Once we are connected — and
+    // before any job can be assigned — remove abandoned ones. The sweep's
+    // own safety rule (pid-liveness for supervisor dirs, age gate for
+    // runner dirs) is what keeps a live sibling supervisor's workdir safe.
+    let swept = crate::sweep::sweep_stale_workdirs();
+    if swept > 0 {
+        obs.log(LogLine::info(format!(
+            "Swept {swept} abandoned job workdir(s) left by a hard-killed supervisor"
+        )));
+    }
+
     let (mut sink, mut stream) = ws.split();
 
     let send = |msg: WorkerMessage| {
@@ -1191,5 +1204,405 @@ mod tests {
         let config = ConnectionConfig::new("ws://localhost:8790/ws?region=eu", "t");
         let request = config.handshake_request().unwrap();
         assert!(request.uri().to_string().contains("region=eu"));
+    }
+
+    /// Wait until the fake runner's pid side-file appears, then read it.
+    /// Used by the containment tests (the pid is out-of-band, never a frame).
+    #[cfg(unix)]
+    async fn wait_for_pid_file(pid_file: &std::path::Path) -> u32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(pid_file) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runner never wrote its grandchild pid file"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Shared helper for the containment tests: a fake runner shell script
+    /// that spawns a never-exiting grandchild (the Chrome stand-in) and
+    /// reports its pid on stdout as a progress frame BEFORE anything else,
+    /// then idles. `trap_term` controls whether the runner and grandchild
+    /// ignore SIGTERM (the adversarial case only the group-KILL stage can
+    /// settle).
+    #[cfg(unix)]
+    fn group_kill_payload(trap_term: bool, then: &str, pid_file: &str, grandchild: &str) -> String {
+        let trap = if trap_term { "trap '' TERM INT" } else { "" };
+        format!(
+            r#"#!/bin/sh
+{trap_runner}
+"{grandchild}" >/dev/null 2>&1 &
+GC=$!
+echo "$GC" > "{pid_file}"
+# Let the grandchild finish exec (install its traps) BEFORE the error event
+# fires — the supervisor terminates the tree the moment it reads the error,
+# and a TERM during the grandchild's exec window destroys the evidence.
+sleep 1
+echo "{{\"type\":\"progress\",\"progress\":0.5}}"
+{then}
+while true; do sleep 5; done
+"#,
+            trap_runner = trap,
+            grandchild = grandchild,
+            then = then,
+            pid_file = pid_file,
+        )
+    }
+
+    /// The Chrome stand-in: a STATIC script written by the test (not by a
+    /// heredoc inside the runner — that quoting maze caused two vacuous-test
+    /// bugs: dollar-expansion at write time made the grandchild die instantly
+    /// and read as a reaped zombie). This variant RECORDS that TERM reached
+    /// it, then exits 143 so the tree can settle.
+    #[cfg(unix)]
+    fn grandchild_script_evidence(marker: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "decent-gc-ev-{}-{}.sh",
+            std::process::id(),
+            marker.rsplit('/').next().unwrap_or("m")
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ntrap 'touch {marker}.term; exit 143' TERM\ntouch {marker}.started\n# Short sleeps: dash runs traps only BETWEEN commands, so a long sleep\n# would defer the TERM evidence past the test deadline.\ni=0\nwhile [ $i -lt 600 ]; do sleep 0.1 2>/dev/null || sleep 1; i=$((i+1)); done\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The adversarial Chrome stand-in: ignores TERM and INT entirely, so
+    /// only the group SIGKILL escalation can stop it. Dies on its own after
+    /// 120s so a broken test cannot leak it forever.
+    #[cfg(unix)]
+    fn grandchild_script_immune() -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let started =
+            std::env::temp_dir().join(format!("decent-gc-im-{}.started", std::process::id()));
+        let path = std::env::temp_dir().join(format!("decent-gc-im-{}.sh", std::process::id()));
+        let _ = std::fs::remove_file(&started);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ntrap '' TERM INT\ntouch {}\nsleep 60\nsleep 60\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// ITEM 1: a cancel must kill the runner's whole process GROUP. The
+    /// grandchild is Chrome-like (records TERM, then exits 143). Evidence is
+    /// BOTH the marker file AND the grandchild's death: deadness alone cannot
+    /// discriminate a group TERM from an orphaned-zombie artifact, and a
+    /// marker alone cannot prove the process actually stopped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_kills_the_runners_whole_process_group() {
+        let pid = std::process::id();
+        let sha = format!("test-group-kill-{pid}");
+        let job_id = format!("job-group-kill-{pid}");
+        let marker = std::env::temp_dir().join(format!("decent-gc-kill-{pid}"));
+        let mark_term = marker.with_extension("term");
+        let _ = std::fs::remove_file(&mark_term);
+        // Evidence traps: the grandchild records that TERM reached IT (not
+        // just the runner), then exits so the tree can settle.
+        let gc_script = grandchild_script_evidence(&marker.to_string_lossy());
+        let pid_file = std::env::temp_dir().join(format!("{job_id}.gc-pid"));
+        let _ = std::fs::remove_file(&pid_file);
+        let payload_dir = seed_fake_payload(
+            &sha,
+            &group_kill_payload(
+                false,
+                "",
+                pid_file.to_str().unwrap(),
+                gc_script.to_str().unwrap(),
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, mut status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
+            .await
+            .unwrap();
+
+        // The runner writes the grandchild pid to a side file: the pid is
+        // not part of the protocol and must not ride a frame.
+        let grandchild_pid = wait_for_pid_file(&pid_file).await;
+        // Wait until the grandchild has ACTUALLY exec'd (its .started marker
+        // exists) — sending the group TERM during its exec window would kill
+        // it before the trap is installed and the evidence would be lost.
+        let mark_started = marker.with_extension("started");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !mark_started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            unsafe { libc::kill(grandchild_pid as libc::pid_t, 0) } == 0,
+            "grandchild must be alive before cancel"
+        );
+
+        ws.send(Message::Text(format!(
+            r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+        )))
+        .await
+        .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            status_rx.wait_for(|s| s.jobs_canceled == 1 && s.current_job.is_none()),
+        )
+        .await
+        .expect("canceled render was not processed in time")
+        .expect("status channel closed");
+
+        // THE assertions: the Chrome stand-in RECEIVED the group TERM
+        // (marker) and is dead. Pre-fix (pid-only signal) it is orphaned
+        // alive with no marker.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let alive = unsafe { libc::kill(grandchild_pid as libc::pid_t, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild (Chrome stand-in) survived the cancel — group TERM never reached it"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            mark_term.exists(),
+            "grandchild never received SIGTERM — the kill did not reach the process GROUP"
+        );
+
+        ws.close(None).await.ok();
+        while let Some(Ok(_)) = ws.next().await {}
+        client.await.unwrap().expect("clean exit");
+        std::fs::remove_dir_all(&payload_dir).ok();
+    }
+
+    /// ITEM 1 (escalation): when the runner AND its grandchild both ignore
+    /// SIGTERM, the two-stage terminate must escalate to a group SIGKILL
+    /// after CANCEL_GRACE. Only a group-scoped KILL can settle this tree;
+    /// signalling only the runner pid (the old behaviour) hangs forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_escalates_to_group_sigkill_when_term_is_ignored() {
+        let pid = std::process::id();
+        let sha = format!("test-group-escalate-{pid}");
+        let job_id = format!("job-group-escalate-{pid}");
+        let gc_script = grandchild_script_immune();
+        let pid_file = std::env::temp_dir().join(format!("{job_id}.gc-pid"));
+        let _ = std::fs::remove_file(&pid_file);
+        let payload_dir = seed_fake_payload(
+            &sha,
+            &group_kill_payload(
+                true,
+                "",
+                pid_file.to_str().unwrap(),
+                gc_script.to_str().unwrap(),
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, mut status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
+            .await
+            .unwrap();
+
+        let grandchild_pid = wait_for_pid_file(&pid_file).await;
+        // Gate on the grandchild having exec'd: its trap must be installed
+        // before the group TERM lands (immune variant also records .started).
+        let gc_started = gc_script.with_extension("started");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !gc_started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            unsafe { libc::kill(grandchild_pid as libc::pid_t, 0) } == 0,
+            "grandchild must be alive before cancel"
+        );
+
+        ws.send(Message::Text(format!(
+            r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+        )))
+        .await
+        .unwrap();
+
+        tokio::time::timeout(
+            // TERM ignored → grace (10s) → KILL. 30s ceiling for CI slack.
+            Duration::from_secs(30),
+            status_rx.wait_for(|s| s.jobs_canceled == 1 && s.current_job.is_none()),
+        )
+        .await
+        .expect("canceled render was not processed in time")
+        .expect("status channel closed");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let alive = unsafe { libc::kill(grandchild_pid as libc::pid_t, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "TERM-immune grandchild survived — group SIGKILL escalation failed"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        ws.close(None).await.ok();
+        while let Some(Ok(_)) = ws.next().await {}
+        client.await.unwrap().expect("clean exit");
+        std::fs::remove_dir_all(&payload_dir).ok();
+    }
+
+    /// ITEM 4: an `error` event does not imply the runner exited. This fake
+    /// emits error and keeps running (with a live grandchild). The
+    /// supervisor must terminate the tree BEFORE Drop purges the workdir —
+    /// pre-fix it returned immediately and purged around a live writer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn error_event_terminates_child_tree_before_purge() {
+        let pid = std::process::id();
+        let sha = format!("test-error-kill-{pid}");
+        let job_id = format!("job-error-kill-{pid}");
+        let marker = std::env::temp_dir().join(format!("decent-gc-err-{pid}"));
+        let mark_term = marker.with_extension("term");
+        let _ = std::fs::remove_file(&mark_term);
+        let gc_script = grandchild_script_evidence(&marker.to_string_lossy());
+        let pid_file = std::env::temp_dir().join(format!("{job_id}.gc-pid"));
+        let _ = std::fs::remove_file(&pid_file);
+        let payload_dir = seed_fake_payload(
+            &sha,
+            &group_kill_payload(
+                false,
+                r#"echo "{\"type\":\"error\",\"message\":\"render exploded but I keep running\"}""#,
+                pid_file.to_str().unwrap(),
+                gc_script.to_str().unwrap(),
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, mut status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
+            .await
+            .unwrap();
+
+        let grandchild_pid = wait_for_pid_file(&pid_file).await;
+        // Gate on exec completion: TERM during the exec window kills the
+        // grandchild pre-trap and destroys the evidence.
+        let gc_started = marker.with_extension("started");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !gc_started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Drain frames until the jobFailed (the error event) reaches us.
+        loop {
+            let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
+                .await
+                .expect("expected jobFailed before timeout");
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["type"] == "jobFailed" {
+                break;
+            }
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            status_rx.wait_for(|s| s.jobs_failed == 1 && s.current_job.is_none()),
+        )
+        .await
+        .expect("jobFailed was not processed in time")
+        .expect("status channel closed");
+
+        // Purge still happened (Drop ran on the error path).
+        assert!(
+            job_workdirs(&job_id).is_empty(),
+            "workdir must be purged after the error path"
+        );
+
+        // THE assertion: the tree is dead — terminate ran BEFORE Drop, not
+        // after, and the group TERM reached the grandchild too.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let alive = unsafe { libc::kill(grandchild_pid as libc::pid_t, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild survived the error-path purge — terminate-before-drop failed"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        ws.close(None).await.ok();
+        while let Some(Ok(_)) = ws.next().await {}
+        client.await.unwrap().expect("clean exit");
+        std::fs::remove_dir_all(&payload_dir).ok();
     }
 }

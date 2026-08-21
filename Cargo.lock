@@ -3839,6 +3839,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "futures-util",
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

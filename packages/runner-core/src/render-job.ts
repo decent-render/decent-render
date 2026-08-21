@@ -9,6 +9,34 @@ import type {MinimalComposition, RendererApi} from './renderer-api.js';
 const bundleCacheDir = path.join(os.homedir(), '.decent-worker', 'bundles');
 const defaultLog = (message: string) => process.stderr.write(`${message}\n`);
 
+/**
+ * The mkdtemp workdir of the job currently rendering in this process, if any.
+ *
+ * The runner is single-job by construction (the supervisor spawns one process
+ * per jobAssign, concurrency 1), so one slot is exact, not a simplification.
+ * `renderJob` registers the dir for its lifetime and purges it in its
+ * `finally`; this registry exists so the SIGTERM/SIGINT handler in
+ * `runRunner` can also purge it when the signal would otherwise kill the
+ * process between the mkdtemp and the `finally` — the "cancel leaves
+ * customer content behind" leak. Synchronous `rmSync` on purpose: the signal
+ * handler must not await anything to make its exit guarantee.
+ */
+let activeWorkDir: string | null = null;
+
+/**
+ * Purge the active workdir, if one is registered. Safe to call at any time
+ * (no-op when no job is rendering). Rethrows fs errors to the caller, which
+ * decides whether they are fatal — on the normal path they propagate into
+ * renderJob's own failure handling; on the signal path the handler swallows
+ * them because exiting still matters more.
+ */
+export function purgeActiveWorkDir(): void {
+  const dir = activeWorkDir;
+  if (dir === null) return;
+  activeWorkDir = null;
+  rmSync(dir, {recursive: true, force: true});
+}
+
 type Options = {
   onProgress?: (progress: number) => void;
   binariesDirectory?: string | null;
@@ -51,6 +79,7 @@ export async function renderJob<TComposition extends MinimalComposition>(
   if (!propsResponse.ok) throw new Error(`input props fetch failed: HTTP ${propsResponse.status}`);
   const {compositionId, inputProps} = await propsResponse.json() as {compositionId: string; inputProps: Record<string, unknown>};
   const workDir = mkdtempSync(path.join(os.tmpdir(), `job-${assign.jobId}-`));
+  activeWorkDir = workDir;
   try {
     const outputLocation = path.join(workDir, assign.codec === 'vp8' ? 'out.webm' : 'out.mp4');
     const renderOptions = {
@@ -82,6 +111,7 @@ export async function renderJob<TComposition extends MinimalComposition>(
     if (!uploaded.ok) throw new Error(`output upload failed: HTTP ${uploaded.status}`);
     return {wallMs: Date.now() - started, frames: composition.durationInFrames, outputSizeInBytes: output.byteLength};
   } finally {
+    activeWorkDir = null;
     rmSync(workDir, {recursive: true, force: true});
   }
 }
