@@ -164,7 +164,7 @@ const server = Bun.serve({
             setTimeout(() => {
               clearTimeout(timer);
               finish(0, `cancel settled: completeAfterCancel=${sawAccepted} failedLeaked=${result === 'failed'}`);
-            }, 8_000);
+            }, 25_000);
           }
           break;
         case 'jobComplete': {

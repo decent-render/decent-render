@@ -210,6 +210,106 @@ fn browser_executable_in(dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(executable)
 }
 
+/// Write the per-job browser exec wrapper and return its path.
+///
+/// WHY THIS EXISTS (Defect A, packet 3): Remotion's BrowserRunner spawns
+/// Chrome with `detached: true` on non-Windows, which makes Chrome a session
+/// and group LEADER of its own — pgid == its pid, ppid eventually 1. The
+/// runner's process-group kill (ITEM 1) is structurally unable to reach it,
+/// and no amount of smarter scoping changes that: the kernel link back to
+/// the runner is gone by the time we want to kill it.
+///
+/// The supervisor is the party that hands the browser to Remotion
+/// (`DECENT_BROWSER_EXECUTABLE`), so THIS is the interposition point that
+/// sees the exec boundary the runner never controls. The wrapper is a tiny
+/// POSIX shell script placed in the supervisor's per-job workdir:
+///
+///   #!/bin/sh
+///   echo $$ >> <pidfile>
+///   exec "<real-executable>" "$@"
+///
+/// Remotion spawns this script as the "browser executable"; the script's pid
+/// is written BEFORE `exec` replaces it with the real Chrome. Because
+/// `detached: true` makes that pid a group leader, the pid IS the pgid of
+/// Chrome's whole tree — so `killpg(pid, SIGKILL)` later is exactly the
+/// containment Remotion itself uses when it closes a browser
+/// (BrowserRunner.js kills `-proc.pid`).
+///
+/// Appending (`>>`) rather than truncating: Remotion opens a browser per
+/// `selectComposition`/`renderMedia` call, so a job legitimately produces
+/// multiple browser processes; all of them must die.
+///
+/// The wrapper lives in the supervisor's workdir so the purge deletes it
+/// with everything else — no new cleanup path, no pidfile leak.
+#[cfg(unix)]
+fn write_browser_wrapper(
+    workdir: &Path,
+    real_executable: &Path,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+    let wrapper = workdir.join(".decent-browser-wrapper");
+    let pidfile = workdir.join(".decent-browser-pids");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\necho $$ >> {pidfile}\nexec \"{real}\" \"$@\"\n",
+            pidfile = pidfile.display(),
+            real = real_executable.display(),
+        ),
+    )
+    .with_context(|| format!("write browser wrapper {}", wrapper.display()))?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod browser wrapper {}", wrapper.display()))?;
+    Ok((wrapper, pidfile))
+}
+
+/// Kill every browser pid recorded by the job's exec wrapper.
+///
+/// Each recorded pid is a group leader BY CONSTRUCTION (detached spawn), so
+/// killing its group takes Chrome's whole tree in one signal — the same
+/// semantic as Remotion's own `process.kill(-proc.pid, 'SIGKILL')`.
+///
+/// Safety mirrors `terminate_child`'s runtime guard: never pid 0, never the
+/// supervisor's own pid, and (unlike the group kill) also never a pid that
+/// no longer belongs to us. A dead pid is simply skipped — ESRCH means the
+/// browser is already gone, which is success. The pidfile is deleted by the
+/// workdir purge; stale entries can only exist while the workdir does.
+///
+/// Returns the pids actually signalled, for the log line.
+#[cfg(unix)]
+fn kill_recorded_browsers(pidfile: &Path) -> Vec<u32> {
+    let contents = match std::fs::read_to_string(pidfile) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(), // no browser was ever spawned — fine
+    };
+    let me = std::process::id();
+    let mut killed = Vec::new();
+    for line in contents.lines() {
+        let Ok(pid) = line.trim().parse::<u32>() else {
+            continue; // tolerate junk lines rather than aborting the sweep
+        };
+        if pid == 0 || pid == me {
+            // Paranoia identical to terminate_child: a corrupted pidfile
+            // must never be able to kill the supervisor or its group.
+            tracing::warn!(pid, "browser pidfile contains unsafe pid — skipping");
+            continue;
+        }
+        if pid_exists(pid) {
+            let rc = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+            tracing::info!(pid, rc, "browser group SIGKILL (recorded at exec)");
+            killed.push(pid);
+        }
+    }
+    killed
+}
+
+/// pid > 0 is alive (kill(pid, 0) == 0) — ESRCH means dead, anything else
+/// (e.g. EPERM) is treated as alive: err toward NOT killing a foreign pid.
+#[cfg(unix)]
+fn pid_exists(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
 pub async fn run_job(
     assign: JobAssignMessage,
     mut cancel_rx: oneshot::Receiver<()>,
@@ -256,10 +356,30 @@ async fn run_job_inner(
     let browser = ensure_browser(&assign).await?;
     let workdir = WorkDir::new(&format!("job-{}", assign.job_id)).context("create workdir")?;
     let purged_path = workdir.path().to_path_buf();
+    // Browser containment (Defect A): when the supervisor resolved a browser,
+    // hand Remotion the exec wrapper instead of the raw binary. The wrapper
+    // records the spawned pid — which IS Chrome's group leader pid — so every
+    // exit path can kill the browser tree even though Chrome has left the
+    // runner's process group entirely. See `write_browser_wrapper`.
+    #[cfg(unix)]
+    let browser_pidfile = browser
+        .as_ref()
+        .map(|executable| write_browser_wrapper(workdir.path(), executable))
+        .transpose()
+        .context("install browser exec wrapper")?
+        .map(|(_wrapper, pidfile)| pidfile);
     let mut command = Command::new(&runner);
     // The wire carries a sha and a URL; the local filesystem path is this
     // node's business alone, so it is handed over out-of-band rather than
     // being spliced into the jobAssign frame the runner parses.
+    #[cfg(unix)]
+    if browser.is_some() {
+        command.env(
+            "DECENT_BROWSER_EXECUTABLE",
+            workdir.path().join(".decent-browser-wrapper"),
+        );
+    }
+    #[cfg(not(unix))]
     if let Some(ref executable) = browser {
         command.env("DECENT_BROWSER_EXECUTABLE", executable);
     }
@@ -312,7 +432,7 @@ async fn run_job_inner(
     loop {
         tokio::select! {
             _ = &mut *cancel_rx => {
-                terminate_child(&mut child).await;
+                terminate_child(&mut child, browser_pidfile.as_deref()).await;
                 drop(workdir);
                 tracing::info!(job_id = %assign.job_id, purged = !purged_path.exists(), "runner canceled and workdir purged");
                 return Err(anyhow!("Render canceled by dispatch"));
@@ -320,7 +440,7 @@ async fn run_job_inner(
             line = tokio::time::timeout(SILENCE_TIMEOUT, lines.next_line()) => {
                 let line = match line {
                     Err(_) => {
-                        terminate_child(&mut child).await;
+                        terminate_child(&mut child, browser_pidfile.as_deref()).await;
                         drop(workdir);
                         tracing::warn!(job_id = %assign.job_id, purged = !purged_path.exists(), "runner silent and workdir purged");
                         return Err(anyhow!("runner silent"));
@@ -330,7 +450,7 @@ async fn run_job_inner(
                         // the child may still be running and writing into
                         // the workdir. Kill it BEFORE `Drop` purges the
                         // directory out from under it.
-                        terminate_child(&mut child).await;
+                        terminate_child(&mut child, browser_pidfile.as_deref()).await;
                         return Err(anyhow!(e).context("runner stdout read failed"));
                     }
                     Ok(Ok(None)) => break,
@@ -372,7 +492,7 @@ async fn run_job_inner(
                         // runner may keep running (or keep Chrome running)
                         // after emitting it. Kill it BEFORE `Drop` purges the
                         // workdir out from under a live tree.
-                        terminate_child(&mut child).await;
+                        terminate_child(&mut child, browser_pidfile.as_deref()).await;
                         return Err(anyhow!(message));
                     }
                 }
@@ -381,6 +501,18 @@ async fn run_job_inner(
     }
 
     let status = child.wait().await.context("runner wait failed")?;
+    // Defect A, success path: Remotion normally closes its own browser, but
+    // "normally" is doing load-bearing work — a runner that exits cleanly
+    // while Chrome somehow lingers (a leaked browser from an aborted
+    // selectComposition, a Remotion bug) would orphan it with nobody left to
+    // kill it. The pidfile sweep is idempotent: dead pids are skipped.
+    #[cfg(unix)]
+    if let Some(pidfile) = browser_pidfile.as_deref() {
+        let killed = kill_recorded_browsers(pidfile);
+        if !killed.is_empty() {
+            tracing::info!(job_id = %assign.job_id, pids = ?killed, "recorded browsers killed after runner exit");
+        }
+    }
     drop(workdir);
     tracing::info!(job_id = %assign.job_id, purged = !purged_path.exists(), "workdir purged after runner exit");
     if !status.success() {
@@ -394,7 +526,8 @@ async fn run_job_inner(
     })
 }
 
-/// Signal the runner's process group and wait out the grace period.
+/// Signal the runner's process group and wait out the grace period, then
+/// kill any browser the exec wrapper recorded (Defect A backstop).
 ///
 /// ITEM 1 sign convention — read before touching:
 ///
@@ -412,9 +545,16 @@ async fn run_job_inner(
 /// * Why a group at all: Chrome is a grandchild (spawned by Remotion inside
 ///   the runner). Signalling only the runner pid — the old behaviour — left
 ///   Chrome running on every cancel, silence-kill, and shutdown.
+///   BUT (packet 3, Defect A): Remotion spawns Chrome `detached`, so Chrome
+///   LEAVES this group and becomes its own leader — the group kill below
+///   cannot reach it. That is what `browser_pidfile` is for: the exec
+///   wrapper recorded Chrome's own leader pid, and after the runner tree is
+///   down we killpg THAT pid — the exact semantic Remotion itself uses to
+///   close a browser (`kill(-proc.pid)`).
 ///
-/// Two-stage behaviour is preserved: TERM → `CANCEL_GRACE` (10s) → KILL.
-async fn terminate_child(child: &mut Child) {
+/// Two-stage behaviour is preserved: TERM → `CANCEL_GRACE` (10s) → KILL,
+/// followed by the recorded-browser sweep.
+async fn terminate_child(child: &mut Child, browser_pidfile: Option<&Path>) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
@@ -447,6 +587,57 @@ async fn terminate_child(child: &mut Child) {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
+    }
+    // Defect A backstop: Chrome left the runner's group at spawn (detached),
+    // so the group signals above could not reach it. The exec wrapper
+    // recorded its leader pid; kill that group now. Runs on EVERY terminate
+    // path (cancel, silence, runner error event, stdout failure) — and
+    // after SIGKILL escalation, when the runner had no chance to clean up.
+    #[cfg(unix)]
+    if let Some(pidfile) = browser_pidfile {
+        let killed = kill_recorded_browsers(pidfile);
+        if !killed.is_empty() {
+            tracing::info!(pids = ?killed, "recorded browsers killed");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = browser_pidfile;
+}
+
+#[cfg(test)]
+mod browser_kill_tests {
+    use super::kill_recorded_browsers;
+
+    /// The pidfile is attacker-influenced only in the pathological case, but
+    /// the sweep must still never be able to kill the supervisor or its
+    /// group: pid 0 and the supervisor's own pid are skipped, everything
+    /// else signallable is killed.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_skips_unsafe_pids_and_kills_safe_dead_entries_quietly() {
+        let dir = std::env::temp_dir().join(format!("decent-pidfile-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pids");
+        let me = std::process::id();
+        std::fs::write(
+            &pidfile,
+            format!(
+                "0
+{me}
+junk
+999999999
+"
+            ),
+        )
+        .unwrap();
+        // None of these may panic, none may kill us: 0 and me are skipped,
+        // junk is unparseable, 999999999 is dead (skipped by liveness).
+        let killed = kill_recorded_browsers(&pidfile);
+        assert!(
+            killed.is_empty(),
+            "nothing should have been signalled: {killed:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

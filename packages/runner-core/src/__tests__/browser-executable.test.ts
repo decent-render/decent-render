@@ -160,3 +160,24 @@ describe('browser resolution', () => {
 		expect(resolveBrowserExecutable(root, {})).toBeNull();
 	});
 });
+
+describe('supervisor exec wrapper (browser containment)', () => {
+	/**
+	 * Defect A containment: the supervisor hands Remotion a wrapper script
+	 * (.decent-browser-wrapper) that records the spawned pid BEFORE exec'ing
+	 * the real browser. Remotion spawns it detached (own group), so the
+	 * recorded pid is the browser tree's group leader. This test proves the
+	 * resolution layer passes the wrapper through unchanged — the property
+	 * the whole containment depends on.
+	 */
+	it('passes the supervisor exec wrapper through as the browser executable', () => {
+		const workdir = mkdtempSync(path.join(tmpdir(), 'runner-core-wrapper-'));
+		const wrapper = path.join(workdir, '.decent-browser-wrapper');
+		writeFileSync(wrapper, '#!/bin/sh\necho $$ >> pids\nexec /usr/bin/true "$@"\n');
+		const barePayload = mkdtempSync(path.join(tmpdir(), 'runner-core-payload-'));
+
+		expect(resolveBrowserExecutable(barePayload, {DECENT_BROWSER_EXECUTABLE: wrapper})).toBe(
+			wrapper,
+		);
+	});
+});

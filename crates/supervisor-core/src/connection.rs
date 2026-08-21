@@ -1232,7 +1232,14 @@ mod tests {
     /// ignore SIGTERM (the adversarial case only the group-KILL stage can
     /// settle).
     #[cfg(unix)]
-    fn group_kill_payload(trap_term: bool, then: &str, pid_file: &str, grandchild: &str) -> String {
+    #[allow(clippy::too_many_arguments)]
+    fn group_kill_payload(
+        trap_term: bool,
+        then: &str,
+        pid_file: &str,
+        grandchild: &str,
+        started_marker: &str,
+    ) -> String {
         let trap = if trap_term { "trap '' TERM INT" } else { "" };
         format!(
             r#"#!/bin/sh
@@ -1243,7 +1250,14 @@ echo "$GC" > "{pid_file}"
 # Let the grandchild finish exec (install its traps) BEFORE the error event
 # fires — the supervisor terminates the tree the moment it reads the error,
 # and a TERM during the grandchild's exec window destroys the evidence.
-sleep 1
+# Wait for the grandchild's OWN .started marker instead of a flat sleep:
+# under full-suite parallel load a flat sleep races the grandchild's exec
+# (pre-existing flake, reproduced at ae671f9 baseline 2026-08-21).
+i=0
+while [ ! -f "{started_marker}" ] && [ $i -lt 3000 ]; do
+  sleep 0.1 2>/dev/null || sleep 1
+  i=$((i+1))
+done
 echo "{{\"type\":\"progress\",\"progress\":0.5}}"
 {then}
 while true; do sleep 5; done
@@ -1252,6 +1266,7 @@ while true; do sleep 5; done
             grandchild = grandchild,
             then = then,
             pid_file = pid_file,
+            started_marker = started_marker,
         )
     }
 
@@ -1327,6 +1342,7 @@ while true; do sleep 5; done
                 "",
                 pid_file.to_str().unwrap(),
                 gc_script.to_str().unwrap(),
+                marker.with_extension("started").to_str().unwrap(),
             ),
         );
 
@@ -1420,6 +1436,11 @@ while true; do sleep 5; done
         let sha = format!("test-group-escalate-{pid}");
         let job_id = format!("job-group-escalate-{pid}");
         let gc_script = grandchild_script_immune();
+        // The immune stand-in touches this marker once its traps are installed.
+        let started_marker = std::env::temp_dir().join(format!(
+            "decent-gc-im-{pid}.started",
+            pid = std::process::id()
+        ));
         let pid_file = std::env::temp_dir().join(format!("{job_id}.gc-pid"));
         let _ = std::fs::remove_file(&pid_file);
         let payload_dir = seed_fake_payload(
@@ -1429,6 +1450,7 @@ while true; do sleep 5; done
                 "",
                 pid_file.to_str().unwrap(),
                 gc_script.to_str().unwrap(),
+                started_marker.to_str().unwrap(),
             ),
         );
 
@@ -1502,6 +1524,210 @@ while true; do sleep 5; done
         std::fs::remove_dir_all(&payload_dir).ok();
     }
 
+    /// DEFECT A (packet 3): Chrome daemonizes — Remotion spawns it
+    /// `detached`, so it leaves the runner's process group and session
+    /// entirely (own pgid, ppid eventually 1). The group kill CANNOT reach
+    /// it, no matter how it is scoped. Containment therefore rides the exec
+    /// boundary the supervisor owns: `DECENT_BROWSER_EXECUTABLE` is a
+    /// wrapper that records the spawned pid (which becomes the browser's
+    /// group-leader pid) before exec'ing the real binary.
+    ///
+    /// This test models Chrome FAITHFULLY, which the packet-2 sh stand-ins
+    /// did not: the "browser" is spawned EXACTLY as Remotion spawns Chrome
+    /// (own session via setsid — new session, new group, daemonized) and
+    /// only then parks. The runner reads the wrapper path from the env the
+    /// supervisor set, like a real payload does. A stand-in that stays in
+    /// the runner's group would prove nothing — the group kill already
+    /// covers that case; THIS test is about the process that left.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_kills_daemonized_browser_recorded_at_exec() {
+        use std::os::unix::fs::PermissionsExt;
+        let pid = std::process::id();
+        let sha = format!("test-daemon-browser-{pid}");
+        let job_id = format!("job-daemon-browser-{pid}");
+
+        // The "browser": daemonizes then parks. macOS has NO setsid(1)
+        // binary (verified packet 2), so the daemonization is python's
+        // os.setsid() — new session AND group, pgid == own pid: exactly
+        // Remotion's `detached: true` Chrome. Static script written by the
+        // test (no heredoc quoting maze). Bounded so a broken test cannot
+        // leak it forever.
+        let browser_stand_in = std::env::temp_dir().join(format!("decent-chrome-si-{pid}.py"));
+        let started = std::env::temp_dir().join(format!("decent-chrome-si-{pid}.started"));
+        let _ = std::fs::remove_file(&started);
+        std::fs::write(
+            &browser_stand_in,
+            format!(
+                "#!/usr/bin/env python3\nimport os, sys, time\nos.setsid()\nopen({m:?}, 'w').close()\ntime.sleep(120)\n",
+                m = started.display().to_string()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&browser_stand_in, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        // Seed a browser artifact so ensure_browser resolves: the manifest
+        // points at the stand-in "executable" above.
+        let browser_sha = format!("test-chrome-{pid}");
+        let browser_dir =
+            std::path::PathBuf::from(std::env::var("HOME").expect("HOME set in tests"))
+                .join(".decent-worker/browsers")
+                .join(&browser_sha);
+        std::fs::create_dir_all(&browser_dir).unwrap();
+        // The manifest must name the executable RELATIVE to the artifact
+        // root — absolute paths are rejected by the escape guard in
+        // browser_executable_in. So the stand-in lives INSIDE the artifact.
+        std::fs::copy(&browser_stand_in, browser_dir.join("chrome-stand-in.sh")).unwrap();
+        std::fs::write(browser_dir.join("executable"), "chrome-stand-in.sh").unwrap();
+
+        // The runner: reads DECENT_BROWSER_EXECUTABLE (the supervisor's
+        // wrapper) and spawns it EXACTLY as Remotion spawns Chrome —
+        // detached, own group. Reports progress so the supervisor knows it
+        // is alive. The wrapper records the pid before exec'ing the
+        // stand-in.
+        // The runner: reads DECENT_BROWSER_EXECUTABLE (the supervisor's
+        // wrapper) and spawns it EXACTLY as Remotion spawns Chrome —
+        // detached, own group (the `&` under `/bin/sh` with job control off
+        // leaves the wrapper's setsid to do the group escape).
+        let payload_script = r#"#!/bin/sh
+"$DECENT_BROWSER_EXECUTABLE" about:blank --user-data-dir=/tmp >/dev/null 2>&1 &
+echo '{"type":"progress","progress":0.5}'
+while true; do sleep 5; done
+"#;
+        let payload_dir = seed_fake_payload(&sha, payload_script);
+
+        // jobAssign WITH browser fields so ensure_browser engages.
+        let assign = format!(
+            r#"{{"type":"jobAssign","tenant":"driffs","jobId":"{job_id}","kind":"standard","durationFrames":1,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"{sha}","payloadGetUrl":"u","browserSha256":"{browser_sha}","browserGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}}"#
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, mut status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(assign)).await.unwrap();
+
+        // Wait until the browser stand-in is fully daemonized: the .started
+        // marker is touched INSIDE the setsid'd child, so its existence
+        // proves the daemon has its own session (not merely spawned).
+        // 60s, not 5s: under full-suite parallel load the payload spawn +
+        // exec chain can take far longer than solo runs (packet-2 lesson —
+        // the error-path test's 5s deadline flakes for exactly this reason).
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "browser stand-in never daemonized"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Identify the daemon by the CONTAINMENT'S OWN DATA SOURCE: the
+        // exec wrapper recorded its pid to .decent-browser-pids in the job
+        // workdir, and the wrapper exec'd INTO the daemon (same pid). This
+        // asserts the mechanism itself, not a cmdline heuristic.
+        let workdirs = job_workdirs(&job_id);
+        assert!(!workdirs.is_empty(), "job workdir not found");
+        let pidfile_contents = std::fs::read_to_string(workdirs[0].join(".decent-browser-pids"))
+            .expect("wrapper never recorded the browser pid — containment data source missing");
+        let daemon_pid: u32 = pidfile_contents
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .parse()
+            .expect("pidfile holds a pid");
+        // ...and it must be OUTSIDE the runner's group: read its pgid via ps.
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "pgid=", "-p", &daemon_pid.to_string()])
+            .output()
+            .unwrap();
+        let daemon_pgid: u32 = String::from_utf8_lossy(&ps.stdout).trim().parse().unwrap();
+        // The runner's pid equals its pgid (process_group(0)); find it via
+        // the payload script marker.
+        let runner_probe = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(format!("test-daemon-browser-{pid}"))
+            .output()
+            .unwrap();
+        let runner_pids: Vec<u32> = String::from_utf8_lossy(&runner_probe.stdout)
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let runner_pgid = runner_pids
+            .first()
+            .map(|rp| {
+                let ps = std::process::Command::new("ps")
+                    .args(["-o", "pgid=", "-p", &rp.to_string()])
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&ps.stdout)
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap()
+            })
+            .expect("runner process found");
+        assert_ne!(
+            daemon_pgid, runner_pgid,
+            "stand-in failed to model Chrome: it must leave the runner's group"
+        );
+
+        // Sanity: alive before cancel.
+        assert!(
+            unsafe { libc::kill(daemon_pid as libc::pid_t, 0) } == 0,
+            "daemonized browser must be alive before cancel"
+        );
+
+        ws.send(Message::Text(format!(
+            r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+        )))
+        .await
+        .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            status_rx.wait_for(|s| s.jobs_canceled == 1 && s.current_job.is_none()),
+        )
+        .await
+        .expect("canceled render was not processed in time")
+        .expect("status channel closed");
+
+        // THE assertion: the daemonized browser — outside the runner's
+        // group since before the cancel — is dead. Pre-fix, the group TERM/
+        // KILL never reached it and it parked for its full 120s.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let alive = unsafe { libc::kill(daemon_pid as libc::pid_t, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemonized browser survived the cancel — exec-boundary containment failed"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        ws.close(None).await.ok();
+        while let Some(Ok(_)) = ws.next().await {}
+        client.await.unwrap().expect("clean exit");
+        std::fs::remove_dir_all(&payload_dir).ok();
+        std::fs::remove_dir_all(&browser_dir).ok();
+    }
+
     /// ITEM 4: an `error` event does not imply the runner exited. This fake
     /// emits error and keeps running (with a live grandchild). The
     /// supervisor must terminate the tree BEFORE Drop purges the workdir —
@@ -1525,6 +1751,7 @@ while true; do sleep 5; done
                 r#"echo "{\"type\":\"error\",\"message\":\"render exploded but I keep running\"}""#,
                 pid_file.to_str().unwrap(),
                 gc_script.to_str().unwrap(),
+                marker.with_extension("started").to_str().unwrap(),
             ),
         );
 
@@ -1551,7 +1778,11 @@ while true; do sleep 5; done
         // Gate on exec completion: TERM during the exec window kills the
         // grandchild pre-trap and destroys the evidence.
         let gc_started = marker.with_extension("started");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // 60s, not 5s: under full-suite parallel load the payload spawn chain
+        // can exceed 5s (pre-existing flake — reproduced at ae671f9 baseline,
+        // 2026-08-21). The assertion is unchanged; only the wait is honest
+        // about scheduling latency.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while !gc_started.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
