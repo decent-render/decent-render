@@ -2,7 +2,7 @@ import {ServerMessageSchema} from '@decent-render/protocol';
 import {existsSync, readFileSync} from 'node:fs';
 import path from 'node:path';
 import type {MinimalComposition, RendererApi} from './renderer-api.js';
-import {renderJob, purgeActiveWorkDir} from './render-job.js';
+import {renderJob, purgeActiveWorkDir, jobCanceled, markJobCanceled} from './render-job.js';
 
 /**
  * How often the runner proves it is alive when no progress is being reported.
@@ -34,6 +34,7 @@ function heartbeatIntervalMs(): number {
 
 export {renderJob} from './render-job.js';
 export {verifyRenderedOutput} from './verify-output.js';
+export {purgeActiveWorkDir, jobCanceled, markJobCanceled} from './render-job.js';
 export type {OutputProbe, VerifyOptions} from './verify-output.js';
 export type {MinimalComposition, RendererApi} from './renderer-api.js';
 
@@ -125,6 +126,12 @@ export async function runRunner<TComposition extends MinimalComposition>(rendere
       process.exit(9);
     }
     handlingSignal = true;
+    // Cancel containment, upload leg: record the cancel BEFORE anything else
+    // so renderJob's pre-PUT guard (if the process is between verify and
+    // upload) sees it. The handler exits the process below; on the rare path
+    // where the purge throws and stderr is gone, the flag is still set — it
+    // is the one piece of cancel state that must never be lost.
+    markJobCanceled();
     setTimeout(() => process.exit(9), SIGNAL_EXIT_DEADLINE_MS);
     try {
       purgeActiveWorkDir();

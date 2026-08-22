@@ -25,6 +25,62 @@ const defaultLog = (message: string) => process.stderr.write(`${message}\n`);
 let activeWorkDir: string | null = null;
 
 /**
+ * Set the moment a SIGTERM/SIGINT is observed — i.e. the moment the
+ * supervisor's cancel (a group TERM) has reached this process. Once set it is
+ * never cleared: a canceled job must not upload, so there is no path back.
+ *
+ * The one deliberate exception is the signal handler itself, which checks the
+ * re-entry guard (`handlingSignal`) rather than this flag, and which must be
+ * able to purge even though the flag is already set. purgeActiveWorkDir()
+ * likewise keeps working after a cancel — the purge is the point of the
+ * handler.
+ *
+ * `renderJob` checks this immediately before the output PUT: uploading a
+ * render after the job was canceled would put customer content into R2 that
+ * dispatch will never settle (the settle update is scoped to assigned/
+ * rendering states) and no query will ever reference — an orphan in object
+ * storage that only a bucket-wide listing can find. Refusing the upload
+ * keeps the object from ever existing; there is no second source of truth to
+ * reconcile against the job table afterwards.
+ *
+ * Ordering contract: a cancel observed at ANY point up to and including the
+ * event-loop tick immediately before the PUT suppresses the upload. The
+ * check runs after `await new Promise(setImmediate)` (see renderJob), and a
+ * signal delivered earlier — including during the fully-synchronous verify
+ * section, which cannot run JS — is flushed by Bun at event-loop re-entry
+ * BEFORE a setImmediate callback scheduled after the sync section (measured
+ * 2026-08-22, Bun on macOS arm64: 40/40 probe runs). What remains is the
+ * window after the check: a signal arriving while the PUT itself is on the
+ * wire cannot stop bytes already sent. That window is the PUT duration; see
+ * the packet-11 receipt for its measured width.
+ */
+let cancelObserved = false;
+
+/** Visible for tests: the guard renderJob checks before the output PUT. */
+export function jobCanceled(): boolean {
+  return cancelObserved;
+}
+
+/**
+ * Mark the job canceled. Called by runRunner's signal handler on SIGTERM/
+ * SIGINT; exported so a payload entry point (or a test) can drive the same
+ * transition without a real signal.
+ */
+export function markJobCanceled(): void {
+  cancelObserved = true;
+}
+
+/**
+ * TEST-ONLY: clear the cancel flag. Production code must never call this —
+ * a canceled job stays canceled. It exists because the flag is module state
+ * and vitest runs every test in one module instance, so the "no cancel was
+ * observed" control test needs an explicit clean slate.
+ */
+export function resetJobCanceledForTests(): void {
+  cancelObserved = false;
+}
+
+/**
  * Purge the active workdir, if one is registered. Safe to call at any time
  * (no-op when no job is rendering). Rethrows fs errors to the caller, which
  * decides whether they are fatal — on the normal path they propagate into
@@ -119,6 +175,22 @@ export async function renderJob<TComposition extends MinimalComposition>(
       log,
     });
     const output = readFileSync(outputLocation);
+    // Refuse the upload if a cancel has been observed. The `await` yield is
+    // load-bearing: verifyRenderedOutput above is fully synchronous, so a
+    // SIGTERM delivered during it cannot run the handler until JS execution
+    // resumes. Bun flushes a pending signal handler at event-loop re-entry
+    // BEFORE a setImmediate scheduled after the sync section (measured,
+    // 40/40) — so yielding one tick here means the handler (which sets the
+    // cancel flag and exits the process) has provably already run if the
+    // signal arrived before this point. Without the yield the same thing
+    // happened in practice, but only by luck of the runtime's internal
+    // ordering, not by contract.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (jobCanceled()) {
+      throw new Error(
+        'cancel observed before the output upload — refusing to upload a canceled job (the workdir purge in this finally block is the cleanup)',
+      );
+    }
     const uploaded = await fetch(assign.outputPutUrl, {method: 'PUT', body: output, headers: {'content-type': assign.codec === 'vp8' ? 'video/webm' : 'video/mp4'}});
     if (!uploaded.ok) throw new Error(`output upload failed: HTTP ${uploaded.status}`);
     // `frames` is the MEASURED count from the file, not the composition's

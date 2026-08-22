@@ -366,13 +366,26 @@ pub async fn run(
                     WorkerMessage::JobFailed(f) => Some(f.job_id.clone()),
                     _ => None,
                 };
-                // A render failure for a job dispatch already canceled is the
-                // expected outcome of that cancel (the runner was killed), not
-                // a real failure — dispatch has already marked the job
-                // canceled and refunded it. Suppress the jobFailed frame; the
-                // workdir purge already happened in the runner regardless.
-                let suppress_failed = matches!(&msg, WorkerMessage::JobFailed(f)
-                    if canceled_job.as_deref() == Some(f.job_id.as_str()));
+                // A terminal frame for a job dispatch already canceled is the
+                // expected outcome of that cancel, not news — dispatch has
+                // already marked the job canceled and refunded it. This holds
+                // for BOTH terminal shapes:
+                //
+                // - jobFailed: the runner was killed mid-render.
+                // - jobComplete: the runner finished its work (and, since the
+                //   runner-core cancel guard, uploaded nothing) but dispatch
+                //   canceled the job before the completion was reported. A
+                //   completion racing in after cancel must not reach dispatch
+                //   either — it would reference an output that was never
+                //   settled (dispatch's settle update is scoped to assigned/
+                //   rendering) and confuse the job's terminal state.
+                //
+                // The workdir purge happened in the runner regardless.
+                let suppress_after_cancel = match &msg {
+                    WorkerMessage::JobFailed(f) => canceled_job.as_deref() == Some(f.job_id.as_str()),
+                    WorkerMessage::JobComplete(c) => canceled_job.as_deref() == Some(c.job_id.as_str()),
+                    _ => false,
+                };
                 if let Some(id) = terminal_job_id.as_deref() {
                     if in_flight.as_ref().map(|j| j.job_id.as_str()) == Some(id) {
                         in_flight = None;
@@ -381,24 +394,25 @@ pub async fn run(
                         canceled_job = None;
                     }
                 }
-                if suppress_failed {
-                    if let WorkerMessage::JobFailed(f) = &msg {
-                        tracing::info!(
-                            job_id = %f.job_id,
-                            reason = %f.reason,
-                            "render aborted after cancel — suppressing jobFailed"
-                        );
-                        obs.update_status(|s| {
-                            s.jobs_canceled += 1;
-                            if s.current_job.as_ref().is_some_and(|j| j.id == f.job_id) {
-                                s.current_job = None;
-                            }
-                        });
-                        obs.log(LogLine::info(format!(
-                            "Job {} render aborted after cancel — not reporting jobFailed",
-                            f.job_id
-                        )));
-                    }
+                if suppress_after_cancel {
+                    let (job_id, what) = match &msg {
+                        WorkerMessage::JobFailed(f) => (f.job_id.as_str(), "jobFailed"),
+                        WorkerMessage::JobComplete(c) => (c.job_id.as_str(), "jobComplete"),
+                        _ => unreachable!("suppress_after_cancel only set for terminal frames"),
+                    };
+                    tracing::info!(
+                        job_id = job_id,
+                        "render terminal frame after cancel — suppressing {what}"
+                    );
+                    obs.update_status(|s| {
+                        s.jobs_canceled += 1;
+                        if s.current_job.as_ref().is_some_and(|j| j.id == job_id) {
+                            s.current_job = None;
+                        }
+                    });
+                    obs.log(LogLine::info(format!(
+                        "Job {job_id} render terminal frame after cancel — not reporting {what}"
+                    )));
                 } else {
                     emit(obs, &msg);
                     if let Err(e) = sink.send(Message::Text(send(msg))).await {
@@ -1068,6 +1082,111 @@ done
         assert!(
             frames.iter().all(|v| v["type"] != "jobFailed"),
             "jobFailed must be suppressed after cancel, got {frames:?}"
+        );
+        std::fs::remove_dir_all(&payload_dir).ok();
+    }
+
+    /// (a2) Cancel lands AFTER the runner already reported `done` and closed
+    /// stdout — run_job has left its select loop and is in child.wait(), so
+    /// the job's eventual clean exit produces JobComplete, not JobFailed.
+    /// That completion is equally unwanted: dispatch has already marked the
+    /// job canceled (its settle update is scoped to assigned/rendering), so a
+    /// late jobComplete would reference an output nobody will ever settle.
+    /// The supervisor must suppress it exactly like the post-cancel
+    /// jobFailed.
+    ///
+    /// Determinism: the script closes stdout immediately after `done`, so the
+    /// supervisor observes EOF within milliseconds of jobAccepted; the test
+    /// waits 500ms before sending cancel, far past that point, so the cancel
+    /// always lands in the child.wait() window — the JobComplete path, not
+    /// the (already suppressed) JobFailed one. The runner then exits 0 on its
+    /// own 2s schedule; nothing kills it mid-wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_after_runner_done_suppresses_job_complete() {
+        let pid = std::process::id();
+        let sha = format!("test-cancel-complete-{pid}");
+        let job_id = format!("job-cancel-complete-{pid}");
+        // Emit `done`, close stdout ( supervisor leaves its select loop into
+        // child.wait()), linger, then exit cleanly — a runner that finished
+        // its work while dispatch was already canceling the job.
+        let payload_dir = seed_fake_payload(
+            &sha,
+            "#!/bin/sh\necho '{\"type\":\"done\",\"outputSizeInBytes\":123,\"wallTimeMs\":50}'\nexec 1>&-\nsleep 2\nexit 0\n",
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, mut status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
+            .await
+            .unwrap();
+
+        // Collect frames until jobAccepted (heartbeats may interleave).
+        let mut frames: Vec<serde_json::Value> = Vec::new();
+        loop {
+            let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
+                .await
+                .expect("expected jobAccepted before timeout");
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            let accepted = v["type"] == "jobAccepted";
+            frames.push(v);
+            if accepted {
+                break;
+            }
+        }
+
+        // Let the runner's `done` + stdout EOF be processed first (see the
+        // determinism note above), then cancel into the child.wait() window.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        ws.send(Message::Text(format!(
+            r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+        )))
+        .await
+        .unwrap();
+
+        // The suppressed completion bumps jobs_canceled and clears
+        // current_job — the deterministic "fully processed" signal. Under the
+        // old suppress-failed-only code this times out instead (the
+        // completion is emitted as a normal success).
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            status_rx.wait_for(|s| s.jobs_canceled == 1 && s.current_job.is_none()),
+        )
+        .await
+        .expect("post-done completion after cancel was not processed in time")
+        .expect("status channel closed");
+
+        // Purge still happened (WorkDir dropped on run_job's success path).
+        assert!(
+            job_workdirs(&job_id).is_empty(),
+            "workdir must be purged after the suppressed completion"
+        );
+
+        // Close and drain everything the client ever sent.
+        ws.close(None).await.ok();
+        while let Some(Ok(frame)) = ws.next().await {
+            if let Message::Text(t) = frame {
+                frames.push(serde_json::from_str(&t).unwrap());
+            }
+        }
+        client.await.unwrap().expect("clean exit");
+
+        assert!(
+            frames.iter().all(|v| v["type"] != "jobComplete"),
+            "jobComplete must be suppressed after cancel, got {frames:?}"
         );
         std::fs::remove_dir_all(&payload_dir).ok();
     }
