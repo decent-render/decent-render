@@ -18,6 +18,32 @@ use crate::purge::WorkDir;
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
 
+/// Hard ceiling on how long one job may run, however healthy it looks.
+///
+/// [`SILENCE_TIMEOUT`] only catches a runner that goes QUIET. A job that keeps
+/// emitting progress resets that timer forever, so a pathological composition
+/// — an accidental 10-hour duration, a render that crawls at a frame a minute —
+/// occupies the node indefinitely and no existing timeout ever fires. Dispatch
+/// will not rescue it either: from its side the job is progressing normally.
+///
+/// One hour is well above any legitimate render the farm has seen (the E2E
+/// 30-frame render takes ~2s; the heaviest real compositions are minutes) and
+/// well below "nobody noticed for a day".
+const MAX_JOB_WALL_TIME: Duration = Duration::from_secs(60 * 60);
+
+/// `DECENT_MAX_JOB_WALL_TIME_MS` overrides the ceiling (floor 50ms) so tests
+/// can exercise the path in milliseconds instead of waiting out an hour. Same
+/// shape as runner-core's `DECENT_RUNNER_HEARTBEAT_MS`.
+pub(crate) fn max_job_wall_time() -> Duration {
+    match std::env::var("DECENT_MAX_JOB_WALL_TIME_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        Some(ms) if ms >= 50 => Duration::from_millis(ms),
+        _ => MAX_JOB_WALL_TIME,
+    }
+}
+
 #[derive(Debug)]
 pub struct InFlightJob {
     pub job_id: String,
@@ -349,16 +375,25 @@ fn pid_exists(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+/// Run one assigned job to completion.
+///
+/// `wall_clock_limit` is a PARAMETER rather than a global read inside the
+/// loop so tests can drive a short limit without shortening every other job in
+/// the process. The test binary runs tests in parallel, so a process-global
+/// override (env var or OnceLock) set by one test would also cap the 10s
+/// cancel-grace tests running beside it and make them flake. Production passes
+/// [`max_job_wall_time`].
 pub async fn run_job(
     assign: JobAssignMessage,
     mut cancel_rx: oneshot::Receiver<()>,
     tx: tokio::sync::mpsc::UnboundedSender<WorkerMessage>,
+    wall_clock_limit: Duration,
 ) {
     let job_id = assign.job_id.clone();
     let tenant = assign.tenant.clone();
     let output_key = assign.output_key.clone();
     let attempt = assign.attempt;
-    match run_job_inner(assign, &mut cancel_rx, tx.clone()).await {
+    match run_job_inner(assign, &mut cancel_rx, tx.clone(), wall_clock_limit).await {
         Ok(metrics) => {
             let _ = tx.send(WorkerMessage::JobComplete(JobCompleteMessage {
                 tenant,
@@ -383,6 +418,7 @@ async fn run_job_inner(
     assign: JobAssignMessage,
     cancel_rx: &mut oneshot::Receiver<()>,
     tx: tokio::sync::mpsc::UnboundedSender<WorkerMessage>,
+    wall_clock_limit: Duration,
 ) -> anyhow::Result<JobMetrics> {
     let payload_dir = ensure_payload(&assign).await?;
     let runner = payload_dir.join("decent-render-runner");
@@ -468,8 +504,27 @@ async fn run_job_inner(
     let mut lines = BufReader::new(stdout).lines();
     let mut done_metrics: Option<JobMetrics> = None;
 
+    // Armed once, for the whole job: a per-iteration timer would restart on
+    // every progress line and cap nothing.
+    let deadline = tokio::time::sleep(wall_clock_limit);
+    tokio::pin!(deadline);
+
     loop {
         tokio::select! {
+            _ = &mut deadline => {
+                terminate_child(&mut child, browser_pidfile.as_deref()).await;
+                drop(workdir);
+                tracing::warn!(
+                    job_id = %assign.job_id,
+                    limit_s = wall_clock_limit.as_secs_f64(),
+                    purged = !purged_path.exists(),
+                    "render exceeded the wall-clock limit; killed and workdir purged"
+                );
+                return Err(anyhow!(
+                    "render exceeded the {:.0}s wall-clock limit",
+                    wall_clock_limit.as_secs_f64()
+                ));
+            }
             _ = &mut *cancel_rx => {
                 terminate_child(&mut child, browser_pidfile.as_deref()).await;
                 drop(workdir);

@@ -467,7 +467,12 @@ pub async fn run(
                                                 job.phase = JobPhase::Rendering;
                                             }
                                         });
-                                        let handle = tokio::spawn(run_job(*assign, cancel_rx, worker_tx.clone()));
+                                        let handle = tokio::spawn(run_job(
+                                            *assign,
+                                            cancel_rx,
+                                            worker_tx.clone(),
+                                            crate::runner::max_job_wall_time(),
+                                        ));
                                         // PACKET 5: keep the JoinHandle — every exit path awaits it.
                                         in_flight = Some(InFlightJob {
                                             job_id: job_id_owned,
@@ -729,6 +734,89 @@ mod tests {
             root
         })
         .clone()
+    }
+
+    /// A job that never goes quiet must still be stoppable.
+    ///
+    /// `SILENCE_TIMEOUT` only catches a runner that stops talking. A render
+    /// that keeps reporting progress resets that timer forever, so before the
+    /// wall-clock ceiling a pathological composition could hold a node
+    /// indefinitely — and dispatch would not intervene, because from its side
+    /// the job is progressing perfectly normally.
+    ///
+    /// Drives `run_job` directly with a short limit rather than going through
+    /// the WebSocket: the limit is a parameter precisely so this test cannot
+    /// shorten the 10s cancel-grace tests running in parallel beside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wall_clock_limit_kills_a_job_that_never_goes_silent() {
+        let pid = std::process::id();
+        let sha = format!("test-wallclock-{pid}");
+        let job_id = format!("job-wallclock-{pid}");
+        let pid_file = std::env::temp_dir().join(format!("{job_id}.runner-pid"));
+        let _ = std::fs::remove_file(&pid_file);
+
+        // Chatty forever: progress every 100ms. The silence timer can never
+        // fire, so only the wall-clock ceiling can end this.
+        let payload_script = format!(
+            r#"#!/bin/sh
+echo $$ > "{pidfile}"
+while true; do
+  echo '{{"type":"progress","progress":0.5}}'
+  sleep 0.1
+done
+"#,
+            pidfile = pid_file.display()
+        );
+        let payload_dir = seed_fake_payload(&sha, &payload_script);
+
+        let assign: crate::protocol::JobAssignMessage =
+            serde_json::from_str(&job_assign_json(&job_id, &sha)).unwrap();
+        // Bound, not dropped: dropping the sender closes the channel, which
+        // resolves the cancel receiver immediately and would end the job as a
+        // cancel rather than a timeout.
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let t0 = std::time::Instant::now();
+        crate::runner::run_job(assign, cancel_rx, tx, Duration::from_millis(1500)).await;
+        let ran_for = t0.elapsed().as_secs_f64();
+
+        // The job must have been allowed to run up to the limit, not killed
+        // instantly by some unrelated failure.
+        assert!(
+            ran_for >= 1.4,
+            "job ended after {ran_for:.2}s — the wall-clock path was not exercised"
+        );
+
+        let mut reason = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let WorkerMessage::JobFailed(failed) = msg {
+                reason = Some(failed.reason);
+            }
+        }
+        let reason = reason.expect("a timed-out job must report jobFailed");
+        assert!(
+            reason.contains("wall-clock limit"),
+            "unexpected failure reason: {reason}"
+        );
+
+        let runner_pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("runner recorded its pid")
+            .trim()
+            .parse()
+            .expect("pid parses");
+        assert!(
+            unsafe { libc::kill(runner_pid as libc::pid_t, 0) } != 0,
+            "runner survived the wall-clock limit"
+        );
+        assert!(
+            job_workdirs(&job_id).is_empty(),
+            "workdir survived the wall-clock limit"
+        );
+
+        let _ = std::fs::remove_file(&pid_file);
+        std::fs::remove_dir_all(&payload_dir).ok();
     }
 
     /// The tests must never write into the real `~/.decent-worker`.
