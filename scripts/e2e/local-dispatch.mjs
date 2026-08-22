@@ -98,6 +98,12 @@ const server = Bun.serve({
       return new Response(bytes, {headers: {'content-type': 'application/gzip'}});
     }
     if (request.method === 'GET' && url.pathname === '/input-props.json') {
+      const realProps = arg('real-props');
+      if (realProps) {
+        return new Response(readFileSync(realProps), {
+          headers: {'content-type': 'application/json'},
+        });
+      }
       return Response.json({compositionId: 'p3comp', inputProps: {}});
     }
     return new Response('not found', {status: 404});
@@ -128,7 +134,12 @@ const server = Bun.serve({
             process.exit(1);
           }
           sawRegister = true;
-          const bundleBytes = readFileSync(path.join(ART, 'bundle.tar.gz'));
+          // PACKET 22 instrumentation: --real-bundle=<path> serves Ray's
+          // actual bundle bytes; --real-props=<path> serves its props body.
+          const realBundle = arg('real-bundle');
+          const bundleBytes = realBundle
+            ? readFileSync(realBundle)
+            : readFileSync(path.join(ART, 'bundle.tar.gz'));
           const payloadBytes = readFileSync(path.join(ART, 'payload.tar.gz'));
           // Browser pin: reuse the first-run browser tarball (cached by the
           // supervisor) so cancel timing targets the render, not a 9s cold
