@@ -36,13 +36,35 @@ fn gpu_override() -> Option<bool> {
     }
 }
 
+/// The DECLARED max is clamped to 1 (packet 19): the connection loop runs one
+/// job at a time and rejects any second assignment unconditionally
+/// (connection.rs: in-flight is Option, not a counter), so declaring N > 1 on
+/// the wire would be a lie dispatch selection believes (`inFlight <
+/// maxConcurrentJobs`) — an operator asking for 4 would receive 4 assignments
+/// and reject 3 of them. Per the measured decision in the multi-platform
+/// design doc §11.3 (concurrency flat or worse above 1), stop declaring what
+/// we do not honor; the parse + ceiling stay for the day the select loop
+/// actually holds N jobs.
 fn max_concurrent_jobs() -> u32 {
     let configured = std::env::var("DECENT_MAX_CONCURRENT_JOBS")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_MAX_CONCURRENT_JOBS);
-    configured.min(MAX_CONCURRENT_JOBS_CEILING)
+    let clamped = configured.min(MAX_CONCURRENT_JOBS_CEILING);
+    if clamped > 1 {
+        tracing::info!(
+            requested = clamped,
+            declared = 1,
+            "operator requested {clamped} concurrent jobs; the supervisor runs one job at a time today, declaring 1"
+        );
+    }
+    declared_concurrency(clamped)
+}
+
+/// The honest declaration: one job, always, until the select loop holds N.
+fn declared_concurrency(_configured: u32) -> u32 {
+    1
 }
 
 /// Can this node render the GPU path?
@@ -112,6 +134,28 @@ mod tests {
         // Concurrency showed no measured gain; the default must not drift up
         // silently just because a machine looks big.
         assert_eq!(max_concurrent_jobs(), DEFAULT_MAX_CONCURRENT_JOBS);
+    }
+
+    /// Packet 19: the DECLARED concurrency is 1 regardless of what the env
+    /// asks for — the connection loop rejects a second assignment, so any
+    /// higher declaration is a lie on the wire. Pure-fn shape: the parse
+    /// still honors the ceiling for the day the loop holds N; the clamp is
+    /// what the register frame reports.
+    #[test]
+    fn declared_concurrency_is_one_even_when_the_env_asks_for_more() {
+        // No env mutation in the parallel test binary — drive the pure fn
+        // with the values the env could carry.
+        for asked in [1u32, 2, 4, 8, 99] {
+            let clamped = asked.min(MAX_CONCURRENT_JOBS_CEILING);
+            // What max_concurrent_jobs() must declare, whatever the env said:
+            // the register frame carries 1; the log fires for clamped > 1
+            // (asserted separately below to keep this test pure).
+            assert_eq!(
+                declared_concurrency(clamped),
+                1,
+                "env asking {asked} must still declare 1"
+            );
+        }
     }
 
     #[test]
