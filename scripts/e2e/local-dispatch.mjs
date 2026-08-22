@@ -68,13 +68,20 @@ const server = Bun.serve({
     const url = new URL(request.url);
     if (url.pathname === '/ws' && server.upgrade(request)) return;
     if (request.method === 'PUT' && url.pathname === '/output.mp4') {
+      // Packet 15 wire proof: capture the transport headers the runner's
+      // streamed PUT actually carried — Content-Length must be present and
+      // chunked must be absent (S3-compatible presigned PUTs reject chunked).
+      const wireHeaders = [
+        `content-length=${request.headers.get('content-length') ?? 'ABSENT'}`,
+        `transfer-encoding=${request.headers.get('transfer-encoding') ?? 'none'}`,
+      ].join(' ');
       // arrayBuffer, NOT text(): text() UTF-8-decodes the body and replaces
       // invalid sequences with U+FFFD, corrupting binary uploads. (Found the
       // hard way in the first E2E run: moov atom not found, +66% size.)
       return request.arrayBuffer().then((body) => {
         const bytes = Buffer.from(body);
         writeFileSync(OUT, bytes);
-        log(`PUT /output.mp4 ← ${bytes.length} bytes, sha=${sha256(bytes).slice(0, 12)}`);
+        log(`PUT /output.mp4 ← ${bytes.length} bytes, sha=${sha256(bytes).slice(0, 12)} [${wireHeaders}]`);
         return new Response(null, {status: 200});
       });
     }
