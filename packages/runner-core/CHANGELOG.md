@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.2
+
+- SIGTERM/SIGINT now purge the active working directory before exit, so a
+  canceled or superseded job cannot leave rendered customer content on the
+  operator's disk. The handler records the cancel first; nothing after it can
+  lose that state.
+- A canceled job never uploads. `renderJob` re-checks the cancel flag
+  immediately before the output PUT, behind a one-tick yield whose ordering
+  (signal handler runs before a post-sync `setImmediate`) is probe-verified on
+  both macOS and Linux Bun. What remains is only a signal landing while the
+  PUT is already on the wire.
+- Rendered output is verified before upload: container/stream probing and
+  sampled frame decoding using the payload's own ffmpeg/ffprobe, so black or
+  corrupt renders (dead GPU, broken codec) fail the job instead of shipping.
+  Implausibly small and implausibly large outputs are rejected from the same
+  pre-read `stat` — the size cap runs before any file read.
+- The output PUT streams from disk instead of buffering the entire file
+  (previously up to the 2 GiB cap) in memory. Content-Length is always sent —
+  never chunked transfer encoding, which S3-compatible presigned PUTs reject —
+  verified at the socket level under both Bun and Node. Failure paths drain
+  the stream deterministically before the workdir purge.
+- `jobComplete` reports the measured frame count from the probed file, not the
+  composition's declared duration.
+
 ## 0.1.1
 
 - Requires `@decent-render/protocol` ^0.1.1. The browser fields added in
