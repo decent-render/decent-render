@@ -144,6 +144,28 @@ async function discardBody(body: NonNullable<Parameters<typeof fetch>[1]>['body'
   await new Response(body as NonNullable<Parameters<typeof fetch>[1]>['body']).arrayBuffer();
 }
 
+/**
+ * PACKET 25 (0.1.3): match a renderer/GPU-init hang that Remotion surfaces
+ * as a delayRender timeout — `A delayRender() "…" was called but not
+ * cleared after Nms`.
+ *
+ * Breadth decision: match ANY delayRender timeout, not a
+ * ThreeCanvas-labeled one. The packet-22 incident was misdiagnosed for
+ * hours partly BECAUSE the label ("<ThreeCanvas/>") is tenant-authored —
+ * the failing riff used a WebGPU wrapper that reused the label. Matching
+ * labels means chasing tenant copy; matching Remotion's runtime FORMAT
+ * catches every GPU-init hang whatever the composition names it. The
+ * cost of breadth — one extra attempt (~28s) on a deterministically
+ * broken bundle — is bounded by exactly-one-retry and is what a human
+ * operator would do anyway.
+ */
+export function isDelayRenderTimeout(message: string): boolean {
+  return (
+    message.includes('A delayRender()') &&
+    message.includes('was called but not cleared after')
+  );
+}
+
 export async function renderJob<TComposition extends MinimalComposition>(
   assign: JobAssignMessage,
   renderer: RendererApi<TComposition>,
@@ -165,32 +187,60 @@ export async function renderJob<TComposition extends MinimalComposition>(
       chromeMode: 'chrome-for-testing',
       chromiumOptions: {gl: 'angle'},
     } as const;
-    const composition = await renderer.selectComposition({serveUrl, id: compositionId, inputProps, ...renderOptions});
+    // PACKET 25 (0.1.3): retry the WHOLE render (select + renderMedia —
+    // both hang under the packet-22 GPU-adapter contention) exactly ONCE
+    // when the first attempt dies with a delayRender timeout. The hung
+    // navigator.gpu.requestAdapter() promise dies with the Chrome that
+    // owns it; a fresh Chrome usually wins the adapter (packet-22 PROVEN:
+    // concurrent repro, stagger trials). Bounded: no second retry, no
+    // retry for other failures, cancel aborts before the retry starts,
+    // and wallMs keeps counting across attempts (the caller's ceiling
+    // sees the true cost).
+    let composition: TComposition | undefined;
     let lastReported = 0;
-    await renderer.renderMedia({
-      serveUrl,
-      composition,
-      inputProps,
-      codec: assign.codec === 'vp8' ? 'vp8' : 'h264',
-      colorSpace: 'bt709',
-      outputLocation,
-      concurrency: 1,
-      ...renderOptions,
-      onProgress: ({progress}) => {
-        if (progress - lastReported >= 0.05 || progress === 1) {
-          lastReported = progress;
-          options.onProgress?.(progress);
-        }
-      },
-    });
+    const attemptRender = async (attempt: 1 | 2): Promise<void> => {
+      composition = await renderer.selectComposition({serveUrl, id: compositionId, inputProps, ...renderOptions});
+      lastReported = 0; // the retry restarts the progress curve from 0
+      await renderer.renderMedia({
+        serveUrl,
+        composition,
+        inputProps,
+        codec: assign.codec === 'vp8' ? 'vp8' : 'h264',
+        colorSpace: 'bt709',
+        outputLocation,
+        concurrency: 1,
+        ...renderOptions,
+        onProgress: ({progress}) => {
+          if (progress - lastReported >= 0.05 || progress === 1) {
+            lastReported = progress;
+            options.onProgress?.(progress);
+          }
+        },
+      });
+    };
+    try {
+      await attemptRender(1);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!isDelayRenderTimeout(message)) throw error;
+      if (jobCanceled()) throw error; // a canceled job must not retry
+      // Visible by design (Ray's traceability theme): the leased log line
+      // names the retry, the trigger, and the attempt number.
+      log(
+        `[retry] attempt 1 failed with a delayRender timeout (renderer/GPU init hang, packet-22 class) — ` +
+          `retrying the render once (attempt 2 of 2): ${message}`,
+      );
+      await attemptRender(2);
+    }
     // Verify BEFORE the upload, and fail the job rather than uploading
     // something we already know is broken: nothing we can detect as garbage
     // should ever reach R2 and be reported as a success.
+    const done = composition as TComposition; // attemptRender assigns before returning
     const probe = verifyRenderedOutput({
       outputLocation,
-      expectedFrames: composition.durationInFrames,
-      expectedWidth: composition.width,
-      expectedHeight: composition.height,
+      expectedFrames: done.durationInFrames,
+      expectedWidth: done.width,
+      expectedHeight: done.height,
       binariesDirectory: options.binariesDirectory ?? null,
       log,
     });
