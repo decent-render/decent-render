@@ -49,6 +49,13 @@ pub struct ConnectionConfig {
     /// is read from `Observability::allows_real_jobs()` so the app can toggle
     /// it at runtime.
     pub allow_real_jobs: bool,
+    /// PACKET 23: reconnect after a disconnect instead of returning (and, in
+    /// `decent start`, exiting the process). Abrupt TLS closes (the
+    /// `fly deploy` shape), RSTs and clean server closes alike loop back to a
+    /// fresh connect with backoff. Terminal exits — shutdown signal,
+    /// smoke-test heartbeat limit, upgrade-required close — still end the
+    /// run. Tests that pin a single session's teardown set this to false.
+    pub reconnect: bool,
 }
 
 impl ConnectionConfig {
@@ -61,6 +68,7 @@ impl ConnectionConfig {
             connect_retry_delay: Duration::from_secs(1),
             heartbeat_limit: None,
             allow_real_jobs: false,
+            reconnect: true,
         }
     }
 
@@ -106,16 +114,56 @@ impl ConnectionConfig {
 /// process dies on the signal and `Drop` never runs, leaving the job workdir
 /// (user content) on disk. The Tauri app fires it from the Stop button.
 ///
-/// It is honoured during the initial connect-retry loop too, so a node
-/// signalled while dispatch is unreachable still exits cleanly.
-pub async fn run(
+/// Why a connection session ended. `run()` treats the non-terminal
+/// variants as "reconnect with backoff"; the terminal ones end the
+/// process-level run (operator asked for it, or dispatch demanded an
+/// upgrade a retry cannot fix).
+///
+/// PACKET 23: before this, every disconnect — abrupt TLS abort
+/// (`peer closed connection without sending TLS close_notify`),
+/// ECONNRESET, EOF mid-frame, a clean server Close, stream end —
+/// returned out of `run()` and `decent start` exited with code 1 (or
+/// 0). Every `fly deploy` of dispatch killed every foreground node;
+/// daemon nodes survived only because launchd restarted them. There
+/// was NO reconnect path to unify with: the premise "clean closes
+/// already reconnect" was false. Now `run()` itself loops: one
+/// session's teardown (drains any in-flight job exactly as before)
+/// is followed by a fresh connect, with the same backoff the
+/// initial-connect loop uses, until shutdown, heartbeat-limit, or an
+/// upgrade-required close ends the run.
+#[derive(Debug)]
+enum Disconnect {
+    /// SIGTERM/SIGINT or TUI quit — run() returns Ok.
+    Shutdown,
+    /// Smoke-test heartbeat_limit reached — run() returns Ok.
+    HeartbeatLimit,
+    /// dispatch raised its minimum protocol version; retrying is
+    /// pointless until the operator upgrades. run() returns Ok.
+    UpgradeRequired,
+    /// Socket died without a close handshake (TLS abort, RST, EOF
+    /// mid-frame) — the fly-deploy shape. Reconnect.
+    Abnormal,
+    /// Server sent a clean Close (or the stream simply ended).
+    /// Reconnect: dispatch redeploys also produce clean closes, and
+    /// an operator restarting dispatch should not silently take
+    /// every foreground node down either.
+    Clean,
+}
+
+/// One connect-serve-disconnect session, ending in a [`Disconnect`].
+///
+/// All in-flight-job draining semantics live here and are unchanged from the
+/// packet-5 era: whichever way the socket dies, the session does not return
+/// until the render tree is dead and the workdir purged.
+///
+/// `run()` (below) calls this in a loop when `config.reconnect` is set.
+async fn run_session(
     config: &ConnectionConfig,
+    request: &tokio_tungstenite::tungstenite::handshake::client::Request,
     register: &RegisterMessage,
     obs: &Observability,
-    mut shutdown: oneshot::Receiver<()>,
-) -> anyhow::Result<()> {
-    let request = config.handshake_request()?;
-
+    shutdown: &mut oneshot::Receiver<()>,
+) -> anyhow::Result<Disconnect> {
     // Initialize status snapshot with identity + dispatch URL.
     obs.update_status(|s| {
         s.connection = ConnectionState::Connecting;
@@ -148,10 +196,10 @@ pub async fn run(
         // about exiting cleanly instead of dying on the signal.
         let connect = tokio::select! {
             biased;
-            _ = &mut shutdown => {
+            _ = &mut *shutdown => {
                 tracing::info!("shutdown signal received before connect — exiting");
                 obs.update_status(|s| s.connection = ConnectionState::Disconnected);
-                return Ok(());
+                return Ok(Disconnect::Shutdown);
             }
             result = connect_async(request.clone()) => result,
         };
@@ -170,10 +218,10 @@ pub async fn run(
                 )));
                 tokio::select! {
                     biased;
-                    _ = &mut shutdown => {
+                    _ = &mut *shutdown => {
                         tracing::info!("shutdown signal received while retrying — exiting");
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
-                        return Ok(());
+                        return Ok(Disconnect::Shutdown);
                     }
                     _ = tokio::time::sleep(config.connect_retry_delay) => {}
                 }
@@ -188,6 +236,11 @@ pub async fn run(
                     s.last_error = Some(msg.clone());
                 });
                 obs.log(LogLine::error(&msg));
+                // Initial-connect failure stays a hard error: a node that
+                // cannot reach dispatch AT ALL should surface exit 1 to
+                // launchd/systemd, whose restart policy owns cold-start
+                // retries. Reconnect-on-disconnect (run(), below) is about a
+                // node that WAS connected.
                 return Err(e).with_context(|| msg);
             }
         }
@@ -329,7 +382,7 @@ pub async fn run(
         let current_job_count = u32::from(in_flight.is_some());
         tokio::select! {
             // Graceful shutdown: cancel in-flight job, close socket, exit.
-            _ = &mut shutdown => {
+            _ = &mut *shutdown => {
                 tracing::info!("shutdown signal received — closing connection");
                 obs.log(LogLine::info("Shutting down connection…"));
                 if in_flight.is_some() {
@@ -348,21 +401,20 @@ pub async fn run(
                 // Close the socket FIRST so dispatch can requeue immediately;
                 // then finish killing what we started before returning.
                 drain_in_flight_jobs(&mut in_flight, &mut draining).await;
-                return Ok(());
+                return Ok(Disconnect::Shutdown);
             }
             _ = heartbeat.tick() => {
                 let msg = WorkerMessage::Heartbeat(HeartbeatMessage {
                     tenant: register.tenant.clone(),
                     current_job_count,
                 });
-                if let Err(e) = sink.send(Message::Text(send(msg))).await {
+                if sink.send(Message::Text(send(msg))).await.is_err() {
                     // PACKET 5: the socket died with a job still in flight —
                     // cancel and drain it BEFORE returning, or the render tree
                     // is stranded live on the operator machine.
-                    let _ = e;
                     obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                     drain_in_flight_jobs(&mut in_flight, &mut draining).await;
-                    return Err(anyhow::Error::from(e).context("failed to send heartbeat"));
+                    return Ok(Disconnect::Abnormal);
                 }
                 heartbeats_sent += 1;
                 if let Some(limit) = config.heartbeat_limit {
@@ -372,7 +424,7 @@ pub async fn run(
                         sink.send(Message::Close(None)).await.ok();
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                         drain_in_flight_jobs(&mut in_flight, &mut draining).await;
-                        return Ok(());
+                        return Ok(Disconnect::HeartbeatLimit);
                     }
                 }
             }
@@ -452,11 +504,11 @@ pub async fn run(
                     )));
                 } else {
                     emit(obs, &msg);
-                    if let Err(e) = sink.send(Message::Text(send(msg))).await {
+                    if sink.send(Message::Text(send(msg))).await.is_err() {
                         // PACKET 5: drain before returning — see heartbeat arm.
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                         drain_in_flight_jobs(&mut in_flight, &mut draining).await;
-                        return Err(anyhow::Error::from(e).context("failed to send worker job frame"));
+                        return Ok(Disconnect::Abnormal);
                     }
                 }
             }
@@ -594,7 +646,7 @@ pub async fn run(
                                 // a daemonized Chrome with nothing left to
                                 // escalate. Drain before giving up.
                                 drain_in_flight_jobs(&mut in_flight, &mut draining).await;
-                                return Ok(());
+                                return Ok(Disconnect::UpgradeRequired);
                             }
                             tracing::info!(%reason, "socket closed by server");
                         } else {
@@ -605,7 +657,7 @@ pub async fn run(
                         // PACKET 5: the tree we started still needs killing
                         // before this task returns — mid-grace drop strands it.
                         drain_in_flight_jobs(&mut in_flight, &mut draining).await;
-                        return Ok(());
+                        return Ok(Disconnect::Clean);
                     }
                     // tungstenite answers Ping frames automatically.
                     Some(Ok(_)) => {}
@@ -617,17 +669,94 @@ pub async fn run(
                         });
                         obs.log(LogLine::error(&msg));
                         drain_in_flight_jobs(&mut in_flight, &mut draining).await;
-                        return Err(anyhow!(e).context("websocket error"));
+                        // PACKET 23: this is the fly-deploy shape —
+                        // "peer closed connection without sending TLS
+                        // close_notify", RST, EOF mid-frame. Session over,
+                        // run() reconnects.
+                        return Ok(Disconnect::Abnormal);
                     }
                     None => {
                         tracing::info!("socket stream ended");
                         obs.log(LogLine::info("Socket stream ended"));
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                         drain_in_flight_jobs(&mut in_flight, &mut draining).await;
-                        return Ok(());
+                        return Ok(Disconnect::Clean);
                     }
                 }
             }
+        }
+    }
+}
+
+/// PACKET 23: the process-level entry point callers use.
+///
+/// Wraps [`run_session`] in the reconnect loop: any non-terminal
+/// disconnect (abnormal TLS abort, RST, clean close, stream end) sleeps
+/// `connect_retry_delay` and starts a fresh session, reusing the SAME
+/// initial-connect attempt budget each cycle (a disconnect means the node
+/// was reachable before; the budget resets because a redeployed dispatch
+/// is expected back within seconds, not to be counted against a 15-attempt
+/// cold-start allowance). Shutdown, heartbeat-limit and upgrade-required
+/// end the run; `Err` from a session's initial connect (dispatch fully
+/// unreachable for `max_connect_attempts`) ends it too, preserving the
+/// exit-1 contract launchd/systemd restart policies rely on.
+pub async fn run(
+    config: &ConnectionConfig,
+    register: &RegisterMessage,
+    obs: &Observability,
+    mut shutdown: oneshot::Receiver<()>,
+) -> anyhow::Result<()> {
+    let request = config.handshake_request()?;
+
+    // Initialize status snapshot with identity + dispatch URL.
+    obs.update_status(|s| {
+        s.connection = ConnectionState::Connecting;
+        s.dispatch_url = Some(config.dispatch_url.clone());
+        s.node_identity = Some(crate::status::NodeIdentity::from_register_fields(
+            &register.chip,
+            match register.platform {
+                crate::protocol::Platform::Company => "company",
+                crate::protocol::Platform::Community => "community",
+            },
+            &register.supervisor_version,
+        ));
+        s.allow_real_jobs = obs.allows_real_jobs();
+        s.last_error = None;
+        // Optimistic: assume up to date until dispatch says otherwise. Cleared
+        // on every connect so a freshly-upgraded node stops showing a stale
+        // "update available" once it matches the latest.
+        s.update_available = None;
+    });
+
+    loop {
+        match run_session(config, &request, register, obs, &mut shutdown).await {
+            Ok(Disconnect::Shutdown)
+            | Ok(Disconnect::HeartbeatLimit)
+            | Ok(Disconnect::UpgradeRequired) => {
+                return Ok(());
+            }
+            Ok(disconnect @ (Disconnect::Abnormal | Disconnect::Clean)) => {
+                if !config.reconnect {
+                    return Ok(());
+                }
+                tracing::warn!(
+                    reason = ?disconnect,
+                    retry_delay_ms = config.connect_retry_delay.as_millis(),
+                    "disconnected from dispatch — reconnecting"
+                );
+                obs.log(LogLine::warn("Dispatch disconnected — reconnecting…"));
+                obs.update_status(|s| s.connection = ConnectionState::Reconnecting);
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown => {
+                        tracing::info!("shutdown signal during reconnect backoff — exiting");
+                        obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep(config.connect_retry_delay) => {}
+                }
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -678,13 +807,17 @@ mod tests {
         rx
     }
 
-    /// Config with no heartbeat limit — runs until shutdown or server close.
+    /// Config with no heartbeat limit — one session, ending at the first
+    /// disconnect (reconnect: false) so teardown-pinning tests observe
+    /// run() return. Reconnection itself is pinned by the two dedicated
+    /// reconnect tests (which set reconnect: true explicitly).
     fn long_config(port: u16) -> ConnectionConfig {
         ConnectionConfig {
             heartbeat_interval: Duration::from_millis(50),
             max_connect_attempts: 20,
             connect_retry_delay: Duration::from_millis(50),
             heartbeat_limit: None,
+            reconnect: false,
             ..ConnectionConfig::new(format!("ws://127.0.0.1:{port}/ws"), "test-jwt.token")
         }
     }
@@ -1707,6 +1840,9 @@ echo '{"type":"error","message":"boom"}'
         // This test controls the socket lifetime explicitly. A heartbeat limit
         // races the Registered assertion against the second heartbeat timeout.
         config.heartbeat_limit = None;
+        // Single session: it pins the STATE TRANSITIONS incl. the final
+        // Disconnected, not reconnection (which has its own tests).
+        config.reconnect = false;
         let register = test_register();
 
         let (obs, mut status_rx, _log_rx) =
@@ -2732,6 +2868,149 @@ while true; do sleep 5; done
 
         let _ = std::fs::remove_file(&pid_file);
         std::fs::remove_dir_all(&payload_dir).ok();
+    }
+
+    /// PACKET 23 companion: a CLEAN server Close must also reconnect.
+    /// Pre-fix investigation answer to "does a normal close share the same
+    /// path?": YES — pre-fix both shapes returned out of run() and killed
+    /// the process (clean close exited 0, abort exited 1). Dispatch
+    /// redeploys and operator restarts produce clean closes too; the node
+    /// must come back from those as well.
+    #[tokio::test]
+    async fn clean_server_close_reconnects_instead_of_exiting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = ConnectionConfig {
+            heartbeat_interval: Duration::from_millis(50),
+            max_connect_attempts: 20,
+            connect_retry_delay: Duration::from_millis(50),
+            heartbeat_limit: None,
+            reconnect: true,
+            ..ConnectionConfig::new(format!("ws://127.0.0.1:{port}/ws"), "test-jwt.token")
+        };
+        let register = test_register();
+        let (obs, _status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+
+        let obs2 = obs.clone();
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        // Session 1 → register → server closes CLEANLY (proper Close frame).
+        let (mut ws, _) = accept_ws_capturing(&listener).await;
+        let first: serde_json::Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
+        assert_eq!(first["type"], "register");
+        ws.send(Message::Close(None)).await.unwrap();
+        drop(ws);
+
+        // Session 2: the supervisor must come back and re-register.
+        let (mut ws, _) =
+            tokio::time::timeout(Duration::from_secs(10), accept_ws_capturing(&listener))
+                .await
+                .expect("no reconnection within 10s after a CLEAN close — run() returned instead");
+        let second: serde_json::Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
+        assert_eq!(
+            second["type"], "register",
+            "supervisor must re-register after a clean server close"
+        );
+
+        drop(ws);
+        client.abort();
+    }
+
+    /// Set SO_LINGER(0) on the stream and drop it → the peer sees RST, not
+    /// FIN — no Close frame, no handshake: the wire shape of "peer closed
+    /// connection without sending TLS close_notify" and of any mid-frame
+    /// TCP death.
+    async fn abort_with_rst(stream: &TcpStream) {
+        use std::os::fd::AsRawFd;
+        let fd = stream.as_raw_fd();
+        unsafe {
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            );
+        }
+    }
+
+    /// PACKET 23: hard TCP aborts (RST — the fly-deploy shape) must not end
+    /// the run. Pre-fix, the WS read error returned out of `run()` and
+    /// `decent start` exited with code 1; every dispatch deploy killed every
+    /// foreground node. Post-fix: session 1 aborts, the supervisor
+    /// reconnects and re-registers (session 2), that session aborts too, and
+    /// it STILL comes back (session 3) — sustained reconnection, not one
+    /// lucky retry.
+    #[tokio::test]
+    async fn hard_socket_abort_reconnects_instead_of_exiting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = ConnectionConfig {
+            heartbeat_interval: Duration::from_millis(50),
+            max_connect_attempts: 20,
+            connect_retry_delay: Duration::from_millis(50),
+            heartbeat_limit: None,
+            reconnect: true,
+            ..ConnectionConfig::new(format!("ws://127.0.0.1:{port}/ws"), "test-jwt.token")
+        };
+        let register = test_register();
+        let (obs, _status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+
+        let obs2 = obs.clone();
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        async fn accept_registering_session(
+            listener: &TcpListener,
+        ) -> (WebSocketStream<TcpStream>, serde_json::Value) {
+            let (ws, _) = tokio::time::timeout(
+                Duration::from_secs(10),
+                accept_ws_capturing(listener),
+            )
+            .await
+            .expect(
+                "no reconnection within 10s — run() exited (or hung) after the hard abort instead of reconnecting",
+            );
+            let mut ws = ws;
+            let register: serde_json::Value =
+                serde_json::from_str(&next_text(&mut ws).await).unwrap();
+            (ws, register)
+        }
+
+        // Session 1 → register → HARD ABORT.
+        let (ws, first) = accept_registering_session(&listener).await;
+        assert_eq!(first["type"], "register");
+        abort_with_rst(ws.get_ref()).await;
+        drop(ws);
+
+        // Session 2: must come back and re-register.
+        let (ws, second) = accept_registering_session(&listener).await;
+        assert_eq!(
+            second["type"], "register",
+            "supervisor must re-register after a hard socket abort"
+        );
+        abort_with_rst(ws.get_ref()).await;
+        drop(ws);
+
+        // Session 3: STILL coming back — reconnection is sustained.
+        let (ws, third) = accept_registering_session(&listener).await;
+        assert_eq!(
+            third["type"], "register",
+            "supervisor must survive a second consecutive hard abort"
+        );
+
+        // Sustained-register assertions above are the proof. Teardown: the
+        // run would keep reconnecting (reconnect=true, never_shutdown), so
+        // end the task explicitly.
+        drop(ws);
+        client.abort();
     }
 
     /// PACKET 12: send-error drain inventory (pinned by the two tests below).

@@ -23,6 +23,9 @@ use crate::protocol::PROTOCOL_VERSION;
 pub enum ConnectionState {
     Disconnected,
     Connecting,
+    /// PACKET 23: a previously-live session died (TLS abort, RST, clean
+    /// close) and the supervisor is backing off before reconnecting.
+    Reconnecting,
     Connected,
     Registered,
 }

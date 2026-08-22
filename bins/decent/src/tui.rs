@@ -364,6 +364,7 @@ fn connection_color(state: ConnectionState) -> Color {
         ConnectionState::Registered => Color::Green,
         ConnectionState::Connected => Color::Cyan,
         ConnectionState::Connecting => Color::Yellow,
+        ConnectionState::Reconnecting => Color::Yellow,
         ConnectionState::Disconnected => Color::Red,
     }
 }
