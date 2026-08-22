@@ -35,10 +35,17 @@ const MAX_JOB_WALL_TIME: Duration = Duration::from_secs(60 * 60);
 /// can exercise the path in milliseconds instead of waiting out an hour. Same
 /// shape as runner-core's `DECENT_RUNNER_HEARTBEAT_MS`.
 pub(crate) fn max_job_wall_time() -> Duration {
-    match std::env::var("DECENT_MAX_JOB_WALL_TIME_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-    {
+    parse_job_wall_time_override(std::env::var("DECENT_MAX_JOB_WALL_TIME_MS").ok().as_deref())
+}
+
+/// Pure parse of the wall-time override — parameterized on the raw value
+/// (rather than reading the env inside) for the same reason
+/// `WORKER_ROOT_OVERRIDE` exists: the test binary is parallel, and mutating
+/// process-global env from one test while a connection test spawns a job
+/// that reads it is a flake factory. Tests drive this function directly;
+/// production goes through [`max_job_wall_time`].
+pub(crate) fn parse_job_wall_time_override(raw: Option<&str>) -> Duration {
+    match raw.and_then(|raw| raw.parse::<u64>().ok()) {
         Some(ms) if ms >= 50 => Duration::from_millis(ms),
         _ => MAX_JOB_WALL_TIME,
     }
@@ -64,10 +71,13 @@ const WORKDIR_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 /// exercise the path with a few KB instead of 20 GiB, and operators can tune
 /// for a small disk. Same shape as [`max_job_wall_time`].
 pub(crate) fn max_workdir_bytes() -> u64 {
-    match std::env::var("DECENT_MAX_WORKDIR_BYTES")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-    {
+    parse_workdir_bytes_override(std::env::var("DECENT_MAX_WORKDIR_BYTES").ok().as_deref())
+}
+
+/// Pure parse of the workdir cap override. Parameterized for the same
+/// parallel-test reason as [`parse_job_wall_time_override`].
+pub(crate) fn parse_workdir_bytes_override(raw: Option<&str>) -> u64 {
+    match raw.and_then(|raw| raw.parse::<u64>().ok()) {
         Some(bytes) if bytes >= 1024 * 1024 => bytes,
         _ => MAX_WORKDIR_BYTES,
     }
@@ -839,6 +849,62 @@ junk
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `DECENT_MAX_WORKDIR_BYTES` parsing. Drives the pure parse directly —
+    /// NOT by mutating the env: the test binary is parallel and connection
+    /// tests spawn real jobs whose caps are read from the process env, so a
+    /// set_var in one test is a flake in another. The parse is factored out
+    /// for exactly this reason (same pattern as WORKER_ROOT_OVERRIDE).
+    ///
+    /// The brief said the wall-time sibling "has parsing tests" to copy — it
+    /// has none (verified by grep at packet-12 time), so both functions are
+    /// pinned here.
+    #[test]
+    fn workdir_bytes_override_parsing() {
+        // unset → default
+        assert_eq!(parse_workdir_bytes_override(None), MAX_WORKDIR_BYTES);
+        // garbage → default
+        assert_eq!(
+            parse_workdir_bytes_override(Some("not-a-number")),
+            MAX_WORKDIR_BYTES
+        );
+        // below the 1 MiB floor → floor, never the raw value
+        assert_eq!(
+            parse_workdir_bytes_override(Some("1024")),
+            MAX_WORKDIR_BYTES
+        );
+        assert_eq!(
+            parse_workdir_bytes_override(Some(&(1024 * 1024 - 1).to_string())),
+            MAX_WORKDIR_BYTES
+        );
+        // exactly the floor → honored (a floor the boundary itself fails
+        // would surprise every operator who sets exactly 1 MiB)
+        assert_eq!(
+            parse_workdir_bytes_override(Some(&(1024 * 1024).to_string())),
+            1024 * 1024
+        );
+        // valid above-floor → value
+        assert_eq!(parse_workdir_bytes_override(Some("5368709120")), 5368709120);
+    }
+
+    /// Same pins for `DECENT_MAX_JOB_WALL_TIME_MS` (floor 50ms).
+    #[test]
+    fn job_wall_time_override_parsing() {
+        assert_eq!(parse_job_wall_time_override(None), MAX_JOB_WALL_TIME);
+        assert_eq!(
+            parse_job_wall_time_override(Some("soon")),
+            MAX_JOB_WALL_TIME
+        );
+        assert_eq!(parse_job_wall_time_override(Some("49")), MAX_JOB_WALL_TIME);
+        assert_eq!(
+            parse_job_wall_time_override(Some("50")),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            parse_job_wall_time_override(Some("1500")),
+            Duration::from_millis(1500)
+        );
+    }
 
     /// A scratch artifact dir, cleaned up on drop.
     struct Artifact(PathBuf);

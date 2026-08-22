@@ -797,20 +797,35 @@ done
         // 1500ms wall clock with a disk cap far out of reach: only the
         // wall-clock path may end this. (Exchanged one line for five — the
         // disk cap parameter must not silently neuter the original test.)
-        crate::runner::run_job(
+        // Gate on the runner REALLY running before the wall-clock can end
+        // the job: its own pid file, written by itself. Under full-suite
+        // parallel load, fork+exec+first-shell-line can exceed a tight wall
+        // budget (proven packet 12: the payload's very first
+        // `echo $$ > pidfile` never ran while run_job duly reported the
+        // wall-clock limit) — so the test must not assert on a runner that
+        // was never scheduled. run_job runs concurrently with the gate
+        // because IT is what spawns the runner.
+        let job = tokio::spawn(crate::runner::run_job(
             assign,
             cancel_rx,
             tx,
-            Duration::from_millis(1500),
+            // Generous budget so only a genuinely-unschedulable runner could
+            // hit it before the gate below resolves: this test may not
+            // assume the machine is idle.
+            Duration::from_secs(4),
             u64::MAX / 2,
-        )
-        .await;
+        ));
+        tokio::time::timeout(Duration::from_secs(10), wait_for_pid_file(&pid_file))
+            .await
+            .expect("runner never started within 10s — spawn path broken, not a wall-clock race");
+        job.await.expect("run_job task panicked");
         let ran_for = t0.elapsed().as_secs_f64();
 
-        // The job must have been allowed to run up to the limit, not killed
-        // instantly by some unrelated failure.
+        // The job must have been allowed to run past the gate before the
+        // limit ended it — a spawn failure or instant death returns in
+        // milliseconds and would fail this floor.
         assert!(
-            ran_for >= 1.4,
+            ran_for >= 1.0,
             "job ended after {ran_for:.2}s — the wall-clock path was not exercised"
         );
 
@@ -2312,14 +2327,20 @@ while true; do sleep 5; done
         );
         // The WS error itself is honest (the socket really died); what matters
         // is that run() did not RETURN until the drain finished. Ok(()) or
-        // Err(websocket error) are both acceptable — the tree assertions
-        // below are the load-bearing proof.
+        // any socket-death error is acceptable — under parallel load either
+        // arm can surface first (the read arm reports "websocket error", the
+        // heartbeat/worker-frame send arms "failed to send …"), and both
+        // drain before returning. The tree assertions below are the
+        // load-bearing proof.
         match &outcome {
             Ok(()) => {}
-            Err(e) => assert!(
-                format!("{e:#}").contains("websocket error"),
-                "unexpected error from run(): {e:#}"
-            ),
+            Err(e) => {
+                let chain = format!("{e:#}");
+                assert!(
+                    chain.contains("websocket error") || chain.contains("failed to send"),
+                    "unexpected error from run(): {chain}"
+                );
+            }
         }
 
         // THE assertion, part 2: the whole tree is dead — the wedged runner
@@ -2468,6 +2489,225 @@ while true; do sleep 5; done
         assert!(
             unsafe { libc::kill(runner_pid as libc::pid_t, 0) } != 0,
             "wedged runner survived an upgrade-required close mid-grace — escalation was abandoned"
+        );
+
+        let _ = std::fs::remove_file(&pid_file);
+        std::fs::remove_dir_all(&payload_dir).ok();
+    }
+
+    /// PACKET 12: send-error drain inventory (pinned by the two tests below).
+    ///
+    /// Every `sink.send` in the run loop, and whether its Err path can hold
+    /// an in-flight job:
+    ///
+    /// | site | failure handling | in-flight job possible? |
+    /// |---|---|---|
+    /// | register (pre-loop) | `?` return, no drain | NO — before the loop; no job exists |
+    /// | Close on shutdown | `.ok()` swallowed | NO — never an exit |
+    /// | Close on heartbeat limit | `.ok()` swallowed | NO — never an exit |
+    /// | heartbeat frame (~L342) | return Err WITH drain | YES |
+    /// | worker job frame (~L418) | return Err WITH drain | YES |
+    /// | jobAccepted (assign arm ~L473) | `?` WITHOUT drain | NO by construction — the job task is spawned AFTER this send succeeds, so no runner or workdir exists yet |
+    ///
+    /// The two YES arms are exercised through socket death — the only way a
+    /// send fails on a real tungstenite stream — which also wakes the read
+    /// arm (Some(Err(..)) → identical drain). Deterministically the read arm
+    /// wins the select race, so the send arms are its structural shadows;
+    /// they exist (not deduplicated) because a backpressured sink can also
+    /// fail a send on flush without a peer read error. The tests pin the
+    /// guarantee BOTH share: a runner alive at the moment the socket dies is
+    /// terminated, its workdir purged, and `run()` does not return first.
+    ///
+    /// (a) dies while a worker frame (progress) is imminent; (b) dies on the
+    /// heartbeat arm with a TERM-ignoring runner, forcing the drain to ride
+    /// the full 10s grace — the wall-clock floor that proves the grace path
+    /// was really exercised rather than a fast return.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_failure_with_in_flight_job_still_drains_and_purges() {
+        let pid = std::process::id();
+        let sha = format!("test-sendfail-drain-{pid}");
+        let job_id = format!("job-sendfail-drain-{pid}");
+        let pid_file = std::env::temp_dir().join(format!("{job_id}.runner-pid"));
+        let _ = std::fs::remove_file(&pid_file);
+
+        // TERM-honoring runner that reports progress and keeps running: the
+        // supervisor holds an in-flight job and is about to forward progress
+        // (a worker-frame send) when the socket dies.
+        let payload_script = format!(
+            r#"#!/bin/sh
+echo $$ > "{pidfile}"
+echo '{{"type":"progress","progress":0.5}}'
+while true; do sleep 5; done
+"#,
+            pidfile = pid_file.display()
+        );
+        let payload_dir = seed_fake_payload(&sha, &payload_script);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, _status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let mut client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
+            .await
+            .unwrap();
+
+        // Gate on the runner REALLY running — its own pid, written by itself.
+        let runner_pid = wait_for_pid_file(&pid_file).await;
+        assert!(
+            unsafe { libc::kill(runner_pid as libc::pid_t, 0) } == 0,
+            "runner must be alive before the socket dies"
+        );
+
+        // NO cancel frame: the scenario is the socket dying while the job is
+        // simply in flight — the read arm errors out (and the pending
+        // progress-forward / heartbeat sends fail against the same dead
+        // socket), and the drain must cancel the job from there. A cancel
+        // first would kill this TERM-honoring runner before the socket
+        // death, leaving nothing to drain (caught by the alive assert in the
+        // first version of this test).
+        drop(ws);
+        drop(listener);
+
+        // run() must not return until the drain finishes. A TERM-honoring
+        // runner exits fast, so there is no timing floor here — the load-
+        // bearing assertions are alive-at-failure (above) and dead+purged
+        // (below); the grace-riding floor is test (b)'s job.
+        let outcome = tokio::time::timeout(Duration::from_secs(30), &mut client)
+            .await
+            .expect("run() hung — drain did not complete in 30s")
+            .expect("client task panicked");
+        // The socket really died; either a websocket error or a clean end is
+        // honest. What would be dishonest is returning before the drain.
+        match &outcome {
+            Ok(()) => {}
+            Err(e) => assert!(
+                format!("{e:#}").contains("websocket error")
+                    || format!("{e:#}").contains("failed to send"),
+                "unexpected error from run(): {e:#}"
+            ),
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            unsafe { libc::kill(runner_pid as libc::pid_t, 0) } != 0,
+            "runner survived a send failure with an in-flight job — drain was abandoned"
+        );
+        assert!(
+            job_workdirs(&job_id).is_empty(),
+            "workdir survived a send failure with an in-flight job — purge invariant violated"
+        );
+
+        let _ = std::fs::remove_file(&pid_file);
+        std::fs::remove_dir_all(&payload_dir).ok();
+    }
+
+    /// (b) The heartbeat send arm with a wedged runner: the drain must ride
+    /// the full 10s CANCEL_GRACE to SIGKILL ACROSS the dead socket. Pre-fix
+    /// packet-5 shape (return-on-error without drain) would return ~0s here
+    /// and leave the wedged runner alive forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_failure_mid_grace_rides_the_grace_to_sigkill() {
+        let pid = std::process::id();
+        let sha = format!("test-sendfail-grace-{pid}");
+        let job_id = format!("job-sendfail-grace-{pid}");
+        let pid_file = std::env::temp_dir().join(format!("{job_id}.runner-pid"));
+        let _ = std::fs::remove_file(&pid_file);
+
+        // Wedged runner: traps TERM, so only the 10s grace + SIGKILL can end
+        // it. Heartbeat interval in long_config is 50ms, so heartbeats (the
+        // ~L342 arm) are pounding the dying socket throughout.
+        let payload_script = format!(
+            r#"#!/bin/sh
+trap '' TERM INT
+echo $$ > "{pidfile}"
+echo '{{"type":"progress","progress":0.5}}'
+while true; do sleep 5; done
+"#,
+            pidfile = pid_file.display()
+        );
+        let payload_dir = seed_fake_payload(&sha, &payload_script);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, _status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let mut client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
+            .await
+            .unwrap();
+
+        let runner_pid = wait_for_pid_file(&pid_file).await;
+        assert!(
+            unsafe { libc::kill(runner_pid as libc::pid_t, 0) } == 0,
+            "runner must be alive before cancel"
+        );
+
+        ws.send(Message::Text(format!(
+            r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+        )))
+        .await
+        .unwrap();
+
+        // Enter the grace window (TERM sent and ignored), then kill the
+        // socket. Heartbeats every 50ms fail against it from here on.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            unsafe { libc::kill(runner_pid as libc::pid_t, 0) } == 0,
+            "runner died before the socket failure — not mid-grace, so the grace-riding proof below would be vacuous"
+        );
+        drop(ws);
+        drop(listener);
+
+        let t0 = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(45), &mut client)
+            .await
+            .expect("run() hung — drain did not complete in 45s")
+            .expect("client task panicked");
+        let ran_for = t0.elapsed().as_secs_f64();
+        assert!(
+            ran_for >= 7.0,
+            "run() returned in {ran_for:.1}s — the grace path was not ridden (a dropped job returns ~0s; 10s grace minus the 1.5s pre-drop cancel lead is ~8.5s)"
+        );
+        match &outcome {
+            Ok(()) => {}
+            Err(e) => assert!(
+                format!("{e:#}").contains("websocket error")
+                    || format!("{e:#}").contains("failed to send"),
+                "unexpected error from run(): {e:#}"
+            ),
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            unsafe { libc::kill(runner_pid as libc::pid_t, 0) } != 0,
+            "wedged runner survived a mid-grace send failure — SIGKILL escalation was abandoned"
+        );
+        assert!(
+            job_workdirs(&job_id).is_empty(),
+            "workdir survived a mid-grace send failure — purge invariant violated"
         );
 
         let _ = std::fs::remove_file(&pid_file);
