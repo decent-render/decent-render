@@ -1111,6 +1111,124 @@ echo '{"type":"done","outputSizeInBytes":1,"wallTimeMs":1}'
         let _ = std::fs::remove_dir_all(&stale);
     }
 
+    /// Packet 18: the idle-sleep assertion is held EXACTLY for the job's
+    /// lifetime. Proven through keepawake's test-visible active-guard
+    /// counter (a pgrep census cannot work here: the parallel test binary's
+    /// sibling tests hold their own caffeinates parented to this same
+    /// process): the count must rise while the job renders, hold for the
+    /// job's duration, and return to baseline after completion AND after
+    /// failure.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sleep_assertion_held_for_job_lifetime_only() {
+        let pid = std::process::id();
+        let baseline = crate::keepawake::active_guard_count_for_tests();
+
+        // A job that renders for ~2s: long enough to observe the guard
+        // held mid-job by polling the counter.
+        let sha = format!("test-keepawake-{pid}");
+        let payload_dir = seed_fake_payload(
+            &sha,
+            r#"#!/bin/sh
+sleep 2
+echo '{"type":"done","outputSizeInBytes":1,"wallTimeMs":1}'
+"#,
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let job = tokio::spawn(crate::runner::run_job(
+            serde_json::from_str::<crate::protocol::JobAssignMessage>(&job_assign_json(
+                &format!("job-keepawake-{pid}"),
+                &sha,
+            ))
+            .unwrap(),
+            cancel_rx,
+            tx,
+            std::time::Duration::from_secs(30),
+            1024 * 1024 * 1024,
+        ));
+
+        // Mid-job: the guard is held — count strictly above baseline.
+        let mut saw_held = false;
+        for _ in 0..200 {
+            if crate::keepawake::active_guard_count_for_tests() > baseline {
+                saw_held = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(saw_held, "sleep assertion must be held while the job runs");
+
+        job.await.expect("run_job task");
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("completion frame within 5s")
+            .expect("channel open");
+        assert!(
+            matches!(done, crate::protocol::WorkerMessage::JobComplete(_)),
+            "expected jobComplete, got {done:?}"
+        );
+
+        // After completion: back to baseline (retry — Drop's kill+wait is
+        // synchronous and fast, but the decrement lands before this read).
+        let mut settled = false;
+        for _ in 0..100 {
+            if crate::keepawake::active_guard_count_for_tests() <= baseline {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(settled, "sleep assertion must be released after completion");
+
+        // Failure path: a runner that errors must also release it.
+        let fail_sha = format!("test-keepawake-fail-{pid}");
+        let fail_dir = seed_fake_payload(
+            &fail_sha,
+            r#"#!/bin/sh
+echo '{"type":"error","message":"boom"}'
+"#,
+        );
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (_c2, cancel2) = tokio::sync::oneshot::channel::<()>();
+        crate::runner::run_job(
+            serde_json::from_str::<crate::protocol::JobAssignMessage>(&job_assign_json(
+                &format!("job-keepawake-fail-{pid}"),
+                &fail_sha,
+            ))
+            .unwrap(),
+            cancel2,
+            tx2,
+            std::time::Duration::from_secs(30),
+            1024 * 1024 * 1024,
+        )
+        .await;
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(5), rx2.recv())
+            .await
+            .expect("failure frame within 5s")
+            .expect("channel open");
+        assert!(
+            matches!(failed, crate::protocol::WorkerMessage::JobFailed(_)),
+            "expected jobFailed, got {failed:?}"
+        );
+        let mut settled_fail = false;
+        for _ in 0..100 {
+            if crate::keepawake::active_guard_count_for_tests() <= baseline {
+                settled_fail = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            settled_fail,
+            "sleep assertion must be released after failure"
+        );
+
+        let _ = std::fs::remove_dir_all(payload_dir);
+        let _ = std::fs::remove_dir_all(fail_dir);
+    }
+
     /// Workdirs (see `WorkDir::new`) still on disk for the given job id.
     #[cfg(unix)]
     fn job_workdirs(job_id: &str) -> Vec<std::path::PathBuf> {

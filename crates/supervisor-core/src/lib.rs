@@ -19,6 +19,7 @@
 pub mod cache;
 pub mod capabilities;
 pub mod connection;
+pub mod keepawake;
 pub mod protocol;
 pub mod purge;
 pub mod runner;

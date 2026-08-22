@@ -31,6 +31,11 @@ const CANCEL_GRACE: Duration = Duration::from_secs(10);
 /// well below "nobody noticed for a day".
 const MAX_JOB_WALL_TIME: Duration = Duration::from_secs(60 * 60);
 
+// Caveat (packet 18): this deadline uses tokio's monotonic timer, which
+// does NOT advance across system sleep — a render suspended by lid-close
+// or forced sleep undercounts its wall time. The per-job idle-sleep
+// assertion (keepawake.rs) shrinks that to lid-close/forced sleep only.
+
 /// `DECENT_MAX_JOB_WALL_TIME_MS` overrides the ceiling (floor 50ms) so tests
 /// can exercise the path in milliseconds instead of waiting out an hour. Same
 /// shape as runner-core's `DECENT_RUNNER_HEARTBEAT_MS`.
@@ -528,6 +533,12 @@ async fn run_job_inner(
         ));
     }
     let browser = ensure_browser(&assign).await?;
+    // Sleep assertion (packet 18): held for EXACTLY this job's lifetime —
+    // acquired once the job is committed, released by Drop on every exit
+    // path below (success, failure, cancel, wall-clock, disk cap, silence,
+    // stdout death — and run_job_inner being unwound by ? anywhere).
+    // Never held while idle: run_job_inner returning is what drops it.
+    let _keep_awake = crate::keepawake::JobKeepAwake::acquire(&assign.job_id);
     let workdir = WorkDir::new(&format!("job-{}", assign.job_id)).context("create workdir")?;
     let purged_path = workdir.path().to_path_buf();
     // Browser containment (Defect A): when the supervisor resolved a browser,
