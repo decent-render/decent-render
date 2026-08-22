@@ -411,8 +411,19 @@ pub async fn run(
                         // budget). Blocking is fine: the terminal frame was
                         // already sent; the next heartbeat tick can wait.
                         let protected = in_flight.as_ref().map(|j| j.cache_keys.clone()).unwrap_or_default();
-                        if let Err(e) = crate::cache::sweep_node_caches(&protected) {
-                            tracing::warn!(error = %e, "cache sweep after job failed");
+                        match crate::cache::sweep_node_caches(&protected) {
+                            Ok(out) if out.evicted > 0 => {
+                                // Surface evictions on the status log (TUI log
+                                // pane + daemon log) — packet 20: an operator
+                                // should see the cache being reclaimed without
+                                // reading tracing output.
+                                obs.log(LogLine::info(format!(
+                                    "Cache sweep: {} entries, {} -> {} bytes ({} evicted)",
+                                    out.entries, out.bytes_before, out.bytes_after, out.evicted
+                                )));
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "cache sweep after job failed"),
                         }
                         in_flight = None;
                     }

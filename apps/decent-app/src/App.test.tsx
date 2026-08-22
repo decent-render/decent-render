@@ -230,4 +230,19 @@ describe('App', () => {
 		expect(screen.getByText('1')).toBeInTheDocument();
 		expect(screen.getByText('2')).toBeInTheDocument();
 	});
+
+	// Packet 20: the Earnings panel must state the honest contract —
+	// recorded, payouts coming later — and must NOT call the dead
+	// driffs-era fetch_earnings IPC (its /api/operator-earnings route
+	// does not exist in farm-web).
+	it('earnings panel states the not-wired-up contract and makes no earnings IPC call', async () => {
+		render(<App />);
+
+		await waitFor(() => {
+			expect(screen.getByText(/payouts are not yet available/i)).toBeInTheDocument();
+		});
+		const calls = invokeMock.mock.calls.map(([cmd]) => cmd as string);
+		expect(calls).not.toContain('fetch_earnings');
+		expect(screen.queryByText(/spendable/i)).not.toBeInTheDocument();
+	});
 });

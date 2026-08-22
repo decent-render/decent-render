@@ -293,7 +293,7 @@ export default function App() {
 			{/* Earnings */}
 			<section className="card">
 				<h2>Earnings</h2>
-				<EarningsPanel dispatchUrl={dispatchUrl} />
+				<EarningsPanel />
 			</section>
 
 			{/* Log tail */}
@@ -335,50 +335,22 @@ interface EarningsData {
 	} | null;
 }
 
-function EarningsPanel({dispatchUrl}: {dispatchUrl: string}) {
-	const [data, setData] = useState<EarningsData | null>(null);
-	const [error, setError] = useState<string | null>(null);
-
-	const load = useCallback(async () => {
-		const appUrl = dispatchUrl.startsWith('ws://localhost')
-			? 'http://localhost:5173'
-			: dispatchUrl.replace(/^ws/, 'http').replace(/:\d+\/ws$/, ':5173');
-		try {
-			const json = await invoke<string>('fetch_earnings', {appUrl});
-			setData(JSON.parse(json));
-			setError(null);
-		} catch (e) {
-			setError(String(e));
-		}
-	}, [dispatchUrl]);
-
-	useEffect(() => {
-		load();
-		const interval = setInterval(load, 30_000);
-		return () => clearInterval(interval);
-	}, [load]);
-
-	if (error) {
-		return <div className="empty-state">{error}</div>;
-	}
-	if (!data) {
-		return <div className="empty-state">Loading…</div>;
-	}
-
+function EarningsPanel() {
+	// Packet 20: earnings display is NOT WIRED UP, and this panel says so
+	// plainly instead of erroring against a dead endpoint. The old
+	// `fetch_earnings` IPC called `/api/operator-earnings` — a driffs-era
+	// route that does not exist in farm-web (verified at source), so the
+	// panel errored on every refresh AND its "Earned (spendable)" label
+	// over-promised a payout mechanism that does not exist. Ray's settled
+	// wording: earnings are recorded; payouts are not yet available /
+	// coming later. Do not re-add a fetch until a real farm-web endpoint
+	// exists — inventing one from the client side is not ours to do.
 	return (
-		<div className="stats">
-			<div className="stat">
-				<span className="stat-num green">{data.earnedBalance}</span>
-				<span className="stat-label">Earned (spendable)</span>
-			</div>
-			<div className="stat">
-				<span className="stat-num yellow">{data.totals.pending}</span>
-				<span className="stat-label">Pending</span>
-			</div>
-			<div className="stat">
-				<span className="stat-num">{data.reputation?.jobsCompleted ?? 0}</span>
-				<span className="stat-label">Jobs done</span>
-			</div>
+		<div className="empty-state">
+			<p>Earnings are recorded per completed job, but payouts are not yet available — coming later.</p>
+			<p>See your earnings history on the web dashboard (decent-render.farm → Devices).</p>
 		</div>
 	);
 }
+
+

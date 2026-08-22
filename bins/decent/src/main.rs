@@ -685,12 +685,16 @@ async fn main() -> anyhow::Result<()> {
             match read_daemon_snapshot() {
                 Some(s) if s.is_fresh() => {
                     println!("connection  : {}", s.connection);
+                    let has_job = s.current_job.is_some();
                     match s.current_job {
                         Some((id, phase, prog)) => {
                             let pct = (prog.clamp(0.0, 1.0) * 100.0).round() as u32;
                             println!("current job : {id} · {phase} · {pct}%");
                         }
                         None => println!("current job : idle"),
+                    }
+                    if has_job {
+                        println!("power       : idle-sleep held while rendering");
                     }
                     println!(
                         "jobs        : {} done · {} failed · {} canceled",

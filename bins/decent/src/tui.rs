@@ -288,6 +288,16 @@ fn draw_job_panel(frame: &mut Frame, area: Rect, status: &SupervisorStatus) {
                     Span::styled("phase ", Style::default().fg(Color::DarkGray)),
                     Span::styled(phase_label, Style::default().fg(phase_color)),
                 ]),
+                // Packet 20: idle-sleep indicator — an active job holds a
+                // caffeinate assertion (keepawake.rs), so the operator can
+                // see why the machine will not idle-sleep mid-render.
+                Line::from(vec![
+                    Span::styled("power ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "idle-sleep held while rendering",
+                        Style::default().fg(Color::Green),
+                    ),
+                ]),
             ]);
             frame.render_widget(info, chunks[0]);
             let gauge = Gauge::default()
