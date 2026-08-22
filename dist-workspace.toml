@@ -31,6 +31,12 @@ targets = [
 ]
 # Where to host releases
 hosting = "github"
+# Build each distable package with `-p` instead of one unified workspace
+# build. Without this, the Linux builders compile the Tauri debug app's
+# GTK stack (gdk-sys) despite its `dist = false` — the flag excludes it
+# from ARTIFACTS, not from a unified BUILD — and the runners have no GTK
+# headers, which killed the first v0.0.8 release run (32601441473).
+precise-builds = true
 
 # cargo-dist owns .github/workflows/release.yml. Pin its generated action
 # references through the supported generator config rather than hand-editing.
