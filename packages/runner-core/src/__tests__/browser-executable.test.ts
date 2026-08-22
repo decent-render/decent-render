@@ -32,7 +32,11 @@ type RenderOptions = Parameters<Parameters<typeof renderJob>[1]['renderMedia']>[
 function harness() {
 	vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = String(input);
-		if (init?.method === 'PUT') return new Response('', {status: 200});
+		if (init?.method === 'PUT') {
+			// Packet 15: consume the streamed body (see stream-put.test.ts).
+			await new Response(init.body as never).arrayBuffer();
+			return new Response('', {status: 200});
+		}
 		if (url === BUNDLE_URL) return new Response(new Uint8Array(bundle.bytes));
 		if (url === PROPS_URL)
 			return new Response(JSON.stringify({compositionId: 'Main', inputProps: {}}), {

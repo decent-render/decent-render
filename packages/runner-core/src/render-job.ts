@@ -1,7 +1,8 @@
 import type {JobAssignMessage, JobMetrics} from '@decent-render/protocol';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {createReadStream} from 'node:fs';
+import {existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type {MinimalComposition, RendererApi} from './renderer-api.js';
@@ -124,6 +125,25 @@ async function ensureBundle(sha256: string, getUrl: string, log: (message: strin
   return dir;
 }
 
+/**
+ * Deterministically release a streamed PUT body. If fetch never fully
+ * consumed it (early throw, refused connection), the file read stream may
+ * still be pending when renderJob's finally purges the workdir — an
+ * unhandled ENOENT in the best case. Draining via Response (which both
+ * runtimes expose) or cancelling via .cancel() when present closes the
+ * stream before the purge runs. Best-effort by design: the upload has
+ * already failed; this exists so it fails QUIETLY.
+ */
+async function discardBody(body: NonNullable<Parameters<typeof fetch>[1]>['body']): Promise<void> {
+  if (body === null || body === undefined) return;
+  const maybeStream = body as {cancel?: () => Promise<void>};
+  if (typeof maybeStream.cancel === 'function') {
+    await maybeStream.cancel();
+    return;
+  }
+  await new Response(body as NonNullable<Parameters<typeof fetch>[1]>['body']).arrayBuffer();
+}
+
 export async function renderJob<TComposition extends MinimalComposition>(
   assign: JobAssignMessage,
   renderer: RendererApi<TComposition>,
@@ -174,7 +194,7 @@ export async function renderJob<TComposition extends MinimalComposition>(
       binariesDirectory: options.binariesDirectory ?? null,
       log,
     });
-    const output = readFileSync(outputLocation);
+    const outputSize = statSync(outputLocation).size;
     // Refuse the upload if a cancel has been observed. The `await` yield is
     // load-bearing: verifyRenderedOutput above is fully synchronous, so a
     // SIGTERM delivered during it cannot run the handler until JS execution
@@ -191,12 +211,54 @@ export async function renderJob<TComposition extends MinimalComposition>(
         'cancel observed before the output upload — refusing to upload a canceled job (the workdir purge in this finally block is the cleanup)',
       );
     }
-    const uploaded = await fetch(assign.outputPutUrl, {method: 'PUT', body: output, headers: {'content-type': assign.codec === 'vp8' ? 'video/webm' : 'video/mp4'}});
-    if (!uploaded.ok) throw new Error(`output upload failed: HTTP ${uploaded.status}`);
+    // STREAM the file as the PUT body — never buffer it. The size cap allows
+    // up to 2 GiB of output, and readFileSync would commit that much memory
+    // per job (packet 9's OWED). S3-compatible presigned PUTs reject chunked
+    // transfer encoding, so the body must carry Content-Length:
+    //   - Bun (the payload runtime): Bun.file sets Content-Length from the
+    //     file size (probed at the raw-socket level, packet 15).
+    //   - Node (the vitest runtime): a stream body needs duplex:'half' and
+    //     an EXPLICIT content-length header — without it undici rejects, and
+    //     Bun would strip it to chunked anyway (probed both ways).
+    // BodyInit is not in this tsconfig's libs; derive it from fetch's own
+    // RequestInit so the type tracks whatever the runtime defines.
+    let putBody: NonNullable<Parameters<typeof fetch>[1]>['body'];
+    let putHeaders: Record<string, string> = {'content-type': assign.codec === 'vp8' ? 'video/webm' : 'video/mp4'};
+    if (typeof Bun !== 'undefined' && typeof Bun.file === 'function') {
+      putBody = Bun.file(outputLocation);
+    } else {
+      putBody = createReadStream(outputLocation) as unknown as ReadableStream;
+      putHeaders = {...putHeaders, 'content-length': String(outputSize), duplex: 'half'} as Record<string, string>;
+    }
+    let uploaded: Response;
+    try {
+      uploaded = await fetch(assign.outputPutUrl, {
+      method: 'PUT',
+      body: putBody,
+      // The duplex hint is ignored by Bun and required by Node's undici for
+      // stream bodies; typing it through a cast keeps one call site.
+      ...(putBody instanceof ReadableStream || typeof (putBody as {pipe?: unknown}).pipe === 'function'
+        ? {duplex: 'half' as const}
+        : {}),
+      headers: putHeaders,
+      } as RequestInit);
+    } catch (err) {
+      await discardBody(putBody).catch(() => {});
+      throw err;
+    }
+    if (!uploaded.ok) {
+      // A streamed body may still be opening/reading when fetch rejects or
+      // returns early; make sure nothing can touch the workdir after the
+      // finally-purge below. (Not theoretical: under a refused connection
+      // the stream-open races the purge and surfaces as an unhandled ENOENT
+      // — caught by the ffmpeg-hidden CI-parity run, packet 15.)
+      await discardBody(putBody).catch(() => {});
+      throw new Error(`output upload failed: HTTP ${uploaded.status}`);
+    }
     // `frames` is the MEASURED count from the file, not the composition's
     // declared duration — the whole point of verifying is that the two can
     // disagree, and the claim is what used to be reported.
-    return {wallMs: Date.now() - started, frames: probe.frames, outputSizeInBytes: output.byteLength};
+    return {wallMs: Date.now() - started, frames: probe.frames, outputSizeInBytes: outputSize};
   } finally {
     activeWorkDir = null;
     rmSync(workDir, {recursive: true, force: true});

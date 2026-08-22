@@ -27,7 +27,12 @@ type RenderOptions = Parameters<Parameters<typeof renderJob>[1]['renderMedia']>[
 function harness() {
 	vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = String(input);
-		if (init?.method === 'PUT') return new Response('', {status: 200});
+		if (init?.method === 'PUT') {
+			// Packet 15: the PUT body is a stream under the Node runtime; a
+			// consumer must consume it or the file read races the workdir purge.
+			await new Response(init.body as never).arrayBuffer();
+			return new Response('', {status: 200});
+		}
 		if (url === BUNDLE_URL) return new Response(new Uint8Array(bundle.bytes));
 		if (url === PROPS_URL) return new Response(JSON.stringify({compositionId: 'Main', inputProps: {greeting: 'hi'}}), {headers: {'content-type': 'application/json'}});
 		throw new Error(`unexpected fetch: ${url}`);

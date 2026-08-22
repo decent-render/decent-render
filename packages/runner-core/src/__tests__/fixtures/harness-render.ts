@@ -15,8 +15,10 @@ const uploadReceipt = process.env.FIXTURE_UPLOAD_RECEIPT as string;
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 	const url = String(input);
 	if (init?.method === 'PUT') {
-		const body = init.body as Uint8Array;
-		writeFileSync(uploadReceipt, JSON.stringify({bytes: body.byteLength, contentType: (init.headers as Record<string, string>)['content-type']}));
+		// Packet 15: the PUT body is now a STREAM under the Node runtime —
+		// drain it to count bytes (1234 = the fixture's render size).
+		const bytes = (await new Response(init.body as BodyInit).arrayBuffer()).byteLength;
+		writeFileSync(uploadReceipt, JSON.stringify({bytes, contentType: (init.headers as Record<string, string>)['content-type']}));
 		return new Response('', {status: 200});
 	}
 	if (url.includes('render-bundles')) return new Response(readFileSync(bundlePath) as unknown as BodyInit);

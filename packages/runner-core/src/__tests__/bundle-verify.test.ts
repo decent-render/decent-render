@@ -25,13 +25,17 @@ type FetchCall = {url: string; method: string};
 
 function stubNetwork(options: {bundleBytes?: Buffer; bundleStatus?: number; uploadStatus?: number} = {}) {
 	const calls: FetchCall[] = [];
-	const uploaded: {body: Uint8Array; contentType: string | undefined}[] = [];
+	// Packet 15: the PUT body is now a STREAM (createReadStream under the
+	// Node test runtime), so the capture drains it to bytes for the content
+	// assertions — the wire bytes are identical either way.
+	const uploaded: {body: Uint8Array; contentType: string | undefined; contentLength?: string}[] = [];
 	vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = String(input);
 		calls.push({url, method: init?.method ?? 'GET'});
 		if (init?.method === 'PUT') {
 			const headers = (init.headers ?? {}) as Record<string, string>;
-			uploaded.push({body: init.body as Uint8Array, contentType: headers['content-type']});
+			const drained = await new Response(init.body as BodyInit).arrayBuffer();
+			uploaded.push({body: new Uint8Array(drained), contentType: headers['content-type'], contentLength: headers['content-length']});
 			return new Response('', {status: options.uploadStatus ?? 200});
 		}
 		if (url === BUNDLE_URL) {
