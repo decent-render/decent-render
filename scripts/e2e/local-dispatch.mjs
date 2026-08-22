@@ -30,6 +30,11 @@ const arg = (n) => process.argv.find((a) => a.startsWith(`--${n}=`))?.slice(n.le
 const ART = arg('artifacts') || '/tmp/p3-artifacts';
 const PORT = Number(arg('port') || 8790);
 const CANCEL_AFTER = Number(arg('cancel-after') || 0);
+// Packet 11: where on the progress curve the event-driven cancel fires.
+// 0.3 (default) lands mid-render; 1.0 lands the instant the runner reports
+// completion — right before its synchronous verify + pre-PUT cancel check,
+// the worst case for "cancel observed, upload must still not happen".
+const CANCEL_THRESHOLD = Number(arg('cancel-threshold') || 0.3);
 // PACKET 5: hard-drop the WebSocket this many ms after sending cancel —
 // models dispatch redeploys / network blips DURING the supervisor's
 // CANCEL_GRACE window. The supervisor must still finish killing the tree.
@@ -161,7 +166,7 @@ const server = Bun.serve({
         case 'jobProgress':
           // Event-driven cancel: fire on the first progress ≥ 0.3 so the
           // cancel always lands mid-render regardless of download timing.
-          if (CANCEL_AFTER > 0 && !cancelSent && frame.progress >= 0.3) {
+          if (CANCEL_AFTER > 0 && !cancelSent && frame.progress >= CANCEL_THRESHOLD) {
             log(`⇒ cancel job-p3-proof (at progress ${frame.progress})`);
             ws.send(JSON.stringify({type: 'cancel', tenant: 'driffs', jobId: 'job-p3-proof'}));
             cancelSent = true;
