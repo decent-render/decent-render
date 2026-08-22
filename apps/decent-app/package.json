@@ -19,12 +19,12 @@
 	"devDependencies": {
 		"@tauri-apps/cli": "^2",
 		"@testing-library/react": "^16",
-		"@testing-library/jest-dom": "^6",
+		"@testing-library/jest-dom": "^7",
 		"@types/react": "^19",
 		"@types/react-dom": "^19",
 		"@vitejs/plugin-react": "^6.0.3",
-		"jsdom": "^29.1.1",
-		"typescript": "^5",
+		"jsdom": "^30.0.1",
+		"typescript": "^7",
 		"vite": "^8.1.4",
 		"vitest": "^4.1.10"
 	}
