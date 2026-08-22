@@ -44,6 +44,35 @@ pub(crate) fn max_job_wall_time() -> Duration {
     }
 }
 
+/// Hard ceiling on how much disk one job's workdir may consume.
+///
+/// A render that fills the disk takes down the WHOLE node — every other job,
+/// the supervisor itself, and anything else on the machine — which is a
+/// different class of damage from a job that merely fails. The workdir holds
+/// the render output, the browser profile, and any frame intermediates; real
+/// jobs land in the tens of MB (the E2E fixture output is ~48KB, a heavy
+/// 1080p composition a few hundred MB at most). 20 GiB is two orders of
+/// magnitude above any legitimate job this farm has seen, and far below the
+/// free space a node needs to stay healthy.
+const MAX_WORKDIR_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// How often the workdir is size-sampled during a render. See
+/// [`WORKDIR_SAMPLE_INTERVAL`] on the sampler branch for the cost argument.
+const WORKDIR_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// `DECENT_MAX_WORKDIR_BYTES` overrides the cap (floor 1 MiB) so tests can
+/// exercise the path with a few KB instead of 20 GiB, and operators can tune
+/// for a small disk. Same shape as [`max_job_wall_time`].
+pub(crate) fn max_workdir_bytes() -> u64 {
+    match std::env::var("DECENT_MAX_WORKDIR_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        Some(bytes) if bytes >= 1024 * 1024 => bytes,
+        _ => MAX_WORKDIR_BYTES,
+    }
+}
+
 #[derive(Debug)]
 pub struct InFlightJob {
     pub job_id: String,
@@ -375,25 +404,61 @@ fn pid_exists(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+/// Recursive apparent-size sum of a directory tree, tolerant of files that
+/// vanish mid-walk (a render deleting intermediates while we sample) and of
+/// symlinked directories (never followed: a workdir symlink escaping the
+/// workdir would make the "cap" measure some other tree).
+fn workdir_bytes(path: &Path) -> u64 {
+    fn walk(dir: &Path, total: &mut u64) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return, // vanished or unreadable: sample what exists
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                walk(&entry.path(), total);
+            } else if meta.is_file() {
+                *total += meta.len();
+            }
+        }
+    }
+    let mut total = 0u64;
+    walk(path, &mut total);
+    total
+}
+
 /// Run one assigned job to completion.
 ///
-/// `wall_clock_limit` is a PARAMETER rather than a global read inside the
-/// loop so tests can drive a short limit without shortening every other job in
-/// the process. The test binary runs tests in parallel, so a process-global
-/// override (env var or OnceLock) set by one test would also cap the 10s
-/// cancel-grace tests running beside it and make them flake. Production passes
-/// [`max_job_wall_time`].
+/// `wall_clock_limit` and `workdir_cap_bytes` are PARAMETERS rather than
+/// globals read inside the loop so tests can drive short/small limits without
+/// shortening every other job in the process. The test binary runs tests in
+/// parallel, so a process-global override (env var or OnceLock) set by one
+/// test would also cap the 10s cancel-grace tests running beside it and make
+/// them flake. Production passes [`max_job_wall_time`] and
+/// [`max_workdir_bytes`].
 pub async fn run_job(
     assign: JobAssignMessage,
     mut cancel_rx: oneshot::Receiver<()>,
     tx: tokio::sync::mpsc::UnboundedSender<WorkerMessage>,
     wall_clock_limit: Duration,
+    workdir_cap_bytes: u64,
 ) {
     let job_id = assign.job_id.clone();
     let tenant = assign.tenant.clone();
     let output_key = assign.output_key.clone();
     let attempt = assign.attempt;
-    match run_job_inner(assign, &mut cancel_rx, tx.clone(), wall_clock_limit).await {
+    match run_job_inner(
+        assign,
+        &mut cancel_rx,
+        tx.clone(),
+        wall_clock_limit,
+        workdir_cap_bytes,
+    )
+    .await
+    {
         Ok(metrics) => {
             let _ = tx.send(WorkerMessage::JobComplete(JobCompleteMessage {
                 tenant,
@@ -419,6 +484,7 @@ async fn run_job_inner(
     cancel_rx: &mut oneshot::Receiver<()>,
     tx: tokio::sync::mpsc::UnboundedSender<WorkerMessage>,
     wall_clock_limit: Duration,
+    workdir_cap_bytes: u64,
 ) -> anyhow::Result<JobMetrics> {
     let payload_dir = ensure_payload(&assign).await?;
     let runner = payload_dir.join("decent-render-runner");
@@ -509,6 +575,17 @@ async fn run_job_inner(
     let deadline = tokio::time::sleep(wall_clock_limit);
     tokio::pin!(deadline);
 
+    // Workdir disk sampler. Every 2s a recursive apparent-size walk of the
+    // workdir runs on the blocking pool. Cost is bounded by FILE COUNT, not
+    // bytes: a workdir holds the bundle copy, browser profile and render
+    // output — thousands of entries at worst, each a dentry-cached stat, so
+    // a sample is single-digit milliseconds and 2s cadence keeps it far below
+    // 1% of one core. A tighter interval would buy at most one interval of
+    // overrun (a runaway writes hundreds of MB/s regardless); a looser one
+    // widens the damage window before the node's disk fills. 2s is the knee.
+    let mut disk_sampler = tokio::time::interval(WORKDIR_SAMPLE_INTERVAL);
+    disk_sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             _ = &mut deadline => {
@@ -524,6 +601,30 @@ async fn run_job_inner(
                     "render exceeded the {:.0}s wall-clock limit",
                     wall_clock_limit.as_secs_f64()
                 ));
+            }
+            _ = disk_sampler.tick() => {
+                // spawn_blocking: the walk is synchronous IO and must not
+                // stall the runtime (or the cancel branch beside it).
+                let sample_root = purged_path.clone();
+                let bytes = tokio::task::spawn_blocking(move || workdir_bytes(&sample_root))
+                    .await
+                    .map_err(|e| anyhow!(e).context("disk sampler join failed"))?;
+                if bytes > workdir_cap_bytes {
+                    terminate_child(&mut child, browser_pidfile.as_deref()).await;
+                    drop(workdir);
+                    tracing::warn!(
+                        job_id = %assign.job_id,
+                        bytes,
+                        cap_bytes = workdir_cap_bytes,
+                        purged = !purged_path.exists(),
+                        "workdir exceeded the disk cap; killed and workdir purged"
+                    );
+                    return Err(anyhow!(
+                        "workdir exceeded the {} byte disk cap ({} bytes on disk)",
+                        workdir_cap_bytes,
+                        bytes
+                    ));
+                }
             }
             _ = &mut *cancel_rx => {
                 terminate_child(&mut child, browser_pidfile.as_deref()).await;

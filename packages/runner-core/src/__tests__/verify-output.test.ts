@@ -1,10 +1,10 @@
 import {afterAll, beforeAll, describe, expect, it} from 'vitest';
 import {spawnSync} from 'node:child_process';
-import {existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync} from 'node:fs';
+import {closeSync, existsSync, mkdtempSync, openSync, readdirSync, rmSync, truncateSync, writeFileSync} from 'node:fs';
 import {homedir, tmpdir} from 'node:os';
 import path from 'node:path';
 
-import {verifyRenderedOutput} from '../verify-output.js';
+import {maxOutputBytes, verifyRenderedOutput} from '../verify-output.js';
 
 /**
  * Fixtures are BUILT with the system ffmpeg (it has the lavfi sources needed
@@ -144,6 +144,64 @@ describe('verifyRenderedOutput without ffprobe', () => {
 		expect(() =>
 			verifyRenderedOutput({outputLocation: clip('zero.mp4'), expectedFrames: 30, binariesDirectory: null}),
 		).toThrow(/zero-byte/);
+	});
+});
+
+/** Apparent-size blob via a hole: statSync().size is huge, disk cost ~0. */
+function sparse(file: string, bytes: number) {
+	const handle = openSync(file, 'w');
+	truncateSync(file, bytes);
+	closeSync(handle);
+}
+
+describe('the output size cap', () => {
+	it('floors at 2 GiB however small the composition claims', () => {
+		// Sparse file: statSync sees APPARENT size without occupying CI disk.
+		// A 2.5 GiB blob against 30×64×36 claims (derived 6,912 B) still gets
+		// the 2 GiB floor — and trips it. Derived-only would cap a legit
+		// 64×36 render (the E2E fixture shape) at ~7 KB and fail real work.
+		sparse(clip('huge-floor.mp4'), 2.5 * 1024 ** 3);
+		expect(() =>
+			verifyRenderedOutput({outputLocation: clip('huge-floor.mp4'), expectedFrames: 30, expectedWidth: 64, expectedHeight: 36, binariesDirectory: null}),
+		).toThrow(/exceeding the 2147483648 byte cap/);
+	});
+
+	it('derives a higher ceiling from big composition claims', () => {
+		// 4 GiB blob: over the ceiling for a 10-minute 1080p30 claim
+		// (3,732,480,000 B) → rejected…
+		sparse(clip('huge-derived.mp4'), 4 * 1024 ** 3);
+		expect(() =>
+			verifyRenderedOutput({outputLocation: clip('huge-derived.mp4'), expectedFrames: 18_000, expectedWidth: 1920, expectedHeight: 1080, binariesDirectory: null}),
+		).toThrow(/exceeding the 3732480000 byte cap/);
+		// …but under it for a 20-minute 4K claim (35.8 GB) → proceeds down
+		// the no-tools LOUD path instead. Proves the derived value really
+		// replaces the floor, in both directions.
+		const logs: string[] = [];
+		const probe = verifyRenderedOutput({
+			outputLocation: clip('huge-derived.mp4'),
+			expectedFrames: 43_200,
+			expectedWidth: 3840,
+			expectedHeight: 2160,
+			binariesDirectory: null,
+			log: (m) => logs.push(String(m)),
+		});
+		expect(probe.codec).toBe('unverified');
+		expect(logs.join('\n')).toMatch(/WITHOUT content verification/);
+	});
+
+	it('maxOutputBytes: generous math, floors at 2 GiB, tolerates missing claims', () => {
+		// Small claims → the floor governs (and protects short renders).
+		expect(maxOutputBytes(30, 640, 360)).toBe(2 * 1024 ** 3);
+		expect(maxOutputBytes(30, 64, 36)).toBe(2 * 1024 ** 3);
+		// Big legit claims → derived, ABOVE the floor: a 10-minute 1080p30
+		// may emit 3.73 GB; a 20-minute 4K may emit 35.8 GB.
+		expect(maxOutputBytes(18_000, 1920, 1080)).toBe(3_732_480_000);
+		expect(maxOutputBytes(43_200, 3840, 2160)).toBe(35_831_808_000);
+		// Claims missing or nonsense → the 2 GiB floor, never zero/NaN.
+		expect(maxOutputBytes(0, 640, 360)).toBe(2 * 1024 ** 3);
+		expect(maxOutputBytes(30, undefined, undefined)).toBe(2 * 1024 ** 3);
+		expect(maxOutputBytes(Number.NaN, 640, 360)).toBe(2 * 1024 ** 3);
+		expect(maxOutputBytes(30, 0, 360)).toBe(2 * 1024 ** 3);
 	});
 });
 

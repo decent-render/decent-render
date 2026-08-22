@@ -102,6 +102,42 @@ function sampleIndices(frames: number): number[] {
  */
 const MIN_BYTES_PER_FRAME = 8;
 
+/**
+ * Largest believable bytes per CLAIMED output pixel, h264 or vp8.
+ *
+ * The ceiling is derived from what the job says it rendered — its frame
+ * count and dimensions — because a flat cap cannot be both safe for a
+ * long 4K render and tight for a 30-frame preview: one number that fails
+ * a legitimate render is worse than no cap at all. Real h264 at CRF lands
+ * around 0.02–0.05 bytes/pixel even for hard content, and vp8 is roughly
+ * twice that; 0.1 covers both codecs with ≥2× headroom. Only a runaway —
+ * an encode emitting garbage frames forever, a pathological image
+ * sequence — crosses it.
+ */
+const MAX_BYTES_PER_CLAIMED_PIXEL = 0.1;
+
+/**
+ * Flat floor for the derived ceiling: no render this farm serves produces
+ * more, whatever it claims (the E2E fixture is ~48KB; heaviest real
+ * compositions are minutes of 1080p ≈ 1GB), and it bounds the damage a
+ * render with no dimension claim can do to node memory at read time.
+ */
+const MIN_OUTPUT_CEILING_BYTES = 2 * 1024 ** 3;
+
+/**
+ * The largest output we will read and upload for these composition claims.
+ * Generous on purpose: tripping on a legitimate render is a worse failure
+ * than the unbounded read this exists to prevent.
+ */
+export function maxOutputBytes(expectedFrames: number, expectedWidth?: number, expectedHeight?: number): number {
+	if (!Number.isFinite(expectedFrames) || expectedFrames <= 0) return MIN_OUTPUT_CEILING_BYTES;
+	if (!Number.isFinite(expectedWidth) || !Number.isFinite(expectedHeight) || expectedWidth! <= 0 || expectedHeight! <= 0) {
+		return MIN_OUTPUT_CEILING_BYTES;
+	}
+	const derived = Math.ceil(expectedFrames * expectedWidth! * expectedHeight! * MAX_BYTES_PER_CLAIMED_PIXEL);
+	return Math.max(MIN_OUTPUT_CEILING_BYTES, derived);
+}
+
 function findBinary(name: string, binariesDirectory: string | null): string | null {
   if (binariesDirectory === null) return null;
   const candidate = path.join(binariesDirectory, name);
@@ -252,6 +288,18 @@ export function verifyRenderedOutput(options: VerifyOptions): OutputProbe {
   const sizeInBytes = statSync(outputLocation).size;
   if (sizeInBytes === 0) {
     throw new Error('render produced a zero-byte output file');
+  }
+  // The size ceiling rides the SAME stat, before any read or decode: the
+  // caller reads the file into memory right after this returns, so a cap
+  // that ran later would bound nothing. Derived from the composition's own
+  // claims (see MAX_BYTES_PER_CLAIMED_PIXEL) so a legitimate long render
+  // cannot trip it; a flat cap tight enough to catch a runaway would also
+  // fail real 4K work.
+  const ceiling = maxOutputBytes(expectedFrames, expectedWidth, expectedHeight);
+  if (sizeInBytes > ceiling) {
+    throw new Error(
+      `rendered output is ${sizeInBytes} bytes, exceeding the ${ceiling} byte cap for ${expectedFrames} claimed frames — refusing the read/upload to protect node memory`,
+    );
   }
 
   const ffprobe = findBinary('ffprobe', binariesDirectory);

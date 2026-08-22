@@ -472,6 +472,7 @@ pub async fn run(
                                             cancel_rx,
                                             worker_tx.clone(),
                                             crate::runner::max_job_wall_time(),
+                                            crate::runner::max_workdir_bytes(),
                                         ));
                                         // PACKET 5: keep the JoinHandle — every exit path awaits it.
                                         in_flight = Some(InFlightJob {
@@ -779,7 +780,17 @@ done
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         let t0 = std::time::Instant::now();
-        crate::runner::run_job(assign, cancel_rx, tx, Duration::from_millis(1500)).await;
+        // 1500ms wall clock with a disk cap far out of reach: only the
+        // wall-clock path may end this. (Exchanged one line for five — the
+        // disk cap parameter must not silently neuter the original test.)
+        crate::runner::run_job(
+            assign,
+            cancel_rx,
+            tx,
+            Duration::from_millis(1500),
+            u64::MAX / 2,
+        )
+        .await;
         let ran_for = t0.elapsed().as_secs_f64();
 
         // The job must have been allowed to run up to the limit, not killed
@@ -813,6 +824,97 @@ done
         assert!(
             job_workdirs(&job_id).is_empty(),
             "workdir survived the wall-clock limit"
+        );
+
+        let _ = std::fs::remove_file(&pid_file);
+        std::fs::remove_dir_all(&payload_dir).ok();
+    }
+
+    /// A render that fills the disk takes down the WHOLE node, not just its
+    /// own job — every other job, the supervisor, anything else on the box.
+    /// The wall-clock cap bounds time; this bounds disk, sampled DURING the
+    /// render (a check at the end sees the damage already done).
+    ///
+    /// Same shape as the wall-clock test above: drives `run_job` directly so
+    /// the small cap cannot leak into the parallel tests, against a runner
+    /// that stays chatty (progress every 100ms) so neither the silence timer
+    /// nor any spawn failure can be what ends it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workdir_disk_cap_kills_a_runaway_render() {
+        let pid = std::process::id();
+        let sha = format!("test-diskcap-{pid}");
+        let job_id = format!("job-diskcap-{pid}");
+        let pid_file = std::env::temp_dir().join(format!("{job_id}.runner-pid"));
+        let _ = std::fs::remove_file(&pid_file);
+
+        // Chatty forever AND writing: 4 MiB per 100ms into the workdir. The
+        // silence timer can never fire; the workdir crosses a 4 MiB cap
+        // within the first sample interval or two.
+        let payload_script = format!(
+            r#"#!/bin/sh
+echo $$ > "{pidfile}"
+i=0
+while true; do
+  dd if=/dev/zero of="blob-$i" bs=1048576 count=4 2>/dev/null
+  echo '{{"type":"progress","progress":0.5}}'
+  i=$((i+1))
+  sleep 0.1
+done
+"#,
+            pidfile = pid_file.display()
+        );
+        let payload_dir = seed_fake_payload(&sha, &payload_script);
+
+        let assign: crate::protocol::JobAssignMessage =
+            serde_json::from_str(&job_assign_json(&job_id, &sha)).unwrap();
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let t0 = std::time::Instant::now();
+        // 4 MiB cap (the production floor for the override) and a wall clock
+        // generous enough that only the disk cap may end it.
+        crate::runner::run_job(
+            assign,
+            cancel_rx,
+            tx,
+            Duration::from_secs(3600),
+            4 * 1024 * 1024,
+        )
+        .await;
+        let ran_for = t0.elapsed().as_secs_f64();
+
+        // The job must have run long enough for the SAMPLER to fire at least
+        // once past its first (empty-workdir) tick — not died instantly.
+        assert!(
+            ran_for >= 1.0,
+            "job ended after {ran_for:.2}s — the disk-cap path was not exercised"
+        );
+
+        let mut reason = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let WorkerMessage::JobFailed(failed) = msg {
+                reason = Some(failed.reason);
+            }
+        }
+        let reason = reason.expect("a disk-capped job must report jobFailed");
+        assert!(
+            reason.contains("disk cap"),
+            "unexpected failure reason: {reason}"
+        );
+
+        let runner_pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("runner recorded its pid")
+            .trim()
+            .parse()
+            .expect("pid parses");
+        assert!(
+            unsafe { libc::kill(runner_pid as libc::pid_t, 0) } != 0,
+            "runner survived the disk cap"
+        );
+        assert!(
+            job_workdirs(&job_id).is_empty(),
+            "workdir survived the disk cap"
         );
 
         let _ = std::fs::remove_file(&pid_file);
