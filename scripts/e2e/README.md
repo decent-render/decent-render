@@ -60,3 +60,17 @@ workdir purge → no orphaned Chrome / runner processes (check with
 The tarballs under the artifacts dir are large and machine-local. Never commit
 them; the artifacts dir is a scratch space (`/tmp/...`), which keeps it out of
 the repo by construction.
+
+## Gotcha: build the bundle with `node`, not `bun`
+
+`make-bundle.mjs` **wedges under Bun** — it sits in a kevent idle loop inside
+`@remotion/bundler` and never finishes (observed 10+ minutes, no output, no
+error). Under `node` it completes normally. This is the one place in the repo
+where the "Bun everywhere" rule does not hold, and the failure mode is a hang
+rather than a message, so it reads as "the bundle is just slow".
+
+Related trap once you are on node: the bundler's esbuild loader may resolve a
+TypeScript version that lacks `readConfigFile` (seen with typescript@7.x),
+which surfaces as an opaque loader error. Pinning a 5.x for the bundler is a
+workaround — if you do it by touching the package store, remove it afterwards
+and verify by content, because nothing in `git status` will show it.
