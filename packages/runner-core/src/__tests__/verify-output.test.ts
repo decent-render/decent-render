@@ -39,6 +39,13 @@ function synthesise(args: string[], output: string) {
 
 beforeAll(() => {
 	dir = mkdtempSync(path.join(tmpdir(), 'verify-output-'));
+	// Tool-free fixtures: written BEFORE the system-ffmpeg early return so the
+	// ungated `without ffprobe` describe below works on hosts with no ffmpeg
+	// at all (CI runners). Caught by running the suite on Linux CI, where
+	// these tests failed with "produced no output file" instead of exercising
+	// the no-tools path they exist to pin.
+	writeFileSync(clip('zero.mp4'), '');
+	writeFileSync(clip('any-nonempty.mp4'), 'not a real video, but the no-tools path never decodes it');
 	if (!haveSystemFf) return;
 	const encode = ['-frames:v', '30', '-c:v', 'libx264', '-pix_fmt', 'yuv420p'];
 	// Moving content — what a healthy render looks like.
@@ -52,7 +59,6 @@ beforeAll(() => {
 	// Wrong dimensions for the composition we will declare.
 	synthesise(['-f', 'lavfi', '-i', 'testsrc=size=32x18:rate=30', ...encode], clip('small.mp4'));
 
-	writeFileSync(clip('zero.mp4'), '');
 	writeFileSync(clip('garbage.mp4'), 'this is definitely not an mp4 file, not even slightly');
 });
 
@@ -125,7 +131,7 @@ describe('verifyRenderedOutput without ffprobe', () => {
 		// against — but it must never be silent.
 		const logs: string[] = [];
 		const probe = verifyRenderedOutput({
-			outputLocation: clip('good.mp4'),
+			outputLocation: clip('any-nonempty.mp4'),
 			expectedFrames: 30,
 			binariesDirectory: null,
 			log: (m) => logs.push(String(m)),
