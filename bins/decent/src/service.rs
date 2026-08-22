@@ -699,6 +699,176 @@ mod tests {
         );
     }
 
+    /// The unit must run THE BINARY THE OPERATOR INSTALLED — by absolute
+    /// path, first among ProgramArguments/ExecStart. A unit that resolved
+    /// `decent` through PATH would silently run whatever another package
+    /// dropped on PATH, on every restart, forever (KeepAlive makes launchd
+    /// the thing that keeps re-running it).
+    #[test]
+    fn unit_runs_the_installed_binary_by_absolute_path() {
+        let text = rendered_unit(&spec());
+        let expected = "/opt/decent/bin/decent";
+        #[cfg(target_os = "macos")]
+        {
+            // First <string> after ProgramArguments is the executable.
+            let args_block = text
+                .split("<key>ProgramArguments</key>")
+                .nth(1)
+                .expect("plist has ProgramArguments");
+            let first = args_block
+                .split("<string>")
+                .nth(1)
+                .expect("at least one argument string")
+                .split("</string>")
+                .next()
+                .unwrap();
+            assert_eq!(first, expected, "plist:\n{text}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let exec_start = text
+                .lines()
+                .find(|l| l.starts_with("ExecStart="))
+                .expect("unit has ExecStart");
+            assert!(
+                exec_start.starts_with(&format!("ExecStart={expected} ")),
+                "unit:\n{text}"
+            );
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = (&text, expected);
+    }
+
+    /// The exact argument vector an operator can rely on: `<exe> start
+    /// --dispatch-url <url> --allow-real-jobs`. Pinned as a sequence, not a
+    /// bag of substrings, so a future flag reorder or insertion is a visible
+    /// diff rather than a silent behavior change on every installed node.
+    #[test]
+    fn unit_argument_vector_is_exactly_start_dispatch_allow() {
+        let text = rendered_unit(&spec());
+        #[cfg(target_os = "macos")]
+        {
+            let args: Vec<String> = text
+                .split("<key>ProgramArguments</key>")
+                .nth(1)
+                .expect("plist has ProgramArguments")
+                .split("<key>")
+                .next()
+                .unwrap()
+                .split("<string>")
+                .skip(1)
+                .map(|s| s.split("</string>").next().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                args,
+                vec![
+                    "/opt/decent/bin/decent",
+                    "start",
+                    "--dispatch-url",
+                    "wss://dispatch.example.com/ws",
+                    "--allow-real-jobs",
+                ],
+                "plist:\n{text}"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let exec_start = text
+                .lines()
+                .find(|l| l.starts_with("ExecStart="))
+                .expect("unit has ExecStart");
+            assert_eq!(
+                exec_start,
+                "ExecStart=/opt/decent/bin/decent start --dispatch-url wss://dispatch.example.com/ws --allow-real-jobs",
+                "unit:\n{text}"
+            );
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = text;
+    }
+
+    /// Start at login/boot: launchd's RunAtLoad (the systemd leg is pinned by
+    /// linux_unit_starts_at_boot_not_just_on_demand). Without it an installed
+    /// node stays down after every reboot until the operator notices.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unit_runs_at_load() {
+        let text = rendered_unit(&spec());
+        assert!(text.contains("<key>RunAtLoad</key>"), "{text}");
+        assert!(
+            text.contains("<key>RunAtLoad</key>\n    <true/>"),
+            "RunAtLoad must be true:\n{text}"
+        );
+    }
+
+    /// A graceful stop must be BOUNDED: the daemon supervises render jobs and
+    /// its shutdown drains them (cancel → TERM → 10s grace → KILL → purge).
+    /// ExitTimeOut/TimeoutStopSec is what stops launchd/systemd SIGKILLing
+    /// the supervisor mid-drain on every `decent stop`/upgrade.
+    #[test]
+    fn unit_gives_the_supervisor_time_to_drain_on_stop() {
+        let text = rendered_unit(&spec());
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                text.contains("<key>ExitTimeOut</key>\n    <integer>30</integer>"),
+                "ExitTimeOut must be a 30s bound:\n{text}"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                text.contains("TimeoutStopSec=30"),
+                "TimeoutStopSec must be a 30s bound:\n{text}"
+            );
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = text;
+    }
+
+    /// Logs must be INFO-level by default — enough for an operator to see
+    /// job flow without enabling anything, not so chatty the log file drowns
+    /// the disk a render farm is filling.
+    #[test]
+    fn unit_sets_rust_log_info() {
+        let text = rendered_unit(&spec());
+        #[cfg(target_os = "macos")]
+        assert!(
+            text.contains("<key>RUST_LOG</key>\n        <string>info</string>"),
+            "{text}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(text.contains("Environment=RUST_LOG=info"), "{text}");
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = text;
+    }
+
+    /// macOS label is the identity launchctl addresses the agent by; the
+    /// manual restart hint must use the SAME label or the operator's
+    /// copy-paste restarts nothing. (Systemd names the unit by filename,
+    /// pinned by the unit_path tests on Linux.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_label_is_stable_and_used_by_the_restart_hint() {
+        assert_eq!(imp::LABEL, "com.decent-render.decent");
+        let hint = manual_restart_hint();
+        assert!(
+            hint.contains(imp::LABEL),
+            "hint {hint:?} must address the installed label"
+        );
+    }
+
+    /// The log FILENAME must be decent.log on both platforms — `decent
+    /// status` prints one path shape regardless of OS, and operators grep
+    /// for it in runbooks.
+    #[test]
+    fn log_file_is_named_decent_log_beside_the_token() {
+        let token = PathBuf::from("/var/lib/op/.config/decent/worker-token");
+        let log = default_log_path(&token).unwrap();
+        assert_eq!(log.file_name().unwrap(), "decent.log");
+        assert_eq!(log.parent().unwrap(), token.parent().unwrap());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_unit_starts_at_boot_not_just_on_demand() {

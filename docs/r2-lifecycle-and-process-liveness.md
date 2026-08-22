@@ -239,4 +239,35 @@ behavior; local experiments for the Docker rows.
   inspect.py, exp_pidfd.py) and their outputs as captured above.
 - Docker image used: `python:3.12-alpine` (fresh pull).
 
+---
+
+## Addendum (packet 12, 2026-08-22): Bun signal-delivery ordering on Linux
+
+Packet 11's runner-core cancel guard relies on a runtime ordering fact first
+proven on macOS only: a SIGTERM delivered during a fully-synchronous section
+(a busy-wait, or the `spawnSync` sequence of `verifyRenderedOutput`) runs its
+`process.on('SIGTERM')` handler at event-loop re-entry BEFORE a
+`setImmediate` scheduled after the sync section. Linux nodes are planned, so
+packet 12 re-ran the identical probes under Linux Bun in Docker
+(`oven/bun:latest`, Bun 1.4.0, Debian, linux/arm64; host Docker 29.1.2):
+
+| probe | runs | result |
+|---|---|---|
+| signal during 1s busy-wait sync section, then `await setImmediate` | 20 | handler-before-setImmediate **20/20** |
+| signal during `spawnSync('/bin/sleep', ['1'])` (the verify shape), then yield | 20 | handler-before-setImmediate **20/20** |
+| NO yield — `fetch()` invoked straight after the sync section | 10 | handler ran after `fetch-invoked` but BEFORE any bytes reached the wire (server saw no request) **10/10** |
+
+**Conclusion: Linux holds the same ordering as macOS** (packet 11: 40/40 +
+10/10 on Bun 1.3.3 / macOS 26.1 / arm64). The pre-PUT `setImmediate` yield in
+`renderJob` is contractually sound on both platforms, and even without the
+yield the handler won the wire race in every run on both platforms — still
+treated as runtime luck, not contract.
+
+Caveat, stated honestly: the probes ran Bun 1.3.3 (macOS) vs 1.4.0 (Linux) —
+a minor-version skew, not a controlled same-version comparison. The payloads
+pin whatever Bun compiles them; if a payload ever moves to a Bun version
+whose signal handling changed, these probes are the regression check to
+re-run (scripts preserved in `/tmp/p11-probe/`, packet-12 copies in
+`/tmp/p12-docker/`).
+
 DECENT_RESEARCH_R2_DONE
