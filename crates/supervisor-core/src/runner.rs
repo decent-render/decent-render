@@ -87,6 +87,14 @@ pub(crate) fn parse_workdir_bytes_override(raw: Option<&str>) -> u64 {
 pub struct InFlightJob {
     pub job_id: String,
     pub cancel: Option<oneshot::Sender<()>>,
+    /// The cache keys (kind:sha) this job is using — its payload, browser
+    /// and bundle shas. Consumed by the post-termination cache sweep so a
+    /// sweep that starts after this job ends can still protect a
+    /// CONCURRENT download... and, more precisely, so the sweep that runs
+    /// at THIS job's termination knows which entries were just used (they
+    /// were touched moments ago, but explicit protection is cheaper to
+    /// reason about than marker recency).
+    pub cache_keys: Vec<String>,
     /// The run_job task itself. The connection loop MUST await this on every
     /// exit path (PACKET 5): cancel triggers teardown, but teardown runs to
     /// completion INSIDE the task — TERM → CANCEL_GRACE → KILL → pidfile
@@ -139,7 +147,7 @@ static WORKER_ROOT_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock:
 /// means `rm -rf` globs pointed at the real cache, and one slightly wrong glob
 /// deletes a real payload. Redirecting the root removes the hazard entirely
 /// rather than managing it.
-fn worker_root() -> anyhow::Result<PathBuf> {
+pub(crate) fn worker_root() -> anyhow::Result<PathBuf> {
     if let Some(root) = WORKER_ROOT_OVERRIDE.get() {
         return Ok(root.clone());
     }
@@ -186,6 +194,10 @@ async fn ensure_artifact(
     let dir = worker_root()?.join(kind).join(sha256);
     if dir.join(marker).exists() {
         tracing::info!(kind, sha = %sha256, path = %dir.display(), "artifact cached");
+        // LRU last-use (cache.rs): atime is unreliable (relatime/noatime),
+        // so the hit itself records recency. Best-effort — a failed touch
+        // must not fail a cache hit; the fallback is the dir mtime.
+        crate::cache::touch_entry_marker(&dir);
         return Ok(dir);
     }
 
@@ -449,6 +461,17 @@ fn workdir_bytes(path: &Path) -> u64 {
 /// test would also cap the 10s cancel-grace tests running beside it and make
 /// them flake. Production passes [`max_job_wall_time`] and
 /// [`max_workdir_bytes`].
+/// The cache keys an assignment pins: its payload sha, browser sha (if
+/// any), and bundle sha. Used for in-flight protection in the cache sweep.
+pub fn cache_keys_for(assign: &JobAssignMessage) -> Vec<String> {
+    let mut keys = vec![format!("payloads:{}", assign.payload_sha256)];
+    if let Some(sha) = assign.browser_sha256.as_deref() {
+        keys.push(format!("browsers:{sha}"));
+    }
+    keys.push(format!("bundles:{}", assign.bundle_sha256));
+    keys
+}
+
 pub async fn run_job(
     assign: JobAssignMessage,
     mut cancel_rx: oneshot::Receiver<()>,

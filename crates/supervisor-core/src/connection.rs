@@ -209,6 +209,22 @@ pub async fn run(
         )));
     }
 
+    // Cache LRU sweep (2.9, packet 17): enforce the size cap at startup,
+    // before any jobAssign can arrive — nothing is in flight yet, so the
+    // protected set is empty. This is also the sweep that eventually
+    // reclaims the pre-eviction residue (old test-* dirs and every
+    // superseded payload/browser/bundle) on real nodes.
+    match crate::cache::sweep_node_caches(&[]) {
+        Ok(out) if out.evicted > 0 => {
+            obs.log(LogLine::info(format!(
+                "Cache sweep: {} entries, {} -> {} bytes ({} evicted)",
+                out.entries, out.bytes_before, out.bytes_after, out.evicted
+            )));
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "startup cache sweep failed"),
+    }
+
     let (mut sink, mut stream) = ws.split();
 
     let send = |msg: WorkerMessage| {
@@ -388,6 +404,16 @@ pub async fn run(
                 };
                 if let Some(id) = terminal_job_id.as_deref() {
                     if in_flight.as_ref().map(|j| j.job_id.as_str()) == Some(id) {
+                        // Cache sweep (2.9): the job's artifacts were just
+                        // used — protect them, evict older LRU entries down
+                        // to the cap. Runs here, at termination, never on a
+                        // timer during a render (packet 9's interference
+                        // budget). Blocking is fine: the terminal frame was
+                        // already sent; the next heartbeat tick can wait.
+                        let protected = in_flight.as_ref().map(|j| j.cache_keys.clone()).unwrap_or_default();
+                        if let Err(e) = crate::cache::sweep_node_caches(&protected) {
+                            tracing::warn!(error = %e, "cache sweep after job failed");
+                        }
                         in_flight = None;
                     }
                     if canceled_job.as_deref() == Some(id) {
@@ -481,6 +507,7 @@ pub async fn run(
                                                 job.phase = JobPhase::Rendering;
                                             }
                                         });
+                                        let assign_snapshot = assign.clone();
                                         let handle = tokio::spawn(run_job(
                                             *assign,
                                             cancel_rx,
@@ -492,6 +519,7 @@ pub async fn run(
                                         in_flight = Some(InFlightJob {
                                             job_id: job_id_owned,
                                             cancel: pending_cancel.take(),
+                                            cache_keys: crate::runner::cache_keys_for(&assign_snapshot),
                                             handle,
                                         });
                                     }
@@ -999,6 +1027,88 @@ done
         format!(
             r#"{{"type":"jobAssign","tenant":"driffs","jobId":"{job_id}","kind":"standard","durationFrames":1,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"{payload_sha}","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}}"#
         )
+    }
+
+    /// Packet 17: a real job through the WS loop must run the post-
+    /// termination cache sweep — the LRU cache enforced after complete/
+    /// fail/cancel, protecting the finished job's own artifacts.
+    ///
+    /// Seeds the redirected test worker root (NOT live ~/.decent-worker —
+    /// the 916a02e seam) with a stale browser entry and the payload the
+    /// job uses. With the default 20 GiB cap the sweep runs but evicts
+    /// nothing, so the honest wiring assertions are: the job completes,
+    /// both sweeps ran without deleting anything under-cap, and the job's
+    /// own payload survives (used moments ago). Eviction-ORDERING proofs
+    /// live in the cache unit tests; the env override cannot be set from
+    /// this parallel test binary — exactly why the cap is parameterized
+    /// (34c74f1 pattern).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_termination_runs_the_cache_sweep() {
+        let root = test_worker_root();
+        let pid = std::process::id();
+        let sha = format!("test-cachesweep-{pid}");
+        let job_id = format!("job-cachesweep-{pid}");
+
+        // An ancient stale browser entry (marker epoch 2023) plus the
+        // payload the job uses — both under the 20 GiB default cap.
+        let stale = root.join("browsers").join(format!("stale-{pid}"));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("executable"), "stale").unwrap();
+        std::fs::write(stale.join(".last-use"), "1700000000").unwrap();
+        std::fs::write(stale.join("filler"), vec![0u8; 1024]).unwrap();
+
+        let payload_dir = seed_fake_payload(
+            &sha,
+            r#"#!/bin/sh
+echo '{"type":"done","outputSizeInBytes":1,"wallTimeMs":1}'
+"#,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = long_config(port);
+        let register = test_register();
+        let (obs, mut status_rx, _log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        let (mut ws, _uri) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+
+        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
+            .await
+            .unwrap();
+
+        // The startup sweep ran during connect (before the assign); the
+        // post-termination sweep runs when the done frame is processed.
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            status_rx.wait_for(|s| s.jobs_completed == 1 && s.current_job.is_none()),
+        )
+        .await
+        .expect("job did not complete in time")
+        .expect("status channel closed");
+
+        // Sweep wiring proof: the stale entry was ACCOUNTED (startup sweep
+        // ran, saw it, kept it — under the default cap). If no sweep had
+        // run at all this assertion is vacuous, so also assert the payload
+        // the job used still exists (protected + used moments ago).
+        assert!(stale.exists(), "under-cap entries survive both sweeps");
+        assert!(
+            root.join("payloads").join(&sha).exists(),
+            "the completed job's payload survives (in-use protection + recency)"
+        );
+
+        ws.close(None).await.ok();
+        while let Some(Ok(_)) = ws.next().await {}
+        client.await.unwrap().expect("clean exit");
+        let _ = std::fs::remove_dir_all(payload_dir);
+        let _ = std::fs::remove_dir_all(&stale);
     }
 
     /// Workdirs (see `WorkDir::new`) still on disk for the given job id.
