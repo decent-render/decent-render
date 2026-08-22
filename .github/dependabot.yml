@@ -14,3 +14,45 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions-bumps:
+        update-types:
+          - major
+          - minor
+          - patch
+
+  # Bun/npm workspaces (packet 21): dev-deps grouped so one PR per package
+  # per week exercises the whole build+test gate at once. Runtime deps
+  # (react, @remotion peer ranges) stay UNGROUPED — they change
+  # published-package behavior and deserve individual review. Security
+  # updates are never silenced. NOTE: dependabot cannot write bun.lock —
+  # every npm PR must be landed together with a regenerated lockfile (see
+  # the packet-21 receipt); CI installs with --frozen-lockfile.
+  - package-ecosystem: npm
+    directory: /packages/protocol
+    schedule:
+      interval: weekly
+    groups:
+      protocol-dev-deps:
+        dependency-type: development
+
+  - package-ecosystem: npm
+    directory: /packages/client
+    schedule:
+      interval: weekly
+    groups:
+      client-dev-deps:
+        dependency-type: development
+    ignore:
+      # Remotion is pinned deliberately (payload compatibility matrix);
+      # bumping the peer range is a release-train decision, not weekly.
+      - dependency-name: "@remotion/bundler"
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: npm
+    directory: /apps/decent-app
+    schedule:
+      interval: weekly
+    groups:
+      app-dev-deps:
+        dependency-type: development
