@@ -14,7 +14,7 @@
 //! There is no `ServerMessageHandler` trait — the observation mechanism is
 //! the [`Observability`] bundle alone. One mechanism, not two.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context};
 use futures_util::{SinkExt, StreamExt};
@@ -56,6 +56,17 @@ pub struct ConnectionConfig {
     /// smoke-test heartbeat limit, upgrade-required close — still end the
     /// run. Tests that pin a single session's teardown set this to false.
     pub reconnect: bool,
+    /// PACKET 28: base delay for the jittered exponential reconnect
+    /// backoff (attempt n targets base·2^(n−1), full jitter below, capped
+    /// at `reconnect_backoff_max`). The initial-connect retry loop inside
+    /// a session keeps the FLAT `connect_retry_delay` — launchd/systemd
+    /// restart policy owns cold-start cadence.
+    pub reconnect_backoff_base: Duration,
+    /// PACKET 28: hard cap on the reconnect backoff target (and thus on
+    /// any jittered delay — jitter is drawn in [0, target], never above).
+    /// Doubles as the healthy-session threshold: a session that stayed
+    /// connected this long resets the curve.
+    pub reconnect_backoff_max: Duration,
 }
 
 impl ConnectionConfig {
@@ -69,6 +80,8 @@ impl ConnectionConfig {
             heartbeat_limit: None,
             allow_real_jobs: false,
             reconnect: true,
+            reconnect_backoff_base: Duration::from_secs(1),
+            reconnect_backoff_max: Duration::from_secs(60),
         }
     }
 
@@ -688,6 +701,107 @@ async fn run_session(
     }
 }
 
+/// PACKET 28: jittered exponential backoff for the disconnect→reconnect
+/// loop (packet 23's OWED hardening; flat 1s reconnect = thundering herd
+/// when a dispatch redeploy disconnects the whole fleet at once).
+///
+/// Schedule: attempt n targets `min(max, base·2^(n−1))`; the actual delay
+/// is uniformly random in [0, target] — FULL jitter (AWS "Exponential
+/// Backoff and Jitter", full-jitter variant). Full rather than equal
+/// jitter deliberately: a fleet reconnecting after a simultaneous
+/// redeploy needs the retries SPREAD across the whole window [0, target],
+/// not clustered near target the way equal jitter's [target/2, target]
+/// does — the herd is densest at the low end right after a restart, and
+/// full jitter thins it maximally. Cost: full jitter occasionally
+/// reconnects near 0s; that is fine — dispatch accepting a connection is
+/// the success signal, and the next failure re-enters the curve.
+///
+/// RNG: a xorshift64 seeded from the system clock (no `rand` dependency
+/// for one uniform draw; xorshift64 is a well-studied fast PRNG with a
+/// 2^64−1 period, plenty for reconnect timing). Tests inject a canned
+/// `f64` source for determinism — no pigeonhole `nanos % n` jitter.
+///
+/// Reset rule: a session that stayed connected ≥ `max` is healthy, so the
+/// next disconnect starts a FRESH exponential cycle (a node that held for
+/// a full cap-window before dying is not in a crash loop).
+struct ReconnectBackoff {
+    base: Duration,
+    max: Duration,
+    /// Consecutive reconnect attempts without a healthy session.
+    attempt: u32,
+    /// Uniform source in [0, 1); production seeds xorshift64 from
+    /// SystemTime; tests inject a canned value.
+    rng: Box<dyn FnMut() -> f64 + Send>,
+}
+
+impl ReconnectBackoff {
+    fn new(base: Duration, max: Duration) -> Self {
+        let seed = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15)
+            | 1; // xorshift64 state must be nonzero
+        let mut state = seed;
+        ReconnectBackoff {
+            base,
+            max,
+            attempt: 0,
+            rng: Box::new(move || {
+                // xorshift64*
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                ((state.wrapping_mul(0x2545F4914F6CDD1D)) >> 11) as f64 / (1u64 << 53) as f64
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_canned_rng(
+        base: Duration,
+        max: Duration,
+        canned: impl FnMut() -> f64 + Send + 'static,
+    ) -> Self {
+        ReconnectBackoff {
+            base,
+            max,
+            attempt: 0,
+            rng: Box::new(canned),
+        }
+    }
+
+    /// The exponential target for the upcoming attempt (pre-jitter),
+    /// capped at `max`.
+    fn target(&self) -> Duration {
+        // base·2^(attempt) — saturating so a pathological attempt count
+        // cannot overflow (and the cap binds first anyway).
+        // Duration::saturating_mul takes u32; cap the shift so the
+        // factor fits (2^32 ≈ 4.3e9 × any sane base already exceeds the
+        // 60s cap long before attempt 32).
+        let shift = self.attempt.min(31);
+        let factor = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+        let grown = self.base.saturating_mul(factor);
+        grown.min(self.max)
+    }
+
+    /// Next delay: full jitter in [0, target], target ≤ max. The attempt
+    /// counter advances here (this call IS the retry).
+    fn next_delay(&mut self) -> Duration {
+        let target = self.target();
+        self.attempt = self.attempt.saturating_add(1);
+        let u = (self.rng)().clamp(0.0, 1.0);
+        target.mul_f64(u)
+    }
+
+    /// Record how long the last session stayed connected; ≥ max resets
+    /// the curve (healthy node → fresh exponential next time).
+    fn session_lasted(&mut self, connected_for: Duration) {
+        if connected_for >= self.max {
+            self.attempt = 0;
+        }
+    }
+}
+
 /// PACKET 23: the process-level entry point callers use.
 ///
 /// Wraps [`run_session`] in the reconnect loop: any non-terminal
@@ -728,7 +842,16 @@ pub async fn run(
         s.update_available = None;
     });
 
+    // PACKET 28: jittered exponential backoff replaces the flat
+    // connect_retry_delay here (packet 23's OWED: a dispatch redeploy
+    // disconnects the whole fleet at once; flat 1s reconnects = thundering
+    // herd). The initial-connect retry loop INSIDE a session keeps the
+    // flat delay — launchd/systemd own cold-start cadence.
+    let mut backoff =
+        ReconnectBackoff::new(config.reconnect_backoff_base, config.reconnect_backoff_max);
+
     loop {
+        let session_start = std::time::Instant::now();
         match run_session(config, &request, register, obs, &mut shutdown).await {
             Ok(Disconnect::Shutdown)
             | Ok(Disconnect::HeartbeatLimit)
@@ -739,9 +862,14 @@ pub async fn run(
                 if !config.reconnect {
                     return Ok(());
                 }
+                // A session that held ≥ the cap-window was healthy: start
+                // a fresh exponential cycle. A short one keeps climbing.
+                backoff.session_lasted(session_start.elapsed());
+                let retry_delay = backoff.next_delay();
                 tracing::warn!(
                     reason = ?disconnect,
-                    retry_delay_ms = config.connect_retry_delay.as_millis(),
+                    retry_delay_ms = retry_delay.as_millis(),
+                    backoff_attempt = backoff.attempt,
                     "disconnected from dispatch — reconnecting"
                 );
                 obs.log(LogLine::warn("Dispatch disconnected — reconnecting…"));
@@ -753,7 +881,7 @@ pub async fn run(
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                         return Ok(());
                     }
-                    _ = tokio::time::sleep(config.connect_retry_delay) => {}
+                    _ = tokio::time::sleep(retry_delay) => {}
                 }
             }
             Err(e) => return Err(e),
@@ -2886,6 +3014,8 @@ while true; do sleep 5; done
             connect_retry_delay: Duration::from_millis(50),
             heartbeat_limit: None,
             reconnect: true,
+            reconnect_backoff_base: Duration::from_millis(50),
+            reconnect_backoff_max: Duration::from_secs(1),
             ..ConnectionConfig::new(format!("ws://127.0.0.1:{port}/ws"), "test-jwt.token")
         };
         let register = test_register();
@@ -2916,6 +3046,132 @@ while true; do sleep 5; done
 
         drop(ws);
         client.abort();
+    }
+
+    // ── PACKET 28: ReconnectBackoff unit tests ────────────────────────────
+
+    fn backoff_with(
+        base_ms: u64,
+        max_s: u64,
+        canned: impl FnMut() -> f64 + Send + 'static,
+    ) -> ReconnectBackoff {
+        ReconnectBackoff::with_canned_rng(
+            Duration::from_millis(base_ms),
+            Duration::from_secs(max_s),
+            canned,
+        )
+    }
+
+    #[test]
+    fn backoff_bounds_every_delay_within_cap() {
+        // For n = 1..=8 with base=1s/max=60s and an adversarial rng=0.999,
+        // every delay must lie in [0, 60s].
+        for _ in 0..8 {
+            let mut b = backoff_with(1000, 60, || 0.999);
+            for _ in 1..=8u32 {
+                let d = b.next_delay();
+                assert!(d <= Duration::from_secs(60), "delay {d:?} above cap");
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_growth_mean_increases_and_attempts_separate() {
+        // rng=0.999 → delay ≥ 0.9·target (target=base·2^(n-1), pre-cap):
+        // attempt 1 ≈ 1s, attempt 4 ≈ 8s — clearly separated.
+        let mut b = backoff_with(1000, 60, || 0.999);
+        let d1 = b.next_delay();
+        b.next_delay();
+        b.next_delay(); // attempts 2, 3
+        let d4 = b.next_delay();
+        assert!(d1 >= Duration::from_millis(900), "attempt1 {d1:?}");
+        assert!(d1 <= Duration::from_secs(1));
+        assert!(
+            d4 >= Duration::from_millis(7200),
+            "attempt4 {d4:?} (≥0.9·8s)"
+        );
+        assert!(d4 > d1 * 4, "growth: {d4:?} vs 4×{d1:?}");
+
+        // Mean grows with n (canned 0.5): expected = target/2.
+        let mut b2 = backoff_with(1000, 60, || 0.5);
+        let m1 = b2.next_delay();
+        for _ in 0..2 {
+            b2.next_delay();
+        }
+        let m4 = b2.next_delay();
+        assert!(m4 > m1, "mean growth {m1:?} → {m4:?}");
+    }
+
+    #[test]
+    fn backoff_cap_binds_target_not_jitter() {
+        // base=1s: attempt 7 targets 64s > cap 60s → target clamps to 60s;
+        // rng=0.999 still ≤ 60s.
+        let mut b = backoff_with(1000, 60, || 0.999);
+        for _ in 0..6 {
+            b.next_delay();
+        }
+        assert_eq!(b.target(), Duration::from_secs(60));
+        let d = b.next_delay();
+        assert!(d <= Duration::from_secs(60));
+        assert!(d >= Duration::from_secs(59), "0.999·60s ≈ 60s: {d:?}");
+        // and deeper attempts stay pinned
+        assert_eq!(b.target(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn backoff_full_jitter_variance() {
+        // Oscillating canned rng at the same attempt index → different
+        // delays; extremes rng=0 → 0, rng→1 → target.
+        // Oscillating rng: consecutive draws differ, so consecutive
+        // delays differ (a≈0.99s, c≈20ms — same generator, same curve
+        // position ±1, different jitter outcomes).
+        let mut b = backoff_with(1000, 60, {
+            let mut hi = false;
+            move || {
+                hi = !hi;
+                if hi {
+                    0.99
+                } else {
+                    0.01
+                }
+            }
+        });
+        let a = b.next_delay(); // attempt 1, rng 0.99 → ~0.99s
+        let c = b.next_delay(); // attempt 2, rng 0.01 → 0.01·2s = 20ms
+        assert!(a != c);
+        assert!(a >= Duration::from_millis(980), "a={a:?}");
+        assert!(c <= Duration::from_millis(21), "c={c:?}");
+
+        let mut lo = backoff_with(1000, 60, || 0.0);
+        assert_eq!(lo.next_delay(), Duration::ZERO);
+        let mut hi = backoff_with(1000, 60, || 0.999999);
+        let d = hi.next_delay();
+        assert!(d >= Duration::from_millis(999), "near-target: {d:?}");
+        assert!(d <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backoff_reset_on_healthy_session_only() {
+        // Short session: curve keeps climbing.
+        let mut b = backoff_with(1000, 60, || 0.999);
+        b.next_delay(); // attempt 1
+        b.next_delay(); // attempt 2
+        b.session_lasted(Duration::from_secs(5)); // « max
+        assert_eq!(b.target(), Duration::from_secs(4), "attempt 3 target");
+        // Healthy session (≥ max): resets to cycle-1 scale.
+        b.session_lasted(Duration::from_secs(60));
+        assert_eq!(b.target(), Duration::from_secs(1), "fresh cycle");
+    }
+
+    #[test]
+    fn backoff_saturates_instead_of_overflowing() {
+        let mut b = backoff_with(1000, 60, || 0.5);
+        for _ in 0..1000 {
+            b.next_delay();
+        }
+        assert_eq!(b.target(), Duration::from_secs(60));
+        let d = b.next_delay();
+        assert!(d <= Duration::from_secs(60));
     }
 
     /// Set SO_LINGER(0) on the stream and drop it → the peer sees RST, not
@@ -2957,6 +3213,8 @@ while true; do sleep 5; done
             connect_retry_delay: Duration::from_millis(50),
             heartbeat_limit: None,
             reconnect: true,
+            reconnect_backoff_base: Duration::from_millis(50),
+            reconnect_backoff_max: Duration::from_secs(1),
             ..ConnectionConfig::new(format!("ws://127.0.0.1:{port}/ws"), "test-jwt.token")
         };
         let register = test_register();
