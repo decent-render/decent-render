@@ -9,6 +9,13 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell", "homebrew"]
+# Publish jobs to run after a successful release build. Without this key,
+# cargo-dist generates the homebrew formula but never pushes it to the tap —
+# v0.0.8's formula had to be committed by hand (tap 5963aa0). With it, the
+# generated release.yml gains the publish-homebrew job.
+publish-jobs = ["homebrew"]
+tap = "decent-render/homebrew-tap"
+formula = "decent"
 # Target platforms to build apps for (Rust target-triple syntax).
 #
 # Intel Macs are excluded because the render payloads are arm64-compiled.
@@ -45,9 +52,13 @@ precise-builds = true
 "actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" # v7
 "actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" # v8
 
-# Homebrew tap — cargo-dist generates Formula/<crate>.rb and pushes on tag.
-# Requires HOMEBREW_TAP_TOKEN secret in the repo (GitHub PAT with repo scope
-# on decent-render/homebrew-tap).
+# Homebrew tap — cargo-dist generates Formula/<crate>.rb and pushes it on
+# tag via the publish-homebrew-formula job in release.yml. Requires the
+# HOMEBREW_TAP_TOKEN secret in the repo (GitHub PAT with repo scope on
+# decent-render/homebrew-tap). NOTE: `tap` and `formula` are FLAT keys in
+# [dist] — cargo-dist 0.32 does not read a [dist.homebrew] table; the old
+# table is why v0.0.8's formula never got pushed (manual tap commit 5963aa0)
+# and why `dist generate` warned "no tap was specified".
 #
 # The tap is the macOS story: `decent upgrade` is `brew upgrade` there. Linux
 # operators get the generated shell installer instead. Homebrew does run on
@@ -58,6 +69,4 @@ precise-builds = true
 # formula. That also fixes a latent bug in the single-target formula: it carried
 # `depends_on arch: :arm64` with no `depends_on :macos`, so Homebrew-on-Linux
 # arm64 would have installed a Mach-O binary that cannot exec.
-[dist.homebrew]
-formula = "decent"
-tap = "decent-render/homebrew-tap"
+

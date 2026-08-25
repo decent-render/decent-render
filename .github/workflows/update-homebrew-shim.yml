@@ -1,6 +1,14 @@
 # Auto-update Formula/decent-node.rb (the deprecated compatibility shim) on
 # every successful release. The primary Formula/decent.rb is handled by
-# cargo-dist's built-in homebrew installer.
+# cargo-dist's built-in homebrew installer (publish-homebrew-formula job in
+# release.yml).
+#
+# The shim is DEPRECATED by design and recent releases do not ship the
+# decent-node-* artifact. When the release has no shim artifact, this
+# workflow prints "shim artifact not in release — skipping" and exits 0
+# (a graceful skip, not a failure; v0.0.8 failed loudly here because the
+# SHA fetch 404'd). Releases that DO ship the shim still update the
+# formula — this is not a removal.
 #
 # Requires HOMEBREW_TAP_TOKEN secret (GitHub PAT with repo scope on
 # decent-render/homebrew-tap).
@@ -22,13 +30,24 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - name: Determine version and artifact SHA
+      - name: Determine version, check for shim artifact, fetch its SHA
         id: info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.event.workflow_run.head_branch }}"
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # Graceful skip: if this release contains no decent-node-* asset,
+          # there is nothing to update — exit 0 without noise.
+          ASSETS=$(gh release view "$TAG" --repo decent-render/decent-render --json assets --jq '.assets[].name')
+          if ! echo "$ASSETS" | grep -q '^decent-node-'; then
+            echo "shim artifact not in release — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # Fetch the SHA256 of the shim artifact
           SHA=$(curl -sL "https://github.com/decent-render/decent-render/releases/download/${TAG}/decent-node-aarch64-apple-darwin.tar.xz.sha256" | awk '{print $1}')
@@ -39,6 +58,7 @@ jobs:
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Update Formula/decent-node.rb
+        if: ${{ steps.info.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
