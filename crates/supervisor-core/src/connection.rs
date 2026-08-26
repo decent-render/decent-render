@@ -332,11 +332,24 @@ async fn run_session(
         _ => {}
     };
 
-    sink.send(Message::Text(send(WorkerMessage::Register(
-        register.clone(),
-    ))))
-    .await
-    .context("failed to send register")?;
+    // PACKET 37: a failed send is a DEAD SOCKET, not a session error to
+    // propagate — `?` here skipped drain_in_flight_jobs (stranding a
+    // mid-grace render tree) and bypassed the packet-23 reconnect design.
+    // This is the register frame, before any job exists, so there is
+    // nothing to drain yet — the reconnect path is what matters.
+    if sink
+        .send(Message::Text(send(WorkerMessage::Register(
+            register.clone(),
+        ))))
+        .await
+        .is_err()
+    {
+        obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+        obs.log(LogLine::warn(
+            "Register send failed — reconnecting".to_string(),
+        ));
+        return Ok(Disconnect::Abnormal);
+    }
 
     obs.update_status(|s| s.connection = ConnectionState::Registered);
     obs.log(LogLine::info(format!(
@@ -363,7 +376,23 @@ async fn run_session(
     // `run()` awaits it on EVERY exit path so the TERM -> grace -> SIGKILL ->
     // browser-sweep -> purge sequence cannot be abandoned when the socket
     // dies mid-grace (dispatch redeploy / network blip).
-    let mut draining: Option<InFlightJob> = None;
+    //
+    // PACKET 37 (audit 5): a Vec, not a slot — assign→cancel→assign→cancel
+    // used to OVERWRITE the first teardown and detach its handle. Bounded by
+    // the busy-gate above (in_flight.is_some() rejects new assigns while a
+    // job runs) plus the draining count below: at most a handful of
+    // cancels per session can stack before the heartbeat advertises the
+    // load. Hard cap for pathological peers: extra cancels beyond the cap
+    // are still CANCELED and their handles awaited at drain — only the
+    // per-cancel status bookkeeping is capped, never the completion
+    // guarantee.
+    let mut draining: Vec<InFlightJob> = Vec::new();
+    // Purge failures already announced through obs.log (announce-once).
+    let mut announced_purge_failures: Vec<std::path::PathBuf> = Vec::new();
+    /// Teardowns are bounded by real job count; this cap only guards the
+    /// Vec against a pathological cancel flood (each cancel requires a real
+    /// prior jobAssign, so legitimate traffic stays far below it).
+    const MAX_DRAINING_TEARDOWNS: usize = 16;
 
     // PACKET 5: teardown completion guarantee. Every exit path must cancel
     // the in-flight job AND await its task to completion before run() returns.
@@ -375,24 +404,30 @@ async fn run_session(
     // construction: TERM-grace(10s) + KILL + wait + sweep are all bounded.
     async fn drain_in_flight_jobs(
         in_flight: &mut Option<InFlightJob>,
-        draining: &mut Option<InFlightJob>,
+        draining: &mut Vec<InFlightJob>,
     ) {
         if let Some(mut job) = in_flight.take() {
             let _ = job.cancel.take().map(|tx| tx.send(()));
             // The job already had its chance to report; the socket is gone.
             let _ = job.handle.await;
         }
-        // A job canceled by dispatch moments before the socket died: its
-        // terminate (TERM -> grace -> SIGKILL -> sweep -> purge) is still
-        // running inside the job task. Await it to completion — abandoning
-        // it here is exactly the stranded-tree defect this packet fixes.
-        if let Some(job) = draining.take() {
+        // PACKET 37: await EVERY in-progress teardown (was a single slot —
+        // a second cancel detached the first). Completion is guaranteed for
+        // all of them; the Vec is bounded by MAX_DRAINING_TEARDOWNS.
+        for job in draining.drain(..) {
             let _ = job.handle.await;
         }
     }
 
     loop {
-        let current_job_count = u32::from(in_flight.is_some());
+        // PACKET 37 (audit 12): count draining teardowns too — a node that
+        // reports idle while still tearing down gets double-assigned by
+        // dispatch. Dispatch treats this as a load signal only (its
+        // assignPendingJobs already requeues on timeout), so a transient
+        // nonzero count is safe; permanent idleness is impossible because
+        // teardowns always complete (drain awaits them).
+        let current_job_count =
+            u32::from(in_flight.is_some()) + u32::try_from(draining.len()).unwrap_or(u32::MAX);
         tokio::select! {
             // Graceful shutdown: cancel in-flight job, close socket, exit.
             _ = &mut *shutdown => {
@@ -417,6 +452,33 @@ async fn run_session(
                 return Ok(Disconnect::Shutdown);
             }
             _ = heartbeat.tick() => {
+                // PACKET 37 (audit 4): surface un-purged workdirs to the
+                // OPERATOR (TUI log pane + daemon log via obs.log), not just
+                // tracing. Announced once per path until it clears.
+                {
+                    let outstanding = crate::purge::outstanding_purge_failures();
+                    for failure in &outstanding {
+                        if !announced_purge_failures.contains(&failure.path) {
+                            announced_purge_failures.push(failure.path.clone());
+                            obs.log(LogLine::error(format!(
+                                "PURGE INCOMPLETE: {} still holds render content ({}, {} attempts) — the sweep will retry",
+                                failure.path.display(),
+                                failure.error,
+                                failure.attempts
+                            )));
+                            obs.update_status(|s| {
+                                s.jobs_purge_pending = outstanding.len() as u32;
+                            });
+                        }
+                    }
+                    if outstanding.is_empty() && !announced_purge_failures.is_empty() {
+                        announced_purge_failures.clear();
+                        obs.update_status(|s| s.jobs_purge_pending = 0);
+                        obs.log(LogLine::info(
+                            "All previously failed purges have been reclaimed".to_string(),
+                        ));
+                    }
+                }
                 let msg = WorkerMessage::Heartbeat(HeartbeatMessage {
                     tenant: register.tenant.clone(),
                     current_job_count,
@@ -572,11 +634,30 @@ async fn run_session(
                                             });
                                         });
                                         obs.log(LogLine::info(format!("Job {} assigned — accepting", assign.job_id)));
-                                        sink.send(Message::Text(send(WorkerMessage::JobAccepted(JobAcceptedMessage {
+                                        // PACKET 37: a failed jobAccepted send is
+                                        // a dead socket mid-session. `?` here
+                                        // returned straight out of run_session
+                                        // WITHOUT draining — and a job may already
+                                        // be running below, mid-TERM-grace; the
+                                        // dropped handle strands the render tree
+                                        // (the exact defect packet 5 fixed for
+                                        // every OTHER send site). Same treatment:
+                                        // drain, then reconnect.
+                                        if sink.send(Message::Text(send(WorkerMessage::JobAccepted(JobAcceptedMessage {
                                             tenant: assign.tenant.clone(),
                                             job_id: assign.job_id.clone(),
                                             attempt: assign.attempt,
-                                        })))).await.context("failed to send jobAccepted")?;
+                                        })))).await.is_err() {
+                                            obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                                            obs.log(LogLine::warn(
+                                                "jobAccepted send failed — draining and reconnecting".to_string(),
+                                            ));
+                                            // No in-flight job yet on THIS path (the
+                                            // spawn is below), but drain anyway for
+                                            // uniformity and safety against reorders.
+                                            drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                                            return Ok(Disconnect::Abnormal);
+                                        }
                                         // Transition to rendering phase once the runner starts.
                                         obs.update_status(|s| {
                                             if let Some(job) = &mut s.current_job {
@@ -616,11 +697,44 @@ async fn run_session(
                                             });
                                             let _ = job.cancel.take().map(|tx| tx.send(()));
                                             obs.log(LogLine::warn(format!("Job {} canceled by dispatch", cancel.job_id)));
-                                            // PACKET 5: keep ownership of the task. The
+                                            // PACKET 37 (4c): canceled jobs need the
+                                            // post-job cache sweep too — in_flight is
+                                            // None from here on, so the terminal-frame
+                                            // path below would never run it. Run it
+                                            // NOW with this job's cache keys protected
+                                            // (same shape as the terminal-frame sweep).
+                                            {
+                                                let protected = job.cache_keys.clone();
+                                                match crate::cache::sweep_node_caches(&protected) {
+                                                    Ok(out) if out.evicted > 0 => {
+                                                        obs.log(LogLine::info(format!(
+                                                            "Cache sweep: {} entries, {} -> {} bytes ({} evicted)",
+                                                            out.entries, out.bytes_before, out.bytes_after, out.evicted
+                                                        )));
+                                                    }
+                                                    Ok(_) => {}
+                                                    Err(e) => tracing::warn!(error = %e, "cache sweep after cancel failed"),
+                                                }
+                                            }
+                                            // PACKET 5 + 37: keep ownership of the task. The
                                             // terminate sequence runs INSIDE this task;
                                             // dropping the handle here would orphan it
-                                            // mid-grace if the socket dies next.
-                                            draining = Some(job);
+                                            // mid-grace if the socket dies next. Pushed to
+                                            // the Vec (was a single slot that a second
+                                            // cancel would overwrite — audit 5).
+                                            if draining.len() < MAX_DRAINING_TEARDOWNS {
+                                                draining.push(job);
+                                            } else {
+                                                // Over the cap (pathological peer): still
+                                                // await the handle — just inline here, the
+                                                // completion guarantee is never skipped.
+                                                tracing::warn!(
+                                                    job_id = %cancel.job_id,
+                                                    draining = draining.len(),
+                                                    "draining teardowns over cap — awaiting inline"
+                                                );
+                                                let _ = job.handle.await;
+                                            }
                                         }
                                     }
                                     ServerMessage::Cancel(_) => {}
