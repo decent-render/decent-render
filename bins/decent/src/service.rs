@@ -117,15 +117,31 @@ mod imp {
             .unwrap_or_default()
     }
 
+    /// PACKET 40 (audit 7): launchctl prints TAB-separated rows
+    /// (`PID\tStatus\tLabel`). Substring matching was wrong in BOTH
+    /// directions: LEGACY_LABEL ("com.decent-render.decent-node") contains
+    /// LABEL as a substring, so `contains(LABEL)` was true whenever the
+    /// legacy agent was loaded — `legacy_daemon_is_loaded()` could never
+    /// fire and `is_loaded()` reported Running for a legacy-only install,
+    /// making `decent pause` contradict `decent status`. Match the label
+    /// as an EXACT trailing field of a row.
+    pub(super) fn label_is_loaded(out: &str, label: &str) -> bool {
+        out.lines().any(|line| {
+            line.rsplit('\t')
+                .next()
+                .is_some_and(|field| field.trim() == label)
+        })
+    }
+
     fn is_loaded() -> bool {
         let out = launchctl_list();
-        out.contains(LABEL) || out.contains(LEGACY_LABEL)
+        label_is_loaded(&out, LABEL) || label_is_loaded(&out, LEGACY_LABEL)
     }
 
     /// Is ONLY the legacy decent-node daemon loaded (not the new one)?
     pub(super) fn legacy_daemon_is_loaded() -> bool {
         let out = launchctl_list();
-        out.contains(LEGACY_LABEL) && !out.contains(LABEL)
+        label_is_loaded(&out, LEGACY_LABEL) && !label_is_loaded(&out, LABEL)
     }
 
     /// Unload the legacy decent-node agent if present (one-time migration
@@ -141,10 +157,20 @@ mod imp {
     }
 
     /// Runs `decent start --allow-real-jobs` at login, restarts on exit.
+    /// PACKET 40 (audit 8): XML-escape every interpolated value. A legal
+    /// `?a=1&b=2` dispatch URL (or any path with `&`/`<`) produced an
+    /// INVALID plist launchd silently refuses to load. The old test passed
+    /// only because its URL was benign.
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
     fn build_plist(exe: &Path, dispatch_url: &str, log_path: &Path) -> String {
         let exe_str = exe.to_string_lossy();
         let mut args = String::new();
-        for &arg in &[
+        for arg in [
             exe_str.as_ref(),
             "start",
             "--dispatch-url",
@@ -152,7 +178,7 @@ mod imp {
             "--allow-real-jobs",
         ] {
             args.push_str("        <string>");
-            args.push_str(arg);
+            args.push_str(&xml_escape(arg));
             args.push_str("</string>\n");
         }
         format!(
@@ -184,7 +210,7 @@ mod imp {
 </plist>
 "#,
             label = LABEL,
-            log = log_path.display(),
+            log = xml_escape(&log_path.display().to_string()),
         )
     }
 
@@ -235,12 +261,18 @@ mod imp {
 
     pub fn state() -> DaemonState {
         let present = unit_path().map(|p| p.exists()).unwrap_or(false);
+        // PACKET 40: launchctl listing is MACHINE-GLOBAL — another user's
+        // (or a leftover, or this very machine's REAL daemon while testing
+        // under a different HOME) loaded agent with our label must not make
+        // THIS home's status say "running". The unit FILE is the per-home
+        // truth: no file here ⇒ not installed here, whatever launchd lists.
+        if !present {
+            return DaemonState::NotInstalled;
+        }
         if is_loaded() {
             DaemonState::Running
-        } else if present {
-            DaemonState::Paused
         } else {
-            DaemonState::NotInstalled
+            DaemonState::Paused
         }
     }
 
@@ -417,7 +449,7 @@ mod imp {
              [Install]\n\
              WantedBy=default.target\n",
             exe = spec.exe.display(),
-            url = spec.dispatch_url,
+            url = spec.dispatch_url.replace('%', "%%"),
             log = spec.log_path.display(),
         )
     }
@@ -661,6 +693,62 @@ mod tests {
         assert_eq!(
             default_log_path(&token).unwrap(),
             PathBuf::from("/home/op/.config/decent/decent.log")
+        );
+    }
+
+    // ── PACKET 40 ──────────────────────────────────────────────────────────
+
+    /// AUDIT 7 (label collision): `com.decent-render.decent-node` contains
+    /// `com.decent-render.decent` as a substring, so substring matching made
+    /// legacy_daemon_is_loaded() unreachable and is_loaded() true for a
+    /// legacy-only install (pause contradicting status). These pin EXACT
+    /// field matching against real-shaped launchctl output.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn label_matching_is_exact_not_substring() {
+        // launchctl list rows: PID\tStatus\tLabel
+        let legacy_only = "-\t0\tcom.decent-render.decent-node\n";
+        assert!(super::imp::label_is_loaded(
+            legacy_only,
+            "com.decent-render.decent-node"
+        ));
+        // THE regression: the NEW label must NOT match a legacy-only load.
+        assert!(
+            !super::imp::label_is_loaded(legacy_only, "com.decent-render.decent"),
+            "the new label must not substring-match the legacy label"
+        );
+        let modern = "123\t0\tcom.decent-render.decent\n";
+        assert!(super::imp::label_is_loaded(
+            modern,
+            "com.decent-render.decent"
+        ));
+        assert!(
+            !super::imp::label_is_loaded(modern, "com.decent-render.decent-node"),
+            "the legacy label must not match a modern-only load"
+        );
+    }
+
+    /// AUDIT 8 (plist escaping): a legal dispatch URL with XML-special
+    /// characters must round-trip through the plist as an ESCAPED value —
+    /// raw `&` produces a plist launchd refuses to load.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hostile_but_legal_url_escapes_in_plist() {
+        let hostile = ServiceSpec {
+            exe: PathBuf::from("/opt/decent/bin/decent"),
+            // Legal URL shape carrying XML-hostile characters.
+            dispatch_url: "wss://dispatch.example.com/ws?team=a&env=<prod>".to_string(),
+            log_path: PathBuf::from("/tmp/log&path/decent.log"),
+        };
+        let text = rendered_unit(&hostile);
+        // No RAW special characters inside the document body...
+        assert!(!text.contains("a&env"), "raw & leaked into plist:\n{text}");
+        assert!(!text.contains("<prod>"), "raw < leaked into plist:\n{text}");
+        // ...and the escaped forms ARE present, so the URL round-trips.
+        assert!(text.contains("a&amp;env"), "escaped & missing:\n{text}");
+        assert!(
+            text.contains("&lt;prod&gt;"),
+            "escaped < > missing:\n{text}"
         );
     }
 
