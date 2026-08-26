@@ -116,7 +116,8 @@ decent resume
 decent upgrade
 
 # Or run the foreground terminal dashboard instead of the daemon.
-decent tui --dispatch-url wss://dispatch.example.com/ws --allow-real-jobs
+# (Both default to the production dispatch URL; override with --dispatch-url.)
+decent tui --allow-real-jobs
 ```
 
 Worker tokens are minted by the platform (tenant) you register with. Real jobs

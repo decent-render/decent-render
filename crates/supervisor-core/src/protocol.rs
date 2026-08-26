@@ -407,8 +407,8 @@ mod tests {
         assert!(serde_json::from_value::<ServerMessage>(v).is_err());
     }
 
-    /// Exact dispatch frame from driffs `src/dispatch/dispatcher.ts`:
-    /// `conn.send({type: 'cancel', tenant: job.tenant, jobId: job.id})`.
+    /// Exact dispatch cancel frame (fixture-pinned shape; the frame is
+    /// `conn.send({type: 'cancel', tenant: job.tenant, jobId: job.id})`).
     #[test]
     fn cancel_matches_dispatch_frame() {
         let literal = r#"{"type":"cancel","tenant":"driffs","jobId":"job-render-abc123"}"#;

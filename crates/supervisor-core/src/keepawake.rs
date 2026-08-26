@@ -57,7 +57,8 @@
 //! MAX_JOB_WALL_TIME note in runner.rs: tokio's monotonic clock does not
 //! advance across system sleep). With the idle assertion held, the
 //! hazard shrinks to lid-close/forced sleep; always-on nodes should also
-//! disable idle sleep system-wide (docs/operator-quickstart.md).
+//! disable idle sleep system-wide (e.g. `pmset -a sleep 0` — the
+//! operator's own machine setting, not something decent manages).
 //!
 //! ## Linux
 //!

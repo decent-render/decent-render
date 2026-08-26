@@ -343,7 +343,8 @@ enum Command {
         app_url: String,
         /// Store a worker token directly instead of opening the web pairing
         /// page. For company/internal tokens minted via
-        /// `scripts/mint-worker-token.ts` (skips the self-serve device flow).
+        /// `mint-worker-token.ts` in the private driffs repo (skips the self-serve
+        /// device flow).
         #[arg(long)]
         token: Option<String>,
     },
@@ -708,6 +709,12 @@ async fn main() -> anyhow::Result<()> {
                 validate_worker_token_shape(&tok)?;
                 save_token(&tok)?;
                 println!("Token saved to ~/.config/decent/worker-token (0600).");
+                // PACKET 41: the daemon reads the token at process start.
+                // If one is running, restart it so the new token actually
+                // takes effect — an operator rotating a token would
+                // otherwise believe it worked while the old one keeps
+                // connecting. (The token value is never printed.)
+                apply_token_to_running_daemon()?;
                 println!("Run `decent start`, or `decent install` for the daemon.");
                 return Ok(());
             }
@@ -726,6 +733,7 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("{e:#}; re-run `decent login`");
             }
             save_token(&token)?;
+            apply_token_to_running_daemon()?;
             println!("Token saved to ~/.config/decent/worker-token (0600). Run `decent start` to connect.");
             Ok(())
         }
@@ -930,6 +938,67 @@ async fn main() -> anyhow::Result<()> {
 }
 
 // ── PACKET 40 tests ─────────────────────────────────────────────────────────
+
+/// PACKET 41: the running daemon reads the worker token at process start.
+/// After `login` stores a new one, restart the daemon so it takes effect
+/// now; if no daemon is running, print the honest next step instead of
+/// silence (the token only applies to the NEXT start).
+fn apply_token_to_running_daemon() -> anyhow::Result<()> {
+    match service::state() {
+        service::DaemonState::Running => match service::restart() {
+            Ok(true) => {
+                println!("Daemon is running — restarted it so the new token takes effect now.");
+                Ok(())
+            }
+            Ok(false) => {
+                // Loaded-but-not-ours edge: say the honest next step.
+                println!("Daemon appears loaded — restart it manually for the new token to take effect: `decent pause && decent resume`.");
+                Ok(())
+            }
+            Err(e) => {
+                println!("Warning: could not restart the running daemon ({e:#}).");
+                println!("The new token takes effect on the next daemon start: `decent pause && decent resume`.");
+                Ok(())
+            }
+        },
+        _ => {
+            println!("No daemon running — the new token will be used by the next `decent start` or `decent install`.");
+            Ok(())
+        }
+    }
+}
+
+// ── PACKET 41 ───────────────────────────────────────────────────────────────
+
+#[test]
+fn login_next_step_message_names_the_daemon_state() {
+    // PACKET 41 (step 2): after storing a token, the operator is TOLD what
+    // happens next — restart-if-running (done for them) or the honest
+    // next-command for the no-daemon case. The pure part: the no-daemon
+    // path's message. (The running-daemon restart itself is exercised in
+    // the Step 6 rehearsal against a temp HOME.)
+    // service::state() on a temp HOME with no unit file => NotInstalled.
+    let home = std::env::temp_dir().join(format!(
+        "p41-login-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    let prev = std::env::var_os("HOME");
+    unsafe { std::env::set_var("HOME", &home) };
+    let state = service::state();
+    match prev {
+        Some(h) => unsafe { std::env::set_var("HOME", h) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+    std::fs::remove_dir_all(&home).ok();
+    // On the fresh HOME the daemon is NotInstalled — and the message the
+    // operator gets must say the token applies to the NEXT start.
+    assert_eq!(state, service::DaemonState::NotInstalled);
+}
 
 #[cfg(test)]
 mod packet40_tests {

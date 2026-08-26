@@ -214,26 +214,72 @@ mod imp {
         )
     }
 
+    /// PACKET 41 (step 1): the pre-install unload exists for clean
+    /// reinstalls; on a first install there is nothing to unload and
+    /// launching it anyway prints launchctl's "Load failed" noise as the
+    /// command's first output.
+    pub(super) fn should_attempt_pre_install_unload(plist: &Path) -> bool {
+        plist.exists()
+    }
+
     pub fn install(spec: &ServiceSpec) -> anyhow::Result<InstallReport> {
         unload_legacy_agent();
         let plist = unit_path()?;
         let xml = build_plist(&spec.exe, &spec.dispatch_url, &spec.log_path);
-        // Best-effort unload for a clean reinstall — "not loaded" is the
-        // expected first-install case, not an error.
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", &plist.to_string_lossy()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // PACKET 41: only attempt the pre-install unload when a plist
+        // ALREADY exists (a reinstall). On a first install there is nothing
+        // to unload, and launchctl prints "Load failed: 5: Input/output
+        // error" noise as the command's very first output. A genuine
+        // unload failure during a REAL reinstall stays reported, with the
+        // case named.
+        if should_attempt_pre_install_unload(&plist) {
+            let unload = std::process::Command::new("launchctl")
+                .args(["unload", &plist.to_string_lossy()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .output();
+            if let Ok(out) = unload {
+                if !out.status.success() {
+                    eprintln!(
+                        "Warning: launchctl unload of the existing daemon failed (reinstall): {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+            }
+        }
         std::fs::write(&plist, xml)?;
-        let status = std::process::Command::new("launchctl")
-            .args(["load", &plist.to_string_lossy()])
-            .status()?;
-        if !status.success() {
-            anyhow::bail!(
-                "launchctl load failed; inspect the plist at {}",
-                plist.display()
-            );
+        // PACKET 41: `launchctl load` is legacy-but-quiet; it also prints
+        // "Load failed: 5: Input/output error" to STDERR while still
+        // succeeding through the modern bootstrap path in some states,
+        // which surfaced as the scary first line of a first install.
+        // `launchctl bootstrap` is the documented modern form; capture its
+        // output and only surface it when it actually fails.
+        let uid = current_uid().unwrap_or_default();
+        let bootstrap = std::process::Command::new("launchctl")
+            .args(["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()?;
+        if !bootstrap.status.success() {
+            // bootout-then-bootstrap handles the reinstall case (already
+            // loaded); only then is it a real failure.
+            let _ = std::process::Command::new("launchctl")
+                .args(["bootout", &format!("gui/{uid}"), LABEL])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let retry = std::process::Command::new("launchctl")
+                .args(["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .output()?;
+            if !retry.status.success() {
+                anyhow::bail!(
+                    "launchctl bootstrap failed: {}. Inspect the plist at {}",
+                    String::from_utf8_lossy(&retry.stderr).trim(),
+                    plist.display()
+                );
+            }
         }
 
         let mut notes = vec![format!("agent: {LABEL}")];
@@ -677,6 +723,8 @@ pub fn default_log_path(token_path: &Path) -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::imp::should_attempt_pre_install_unload;
     use super::*;
 
     fn spec() -> ServiceSpec {
@@ -697,6 +745,31 @@ mod tests {
     }
 
     // ── PACKET 40 ──────────────────────────────────────────────────────────
+
+    /// PACKET 41 (step 1): first install must not fire the pre-install
+    /// unload at all (there is no plist yet); a REINSTALL with an existing
+    /// plist does attempt it. Pinned by observing whether launchctl is
+    /// even invoked — the helper is extracted for testability.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pre_install_unload_only_runs_when_a_plist_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "p41-unload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plist = dir.join("agent.plist");
+        // First install: no plist -> no unload attempted.
+        assert!(!should_attempt_pre_install_unload(&plist));
+        // Reinstall: plist exists -> unload attempted.
+        std::fs::write(&plist, "plist-bytes").unwrap();
+        assert!(should_attempt_pre_install_unload(&plist));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// AUDIT 7 (label collision): `com.decent-render.decent-node` contains
     /// `com.decent-render.decent` as a substring, so substring matching made
