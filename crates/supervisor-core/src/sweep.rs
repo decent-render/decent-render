@@ -214,9 +214,59 @@ pub fn sweep_dir(base: &Path, stale_runner_after: Duration) -> usize {
     removed
 }
 
-/// Production entry: sweep the OS temp dir with [`STALE_RUNNER_DIR_AGE`].
+/// Production entry: sweep the OS temp dir with [`STALE_RUNNER_DIR_AGE`],
+/// then retry THIS daemon's own recorded purge failures.
+///
+/// PACKET 37 (audit 4): the pid-liveness rule above can never reclaim a
+/// dir THIS process failed to purge — our own pid is alive by definition.
+/// The [`crate::purge`] failure list is exactly those dirs, and it is safe
+/// to retry them by construction: a path enters the list only when a
+/// WorkDir owned by THIS process finished its job and failed all removal
+/// retries — there is no live WorkDir for it anywhere (the object is gone;
+/// its job ended). A LIVE sibling's workdir never enters this list: the
+/// sibling's WorkDir::drop has not run, so it has recorded nothing.
 pub fn sweep_stale_workdirs() -> usize {
-    sweep_dir(&std::env::temp_dir(), STALE_RUNNER_DIR_AGE)
+    let mut removed = sweep_dir(&std::env::temp_dir(), STALE_RUNNER_DIR_AGE);
+
+    // Retry our own failures (bounded list; entries clear on success).
+    for failure in crate::purge::outstanding_purge_failures() {
+        // Extra safety: never touch a path that classifies as a LIVE
+        // supervisor's dir (a foreign pid that is still alive). Our own
+        // pid dirs are the expected shape here; anything else is skipped —
+        // this list is ours, but defense costs nothing.
+        match classify_dir_name(
+            failure
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default(),
+        ) {
+            Classification::Supervisor { owner_pid } => {
+                if owner_pid != std::process::id() && !pid_is_dead(owner_pid) {
+                    continue; // not provably dead, not ours — skip
+                }
+            }
+            _ => continue, // not a supervisor-shaped name — not from our list
+        }
+        match std::fs::remove_dir_all(&failure.path) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %failure.path.display(),
+                    "reclaimed previously failed purge"
+                );
+                crate::purge::clear_purge_failure(&failure.path);
+                removed += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %failure.path.display(),
+                    error = %e,
+                    "retry of previously failed purge failed again"
+                );
+            }
+        }
+    }
+    removed
 }
 
 #[cfg(test)]

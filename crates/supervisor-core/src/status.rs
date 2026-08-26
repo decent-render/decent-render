@@ -81,6 +81,11 @@ pub struct SupervisorStatus {
     pub jobs_completed: u64,
     pub jobs_failed: u64,
     pub jobs_canceled: u64,
+    /// Workdirs this supervisor failed to purge (after retries) and the
+    /// sweep has not yet reclaimed (packet 37, audit 4) — the operator-
+    /// visible "this machine still holds render content" signal. 0 is the
+    /// invariant the crate is public to prove.
+    pub jobs_purge_pending: u32,
     pub last_error: Option<String>,
     pub allow_real_jobs: bool,
     /// Latest supervisor version reported by dispatch via `updateAvailable`,
@@ -98,6 +103,7 @@ impl Default for SupervisorStatus {
             jobs_completed: 0,
             jobs_failed: 0,
             jobs_canceled: 0,
+            jobs_purge_pending: 0,
             last_error: None,
             allow_real_jobs: false,
             update_available: None,
