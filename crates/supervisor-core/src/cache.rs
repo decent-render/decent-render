@@ -139,7 +139,7 @@ fn completion_marker(kind: &str) -> &'static str {
 /// undercounts (metadata size of the dir file itself) — wrong but small,
 /// and never used for eviction decisions on that platform in practice.
 #[cfg(unix)]
-fn dir_size(path: &Path) -> u64 {
+pub(crate) fn dir_size(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
@@ -160,7 +160,7 @@ fn dir_size(path: &Path) -> u64 {
 }
 
 #[cfg(not(unix))]
-fn dir_size(path: &Path) -> u64 {
+pub(crate) fn dir_size(path: &Path) -> u64 {
     // Non-POSIX fallback: never traverses, never overcounts.
     std::fs::symlink_metadata(path)
         .map(|md| md.len())

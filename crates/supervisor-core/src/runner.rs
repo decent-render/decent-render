@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use crate::artifact_fetch;
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
@@ -170,7 +170,20 @@ pub(crate) fn set_worker_root_for_tests(root: PathBuf) {
     let _ = WORKER_ROOT_OVERRIDE.set(root);
 }
 
+/// One artifact-download client per process (connection reuse), with the
+/// packet-37 connect/read timeouts baked in (see artifact_fetch.rs).
+static ARTIFACT_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+fn artifact_client() -> reqwest::Client {
+    ARTIFACT_CLIENT
+        .get_or_init(artifact_fetch::artifact_client)
+        .clone()
+}
+
+/// PACKET 37: production hashing moved into artifact_fetch (streaming).
+/// Retained for tests (fixture sha computation).
+#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
     for b in digest {
@@ -218,36 +231,30 @@ async fn ensure_artifact(
     tokio::fs::create_dir_all(&tmp).await?;
 
     tracing::info!(kind, sha = %sha256, "downloading artifact");
-    let bytes = reqwest::get(get_url)
-        .await
-        .with_context(|| format!("{kind} download request failed"))?
-        .error_for_status()
-        .with_context(|| format!("{kind} download returned non-2xx"))?
-        .bytes()
-        .await
-        .with_context(|| format!("{kind} body read failed"))?;
-    let actual = sha256_hex(&bytes);
+    // PACKET 37: stream to disk + hash-as-we-write. Previously the whole
+    // artifact was buffered in RAM (~340 MB peak for the browser) via a
+    // bare reqwest::get with NO timeout of any kind — a stalled body held
+    // the job slot (and SIGTERM via the drain) forever. The client bounds
+    // connect/read; the per-request total timeout bounds the transfer;
+    // the sha is computed over the same streamed bytes it writes, so peak
+    // RSS is one chunk.
+    let tar_path = tmp.join("artifact.tar.gz");
+    let actual =
+        artifact_fetch::download_to_file_hashed(&artifact_client(), get_url, &tar_path, kind)
+            .await?;
+    // SECURITY ORDERING (unchanged): the sha is verified over the bytes on
+    // disk BEFORE anything is extracted, executed, or renamed into the
+    // cache. A mismatch removes the temp dir and fails the job.
     if actual != sha256 {
-        tokio::fs::remove_dir_all(&tmp).await.ok();
+        if let Err(e) = tokio::fs::remove_dir_all(&tmp).await {
+            tracing::warn!(path = %tmp.display(), error = %e, "removing torn download failed");
+        }
         return Err(anyhow!(
             "{kind} sha mismatch: expected {sha256}, got {actual}"
         ));
     }
-    let tar_path = tmp.join("artifact.tar.gz");
-    tokio::fs::write(&tar_path, &bytes).await?;
 
-    let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(&tar_path)
-        .arg("-C")
-        .arg(&tmp)
-        .status()
-        .await
-        .with_context(|| format!("failed to spawn tar for {kind} extract"))?;
-    if !status.success() {
-        tokio::fs::remove_dir_all(&tmp).await.ok();
-        return Err(anyhow!("{kind} tar extract failed with {status}"));
-    }
+    artifact_fetch::extract_tar_capped(&tar_path, &tmp, kind).await?;
     tokio::fs::remove_file(&tar_path).await.ok();
     if !tmp.join(marker).exists() {
         tokio::fs::remove_dir_all(&tmp).await.ok();
@@ -575,6 +582,16 @@ async fn run_job_inner(
     // orphaning Chrome on every cancel/silence-kill/shutdown.
     #[cfg(unix)]
     command.process_group(0);
+    // PACKET 37 (audit 3b): the frame is serialized BEFORE the spawn —
+    // pure serialization of our own typed struct, so doing it early removes
+    // two `?`s from the spawn→select window where an early return would
+    // orphan the child (kill_on_drop is not set) while WorkDir::drop purges
+    // the directory under it.
+    let mut input_frame = serde_json::to_value(&assign).context("serialize jobAssign frame")?;
+    if let serde_json::Value::Object(ref mut obj) = input_frame {
+        obj.insert("type".into(), serde_json::Value::String("jobAssign".into()));
+    }
+    let input = serde_json::to_vec(&input_frame).context("encode jobAssign frame")?;
     let mut child = command
         .current_dir(workdir.path())
         .stdin(Stdio::piped())
@@ -582,13 +599,15 @@ async fn run_job_inner(
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawn runner {}", runner.display()))?;
-
-    let mut stdin = child.stdin.take().context("runner stdin missing")?;
-    let mut input_frame = serde_json::to_value(&assign)?;
-    if let serde_json::Value::Object(ref mut obj) = input_frame {
-        obj.insert("type".into(), serde_json::Value::String("jobAssign".into()));
-    }
-    let input = serde_json::to_vec(&input_frame)?;
+    let mut stdin = match child.stdin.take() {
+        Some(s) => s,
+        None => {
+            // Kill BEFORE returning: same deliberate ordering as the
+            // stdout-error branch below (audit 3b's reference pattern).
+            terminate_child(&mut child, browser_pidfile.as_deref()).await;
+            return Err(anyhow!("runner stdin missing"));
+        }
+    };
     // A failed write is NOT the job's failure reason.
     //
     // If the runner exits before reading its stdin — which is exactly what the
@@ -610,7 +629,13 @@ async fn run_job_inner(
     }
     drop(stdin);
 
-    let stdout = child.stdout.take().context("runner stdout missing")?;
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            terminate_child(&mut child, browser_pidfile.as_deref()).await;
+            return Err(anyhow!("runner stdout missing"));
+        }
+    };
     let mut lines = BufReader::new(stdout).lines();
     let mut done_metrics: Option<JobMetrics> = None;
 
@@ -650,9 +675,19 @@ async fn run_job_inner(
                 // spawn_blocking: the walk is synchronous IO and must not
                 // stall the runtime (or the cancel branch beside it).
                 let sample_root = purged_path.clone();
-                let bytes = tokio::task::spawn_blocking(move || workdir_bytes(&sample_root))
-                    .await
-                    .map_err(|e| anyhow!(e).context("disk sampler join failed"))?;
+                let bytes = match tokio::task::spawn_blocking(move || {
+                    workdir_bytes(&sample_root)
+                })
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        // PACKET 37 (audit 3b): kill before returning —
+                        // same rule as every other ? in this window.
+                        terminate_child(&mut child, browser_pidfile.as_deref()).await;
+                        return Err(anyhow!(e).context("disk sampler join failed"));
+                    }
+                };
                 if bytes > workdir_cap_bytes {
                     terminate_child(&mut child, browser_pidfile.as_deref()).await;
                     drop(workdir);
@@ -739,7 +774,15 @@ async fn run_job_inner(
         }
     }
 
-    let status = child.wait().await.context("runner wait failed")?;
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            // PACKET 37 (audit 3b): a failed wait leaves the child's state
+            // unknown — terminate defensively before Drop purges.
+            terminate_child(&mut child, browser_pidfile.as_deref()).await;
+            return Err(anyhow!(e).context("runner wait failed"));
+        }
+    };
     // Defect A, success path: Remotion normally closes its own browser, but
     // "normally" is doing load-bearing work — a runner that exits cleanly
     // while Chrome somehow lingers (a leaked browser from an aborted
@@ -1033,5 +1076,139 @@ mod tests {
         )
         .unwrap();
         assert!(ensure_browser(&assign).await.unwrap().is_none());
+    }
+
+    // ── PACKET 37: download verification path ──────────────────────────────
+
+    /// Minimal one-shot HTTP file server on 127.0.0.1:0, serving `body`
+    /// at every path. Returns the base URL. Runs on the tokio runtime the
+    /// test already has; shut down by dropping the JoinHandle (the
+    /// listener closes when the task is dropped).
+    async fn serve_bytes(body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    // drain the request head
+                    let _ = socket.read(&mut buf).await;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}/artifact.tar.gz"), handle)
+    }
+
+    /// A valid tar.gz containing a single `decent-render-runner` marker file.
+    fn make_payload_tarball(runner_contents: &[u8]) -> Vec<u8> {
+        // tar with a 512-byte header + padded content + two zero blocks,
+        // then gzip -9 via flate2? No extra dep: shell out to tar+gzip on
+        // the test's scratch dir (unix; matches production's system tar).
+        let dir = std::env::temp_dir().join(format!(
+            "p37-tar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("decent-render-runner"), runner_contents).unwrap();
+        let out = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg("-")
+            .arg("-C")
+            .arg(&dir)
+            .arg("decent-render-runner")
+            .output()
+            .expect("tar available");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(out.status.success());
+        out.stdout
+    }
+
+    fn unique_worker_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "p37-worker-root-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// THE deletion-mutant survivor (audit 2d): every existing test seeded
+    /// the cache so the sha-verify block never ran. This test downloads a
+    /// REAL tarball whose bytes do not hash to the claimed sha and asserts
+    /// the failure + that nothing was cached or left behind. Removing the
+    /// `if actual != sha256` block in ensure_artifact makes it FAIL.
+    #[tokio::test]
+    async fn sha_mismatch_downloads_are_rejected_and_not_cached() {
+        // NOTE: WORKER_ROOT_OVERRIDE is a process-global OnceLock (first write
+        // wins) and the test binary is parallel — both packet-37 download
+        // tests must agree on ONE root. They use the same tag; whichever
+        // runs first sets it, the other reuses it. Distinguish entries by
+        // the claimed sha (unique per test).
+        let root = unique_worker_root("dl");
+        set_worker_root_for_tests(root.clone());
+        let tarball = make_payload_tarball(b"#!/bin/sh\necho runner\n");
+        let claimed_sha = sha256_hex(b"not-the-tarball");
+        let (url, server) = serve_bytes(tarball.clone()).await;
+
+        let err = ensure_artifact("payloads", &claimed_sha, &url, "decent-render-runner")
+            .await
+            .expect_err("sha mismatch must fail the artifact");
+        assert!(err.to_string().contains("sha mismatch"), "got: {err}");
+        // Nothing cached under the claimed sha...
+        assert!(!root.join("payloads").join(&claimed_sha).exists());
+        // ...and THIS test's torn download temp dir (.<claimed_sha>-download)
+        // is removed, not left behind. Scoped to our sha: the sibling
+        // sha-match test may be mid-download in the shared OnceLock root
+        // (tests run in parallel; its temp dir is legitimately transient).
+        let torn = root
+            .join("payloads")
+            .join(format!(".{claimed_sha}-download"));
+        assert!(
+            !torn.exists(),
+            "torn download temp dir left behind: {}",
+            torn.display()
+        );
+        server.abort();
+        // root intentionally NOT removed: it is a shared OnceLock root
+        // across the packet-37 download tests; /tmp reclamation covers it.
+    }
+
+    /// The counterpart happy path: correct sha → cached, marker present.
+    #[tokio::test]
+    async fn sha_match_downloads_are_cached() {
+        let root = unique_worker_root("dl");
+        set_worker_root_for_tests(root.clone());
+        let tarball = make_payload_tarball(b"#!/bin/sh\necho runner\n");
+        let sha = sha256_hex(&tarball);
+        let (url, server) = serve_bytes(tarball).await;
+
+        let dir = ensure_artifact("payloads", &sha, &url, "decent-render-runner")
+            .await
+            .expect("valid artifact");
+        assert!(dir.join("decent-render-runner").exists());
+        // (cache-internal markers are not asserted — they belong to cache.rs)
+        server.abort();
+        // root intentionally NOT removed: it is a shared OnceLock root
+        // across the packet-37 download tests; /tmp reclamation covers it.
     }
 }
