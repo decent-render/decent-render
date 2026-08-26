@@ -6,6 +6,9 @@ members = ["crates/supervisor-core", "bins/decent", "bins/decent-node-shim", "ap
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/decent-render/decent-render"
+# Consumed by the generated Homebrew formula; without it `dist generate`
+# warns on every release that the publish job has no homepage.
+homepage = "https://decent-render.farm"
 
 [workspace.dependencies]
 anyhow = "1"

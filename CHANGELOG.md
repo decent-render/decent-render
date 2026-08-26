@@ -8,12 +8,81 @@ The format follows Keep a Changelog and semantic versioning.
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-08-26
+
+The first-run release: a fresh `brew install` now reaches the real farm,
+refuses to leak your token, and tells you the truth about what it knows.
+
+### Fixed
+
+- **`decent start` and `decent tui` defaulted to `ws://localhost:8790/ws`**
+  while `decent install` defaulted to the production dispatch. Following the
+  documented command retried 15× against nothing and exited 1. All three now
+  default to the production URL; `--dispatch-url` / `DISPATCH_URL` override.
+- **A remote `ws://` URL shipped the worker token in CLEARTEXT.** Non-`wss://`
+  URLs to a non-local host are now refused, with a message saying why.
+  Localhost stays plaintext for local development.
+- **A 401 from dispatch was reported as "Dispatch unreachable"**, sending
+  operators to debug their network when their token was invalid or revoked.
+  Auth failure is now named as such and fails fast in under a second instead
+  of climbing a retry ladder a bad credential can never satisfy.
+- **`decent status` printed `update: up to date` when it had no snapshot at
+  all.** It now reports an honest unknown.
+- **The worker token was written 0644 and then chmod'd to 0600**, leaving a
+  window where the fleet credential was world-readable; the migration from
+  `~/.config/decent-node/` never chmod'd at all. The file is now created 0600.
+- **`decent install` opened with `Load failed: 5: Input/output error`** on
+  every first install — a best-effort unload of a unit that did not exist yet.
+  It is only attempted when a plist is actually present.
+- **`decent login` did not take effect while the daemon was running.**
+- **The launchd legacy label check could never match** (`LEGACY_LABEL`
+  contains `LABEL` as a substring), so `decent pause` contradicted
+  `decent status` on a legacy-only install. Service units are also XML-escaped
+  now, so a dispatch URL containing `&` no longer writes an invalid plist.
+
+### Security
+
+- **Artifact downloads are bounded and streamed.** They previously had no
+  connect, read, or total timeout and buffered the entire artifact in memory
+  (~340 MB for a browser) before the sha check. They are now timed, streamed
+  to disk while hashing, size-capped, and cancellable. The sha is still
+  verified before anything is extracted or executed.
+- **Tar extraction is size-capped** on both the Rust and TypeScript paths, and
+  traversal containment (`..` members, absolute paths, symlink write-through)
+  is now pinned by tests against both bsdtar and GNU tar.
+
 ### Changed
 
-- The supervisor now echoes the optional assignment-attempt lease on accepted,
-  progress, complete, and failed messages. This lets lifecycle-aware dispatch
-  reject delayed messages from an older retry while retaining protocol-v2
-  compatibility with attempt-less assignments.
+- **A failed workdir purge is no longer silent.** It is retried, recorded, and
+  surfaced to the operator — the purge is the property this crate is public to
+  prove, and its failure mode must be visible.
+- No exit path can skip the in-flight drain, and every in-progress teardown is
+  awaited rather than only the most recent one. A draining node no longer
+  advertises itself as idle.
+- The supervisor echoes the optional assignment-attempt lease on accepted,
+  progress, complete, and failed messages, so lifecycle-aware dispatch can
+  reject delayed messages from an older retry. Protocol-v2 compatible with
+  attempt-less assignments.
+- `DECENT_MAX_CONCURRENT_JOBS` is removed. It was inert: the ceiling was
+  ignored and the connection loop only ever holds one in-flight slot.
+
+## [0.0.8] - 2026-08-26
+
+Recorded retroactively — 0.0.8 shipped without a changelog entry.
+
+### Fixed
+
+- Reconnect after abrupt TLS closes instead of exiting, with jittered
+  exponential backoff and a healthy-session reset.
+- Size-capped LRU sweep over the node caches, ending the ~1 GB-per-job growth.
+- `max_concurrent_jobs` is declared honestly on the wire.
+- An idle-sleep assertion is held for exactly the job's lifetime.
+- Honest operator surfaces across the CLI, TUI, and Tauri app.
+
+### Changed
+
+- Release builds use `precise-builds`, keeping the Tauri app's GTK stack out
+  of the Linux builders.
 
 ## [0.0.7] - 2026-07-11
 

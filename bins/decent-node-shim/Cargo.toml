@@ -5,6 +5,7 @@ description = "Compatibility shim — forwards to the 'decent' binary. Deprecate
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 

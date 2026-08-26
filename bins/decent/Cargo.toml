@@ -1,10 +1,11 @@
 [package]
 name = "decent"
-version = "0.0.8"
+version = "0.0.9"
 description = "Decent render network node — CLI and TUI over supervisor-core."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 supervisor-core = { path = "../../crates/supervisor-core" }
