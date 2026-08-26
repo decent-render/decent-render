@@ -2,7 +2,7 @@ import type {JobAssignMessage, JobMetrics} from '@decent-render/protocol';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {createReadStream} from 'node:fs';
-import {existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync} from 'node:fs';
+import {existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type {MinimalComposition, RendererApi} from './renderer-api.js';
@@ -115,14 +115,54 @@ async function ensureBundle(sha256: string, getUrl: string, log: (message: strin
   const archive = path.join(temp, 'bundle.tar.gz');
   writeFileSync(archive, bytes);
   mkdirSync(dir, {recursive: true});
+  // PACKET 39: tar traversal containment is MEASURED, not assumed — both
+  // bsdtar 3.5.3 (macOS, what operators run) and GNU tar 1.34 (CI/Linux)
+  // refuse ../ members and symlink write-through during extraction, and
+  // neutralize absolute paths by stripping the leading '/'. Regression
+  // tests in tar-safety.test.ts pin that behaviour per class so a future
+  // tar flag/version change that weakens it FAILS CI instead of quietly
+  // reopening the hole. The extraction target is always a fresh, empty
+  // per-sha directory (never reused), which is what makes the
+  // second-archive-through-residual-symlink shape unreachable here.
   const extracted = spawnSync('tar', ['-xzf', archive, '-C', dir]);
   rmSync(temp, {recursive: true, force: true});
   if (extracted.status !== 0) {
     rmSync(dir, {recursive: true, force: true});
     throw new Error(`tar extract failed: ${extracted.stderr.toString()}`);
   }
+  // PACKET 39 (2c): extracted-size cap, matching supervisor-core's
+  // ARTIFACT_MAX_EXTRACTED_BYTES (4 GiB) from packet 37 — same number,
+  // same reasoning: a gzip bomb must bound to one removable cache dir,
+  // not fill the disk. The tarball itself is sha-pinned transport-wise,
+  // but the sha proves transport only, never that contents are benign.
+  const extractedBytes = treeSize(dir);
+  if (extractedBytes > MAX_EXTRACTED_BUNDLE_BYTES) {
+    rmSync(dir, {recursive: true, force: true});
+    throw new Error(
+      `bundle ${sha256.slice(0, 12)} extracted ${extractedBytes} bytes, over the ${MAX_EXTRACTED_BUNDLE_BYTES} byte ceiling`,
+    );
+  }
   log(`bundle ${sha256.slice(0, 12)} verified and extracted`);
   return dir;
+}
+
+/** Same constant and rationale as supervisor-core's ARTIFACT_MAX_EXTRACTED_BYTES. */
+export const MAX_EXTRACTED_BUNDLE_BYTES = 4 * 1024 * 1024 * 1024;
+
+/** Apparent-size walk (blocks are a POSIX-only notion; bytes port). */
+function treeSize(root: string): number {
+  let total = 0;
+  const stack = [root];
+  while (stack.length > 0) {
+    const p = stack.pop()!;
+    const st = lstatSync(p);
+    if (st.isDirectory()) {
+      for (const entry of readdirSync(p)) stack.push(path.join(p, entry));
+    } else {
+      total += st.size;
+    }
+  }
+  return total;
 }
 
 /**
