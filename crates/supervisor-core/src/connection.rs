@@ -20,7 +20,7 @@ use anyhow::{anyhow, Context};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::oneshot;
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
 use crate::protocol::{
     HeartbeatMessage, JobAcceptedMessage, JobRejectedMessage, RegisterMessage, RejectReason,
@@ -293,10 +293,10 @@ async fn run_session(
 
     let (mut sink, mut stream) = ws.split();
 
-    let send = |msg: WorkerMessage| {
+    let send = |msg: WorkerMessage| -> Utf8Bytes {
         let frame = serde_json::to_string(&msg).expect("worker messages always serialize");
         tracing::info!(frame = %frame, "→ send");
-        frame
+        Utf8Bytes::from(frame)
     };
     let emit = |obs: &Observability, frame: &WorkerMessage| match frame {
         WorkerMessage::JobProgress(p) => {
@@ -528,7 +528,7 @@ async fn run_session(
             frame = stream.next() => {
                 match frame {
                     Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<ServerMessage>(&text) {
+                        match serde_json::from_str::<ServerMessage>(text.as_str()) {
                             Ok(msg) => {
                                 log_server_message(&msg, obs.allows_real_jobs());
                                 match msg {
@@ -920,6 +920,7 @@ fn log_server_message(msg: &ServerMessage, allow_real_jobs: bool) {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::protocol::{Capabilities, Platform, PROTOCOL_VERSION};
     use tokio::net::{TcpListener, TcpStream};
@@ -1019,7 +1020,7 @@ mod tests {
     async fn next_text(ws: &mut WebSocketStream<TcpStream>) -> String {
         loop {
             match ws.next().await.expect("stream ended").expect("ws error") {
-                Message::Text(t) => return t,
+                Message::Text(t) => return t.as_str().to_owned(),
                 _ => continue,
             }
         }
@@ -1352,9 +1353,11 @@ echo '{"type":"done","outputSizeInBytes":1,"wallTimeMs":1}'
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
-            .await
-            .unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+            &job_id, &sha,
+        ))))
+        .await
+        .unwrap();
 
         // The startup sweep ran during connect (before the assign); the
         // post-termination sweep runs when the done frame is processed.
@@ -1544,9 +1547,11 @@ echo '{"type":"error","message":"boom"}'
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
-            .await
-            .unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+            &job_id, &sha,
+        ))))
+        .await
+        .unwrap();
 
         // Collect frames until the job is accepted (heartbeats may interleave).
         let mut frames: Vec<serde_json::Value> = Vec::new();
@@ -1563,9 +1568,9 @@ echo '{"type":"error","message":"boom"}'
         }
 
         // Dispatch cancels the in-flight job.
-        ws.send(Message::Text(format!(
+        ws.send(Message::Text(Utf8Bytes::from(format!(
             r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
-        )))
+        ))))
         .await
         .unwrap();
 
@@ -1589,7 +1594,7 @@ echo '{"type":"error","message":"boom"}'
         ws.close(None).await.ok();
         while let Some(Ok(frame)) = ws.next().await {
             if let Message::Text(t) = frame {
-                frames.push(serde_json::from_str(&t).unwrap());
+                frames.push(serde_json::from_str(t.as_str()).unwrap());
             }
         }
         client.await.unwrap().expect("clean exit");
@@ -1645,9 +1650,11 @@ echo '{"type":"error","message":"boom"}'
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
-            .await
-            .unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+            &job_id, &sha,
+        ))))
+        .await
+        .unwrap();
 
         // Collect frames until jobAccepted (heartbeats may interleave).
         let mut frames: Vec<serde_json::Value> = Vec::new();
@@ -1666,9 +1673,9 @@ echo '{"type":"error","message":"boom"}'
         // Let the runner's `done` + stdout EOF be processed first (see the
         // determinism note above), then cancel into the child.wait() window.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        ws.send(Message::Text(format!(
+        ws.send(Message::Text(Utf8Bytes::from(format!(
             r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
-        )))
+        ))))
         .await
         .unwrap();
 
@@ -1694,7 +1701,7 @@ echo '{"type":"error","message":"boom"}'
         ws.close(None).await.ok();
         while let Some(Ok(frame)) = ws.next().await {
             if let Message::Text(t) = frame {
-                frames.push(serde_json::from_str(&t).unwrap());
+                frames.push(serde_json::from_str(t.as_str()).unwrap());
             }
         }
         client.await.unwrap().expect("clean exit");
@@ -1739,9 +1746,11 @@ echo '{"type":"error","message":"boom"}'
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
-            .await
-            .unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+            &job_id, &sha,
+        ))))
+        .await
+        .unwrap();
 
         // Read until jobFailed shows up (heartbeats/jobAccepted interleave).
         let failed = loop {
@@ -2320,9 +2329,11 @@ while true; do sleep 5; done
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
-            .await
-            .unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+            &job_id, &sha,
+        ))))
+        .await
+        .unwrap();
 
         // The runner writes the grandchild pid to a side file: the pid is
         // not part of the protocol and must not ride a frame.
@@ -2344,9 +2355,9 @@ while true; do sleep 5; done
             "grandchild must be alive before cancel"
         );
 
-        ws.send(Message::Text(format!(
+        ws.send(Message::Text(Utf8Bytes::from(format!(
             r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
-        )))
+        ))))
         .await
         .unwrap();
 
@@ -2428,9 +2439,11 @@ while true; do sleep 5; done
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
-            .await
-            .unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+            &job_id, &sha,
+        ))))
+        .await
+        .unwrap();
 
         let grandchild_pid = wait_for_pid_file(&pid_file).await;
         // Gate on the grandchild having exec'd: its trap must be installed
@@ -2449,9 +2462,9 @@ while true; do sleep 5; done
             "grandchild must be alive before cancel"
         );
 
-        ws.send(Message::Text(format!(
+        ws.send(Message::Text(Utf8Bytes::from(format!(
             r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
-        )))
+        ))))
         .await
         .unwrap();
 
@@ -2573,7 +2586,9 @@ while true; do sleep 5; done
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(assign)).await.unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(assign)))
+            .await
+            .unwrap();
 
         // Wait until the browser stand-in is fully daemonized: the .started
         // marker is touched INSIDE the setsid'd child, so its existence
@@ -2647,9 +2662,9 @@ while true; do sleep 5; done
             "daemonized browser must be alive before cancel"
         );
 
-        ws.send(Message::Text(format!(
+        ws.send(Message::Text(Utf8Bytes::from(format!(
             r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
-        )))
+        ))))
         .await
         .unwrap();
 
@@ -2754,7 +2769,9 @@ while true; do sleep 5; done
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(assign)).await.unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(assign)))
+            .await
+            .unwrap();
 
         // Wait for full daemonization: marker touched INSIDE the setsid'd child.
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -2799,9 +2816,9 @@ while true; do sleep 5; done
 
         // CANCEL. The runner ignores TERM (trap ''); the supervisor enters
         // the 10s CANCEL_GRACE.
-        ws.send(Message::Text(format!(
+        ws.send(Message::Text(Utf8Bytes::from(format!(
             r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
-        )))
+        ))))
         .await
         .unwrap();
 
@@ -2934,9 +2951,11 @@ while true; do sleep 5; done
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
-            .await
-            .unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+            &job_id, &sha,
+        ))))
+        .await
+        .unwrap();
 
         // Gate on the runner REALLY running — its own pid, written by itself.
         let runner_pid = wait_for_pid_file(&pid_file).await;
@@ -2945,9 +2964,9 @@ while true; do sleep 5; done
             "runner must be alive before cancel"
         );
 
-        ws.send(Message::Text(format!(
+        ws.send(Message::Text(Utf8Bytes::from(format!(
             r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
-        )))
+        ))))
         .await
         .unwrap();
 
@@ -3335,9 +3354,11 @@ while true; do sleep 5; done
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
-            .await
-            .unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+            &job_id, &sha,
+        ))))
+        .await
+        .unwrap();
 
         // Gate on the runner REALLY running — its own pid, written by itself.
         let runner_pid = wait_for_pid_file(&pid_file).await;
@@ -3431,9 +3452,11 @@ while true; do sleep 5; done
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
-            .await
-            .unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+            &job_id, &sha,
+        ))))
+        .await
+        .unwrap();
 
         let runner_pid = wait_for_pid_file(&pid_file).await;
         assert!(
@@ -3441,9 +3464,9 @@ while true; do sleep 5; done
             "runner must be alive before cancel"
         );
 
-        ws.send(Message::Text(format!(
+        ws.send(Message::Text(Utf8Bytes::from(format!(
             r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
-        )))
+        ))))
         .await
         .unwrap();
 
@@ -3532,9 +3555,11 @@ while true; do sleep 5; done
         let (mut ws, _uri) = accept_ws(&listener).await;
         let _register = next_text(&mut ws).await;
 
-        ws.send(Message::Text(job_assign_json(&job_id, &sha)))
-            .await
-            .unwrap();
+        ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+            &job_id, &sha,
+        ))))
+        .await
+        .unwrap();
 
         let grandchild_pid = wait_for_pid_file(&pid_file).await;
         // Gate on exec completion: TERM during the exec window kills the
