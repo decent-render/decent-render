@@ -799,10 +799,12 @@ dependencies = [
  "crossterm",
  "open",
  "ratatui",
+ "serde_json",
  "supervisor-core",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

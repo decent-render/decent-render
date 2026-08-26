@@ -1,6 +1,10 @@
 //! decent — thin CLI over supervisor-core.
 //!
-//! `decent start --dispatch-url ws://localhost:8790/ws --token <jwt>`
+//! `decent start --token <jwt>`
+//!
+//! (defaults to the production dispatch at
+//! wss://decent-render-dispatch.fly.dev/ws — override with --dispatch-url
+//! or DISPATCH_URL; plain ws:// is allowed only for localhost)
 //! (or env vars DISPATCH_URL / WORKER_TOKEN). Registers with the dispatch and
 //! heartbeats; real rendering requires `--allow-real-jobs`.
 //!
@@ -19,9 +23,6 @@ use supervisor_core::protocol::{Platform, RegisterMessage, PROTOCOL_VERSION};
 use supervisor_core::status::{Observability, SupervisorStatus};
 
 const SUPERVISOR_VERSION: &str = concat!("rust-", env!("CARGO_PKG_VERSION"));
-/// Minimum dispatch server version this client is compatible with.
-#[allow(dead_code)]
-const MIN_DISPATCH_VERSION: &str = "0.0.1";
 
 /// Token storage: a 0600 file at ~/.config/decent/worker-token.
 /// Migrates from the old ~/.config/decent-node/ path if the new path doesn't
@@ -36,13 +37,23 @@ fn token_path() -> anyhow::Result<std::path::PathBuf> {
     let old_path = home.join(".config/decent-node/worker-token");
 
     // One-time migration: if new path doesn't exist but old path does, copy.
+    // PACKET 40 (audit 11): fs::copy reproduced the OLD file's mode — often
+    // 0644 from pre-hardening installs — and create_dir_all made the parent
+    // 0755, silently downgrading the fleet credential's protection on every
+    // upgrade. Both are tightened immediately after the copy, and the
+    // parent is created 0700 before anything lands in it.
     if !new_path.exists() && old_path.exists() {
         if let Some(parent) = new_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("Warning: could not create config dir for token migration: {e}");
+                return Ok(new_path);
+            }
+            set_owner_only(parent, 0o700);
         }
         match std::fs::copy(&old_path, &new_path) {
             Ok(_) => {
-                eprintln!("Migrated token from ~/.config/decent-node/ → ~/.config/decent/");
+                set_owner_only(&new_path, 0o600);
+                eprintln!("Migrated token from ~/.config/decent-node/ → ~/.config/decent/ (0600)");
             }
             Err(e) => {
                 eprintln!("Warning: could not migrate token from old path: {e}");
@@ -82,6 +93,118 @@ fn delete_token() -> anyhow::Result<()> {
 }
 
 /// Current epoch time in milliseconds (for status-snapshot freshness).
+/// PACKET 40 (audit 17): validate the dispatch URL scheme BEFORE anything
+/// dials it. A `ws://` URL to a remote host would ship the worker JWT in
+/// CLEARTEXT — refuse it and say exactly why. Plain `ws://` stays allowed
+/// for localhost/127.0.0.1 (the e2e harness and local development).
+/// Never silently "upgrade" the scheme: the operator must see the mistake.
+pub(crate) fn validate_dispatch_url(url: &str) -> anyhow::Result<()> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| anyhow::anyhow!("--dispatch-url is not a valid URL ({e}): {url}"))?;
+    let scheme = parsed.scheme();
+    let is_local = matches!(
+        parsed.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("[::1]") | None
+    );
+    match scheme {
+        "wss" => Ok(()),
+        "ws" if is_local => Ok(()),
+        "ws" => anyhow::bail!(
+            "refusing to use ws:// to a non-local host: the worker token would be sent in              CLEARTEXT. Use wss://{host}{path} (or a localhost URL for local development).",
+            host = parsed.host_str().unwrap_or("<unknown>"),
+            path = parsed.path(),
+        ),
+        other => anyhow::bail!(
+            "--dispatch-url must be wss:// (or ws:// for localhost); got '{other}://'"
+        ),
+    }
+}
+
+/// PACKET 40 (audit-api-ux): a worker token is a JWT — three
+/// dot-separated base64url segments, each non-empty, header/payload
+/// decodable as JSON, and a payload carrying the claims this fleet mints
+/// (service / tenant / platform family). Placeholder strings ("paste-your-
+/// token-here", shell leftovers) and truncations fail with a message that
+/// names WHAT was wrong — never the token itself.
+pub(crate) fn validate_worker_token_shape(token: &str) -> anyhow::Result<()> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        anyhow::bail!(
+            "not a worker token: expected three dot-separated parts, got {} \
+             (a JWT looks like <header>.<payload>.<signature>)",
+            parts.len()
+        );
+    }
+    if parts.iter().any(|p| p.is_empty()) {
+        anyhow::bail!("not a worker token: one of the three parts is empty (truncated paste?)");
+    }
+    if token.len() < 40 {
+        anyhow::bail!(
+            "not a worker token: {} characters is too short for any JWT this fleet issues",
+            token.len()
+        );
+    }
+    if !token
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_' || b == b'=')
+    {
+        anyhow::bail!(
+            "not a worker token: contains characters outside base64url + dots \
+             (whitespace, quotes, or a paste artifact)"
+        );
+    }
+    // Header + payload must be real base64url JSON.
+    let decode = |s: &str| {
+        base64url_decode(s).ok_or_else(|| anyhow::anyhow!("a segment is not valid base64url"))
+    };
+    let header = decode(parts[0])?;
+    let payload = decode(parts[1])?;
+    serde_json::from_slice::<serde_json::Value>(&header)
+        .map_err(|_| anyhow::anyhow!("token header is not JSON (wrong paste?)"))?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|_| anyhow::anyhow!("token payload is not JSON (wrong paste?)"))?;
+    // Fleet tokens carry worker identity claims; a JWT without ANY of them
+    // is some other system's token pasted by mistake.
+    let has_claim = [
+        "service",
+        "tenant",
+        "workerId",
+        "worker_id",
+        "platform",
+        "deviceId",
+    ]
+    .iter()
+    .any(|k| payload.get(*k).is_some());
+    if !has_claim {
+        anyhow::bail!(
+            "this JWT carries no worker claims (service/tenant/workerId) — \
+             it is probably a token for a different system"
+        );
+    }
+    Ok(())
+}
+
+/// Minimal base64url decode (no padding requirement) for shape validation.
+fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits = 0u32;
+    for &b in s.as_bytes() {
+        if b == b'=' {
+            break;
+        }
+        let v = ALPHABET.iter().position(|&a| a == b)? as u32;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -194,7 +317,11 @@ enum Command {
     /// Connect to the dispatch service, register, and heartbeat.
     Start {
         /// Dispatch WebSocket URL.
-        #[arg(long, env = "DISPATCH_URL", default_value = "ws://localhost:8790/ws")]
+        #[arg(
+            long,
+            env = "DISPATCH_URL",
+            default_value = "wss://decent-render-dispatch.fly.dev/ws"
+        )]
         dispatch_url: String,
         /// Worker JWT. If omitted (and no WORKER_TOKEN env), reads the token
         /// stored by `decent login` (the token file).
@@ -258,7 +385,11 @@ enum Command {
     /// token). `q`/Esc to quit.
     Tui {
         /// Dispatch WebSocket URL.
-        #[arg(long, env = "DISPATCH_URL", default_value = "ws://localhost:8790/ws")]
+        #[arg(
+            long,
+            env = "DISPATCH_URL",
+            default_value = "wss://decent-render-dispatch.fly.dev/ws"
+        )]
         dispatch_url: String,
         /// Worker JWT. If omitted (and no WORKER_TOKEN env), reads the token
         /// stored by `decent login`.
@@ -473,6 +604,7 @@ async fn main() -> anyhow::Result<()> {
             heartbeat_limit,
             allow_real_jobs,
         } => {
+            validate_dispatch_url(&dispatch_url)?;
             let token = resolve_token(token)?;
             let register = build_register();
             tracing::info!(
@@ -570,11 +702,10 @@ async fn main() -> anyhow::Result<()> {
             // Direct token storage (company/internal tokens) skips the web page.
             if let Some(tok) = token {
                 let tok = tok.trim().to_string();
-                if tok.split('.').count() != 3 {
-                    anyhow::bail!(
-                        "That doesn't look like a worker token (expected three dot-separated parts)."
-                    );
-                }
+                // PACKET 40 (audit-api-ux): validate SHAPE before storing.
+                // The token is never echoed — errors describe it, never
+                // repeat it.
+                validate_worker_token_shape(&tok)?;
                 save_token(&tok)?;
                 println!("Token saved to ~/.config/decent/worker-token (0600).");
                 println!("Run `decent start`, or `decent install` for the daemon.");
@@ -591,11 +722,8 @@ async fn main() -> anyhow::Result<()> {
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
             let token = line.trim().to_string();
-            if token.split('.').count() != 3 {
-                anyhow::bail!(
-                    "That doesn't look like a worker token (expected three dot-separated parts). \
-                     Re-run `decent login`."
-                );
+            if let Err(e) = validate_worker_token_shape(&token) {
+                anyhow::bail!("{e:#}; re-run `decent login`");
             }
             save_token(&token)?;
             println!("Token saved to ~/.config/decent/worker-token (0600). Run `decent start` to connect.");
@@ -617,6 +745,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Install { dispatch_url } => {
+            validate_dispatch_url(&dispatch_url)?;
             // Guard: refuse to install a daemon that would bail-loop with no
             // token (start would exit immediately, launchd would restart it).
             if load_token().is_empty() {
@@ -706,19 +835,29 @@ async fn main() -> anyhow::Result<()> {
                             Some(v) => {
                                 format!("⚠ {v} available — run `decent upgrade`")
                             }
-                            None => "up to date".to_string(),
+                            // PACKET 40 (audit 18): "up to date" requires the
+                            // daemon to be CONNECTED (dispatch tells it on
+                            // register). A registered-but-disconnected or
+                            // never-connected node has no data — say unknown.
+                            None if s.connection == "connected" => "up to date".to_string(),
+                            None => "unknown (daemon not connected)".to_string(),
                         }
                     );
                 }
                 Some(_) => {
                     println!("connection  : stale (no recent snapshot — daemon may have stopped)");
-                    println!("update      : up to date");
+                    // PACKET 40 (audit 18): the snapshot exists but is stale —
+                    // whatever it says about updates is out of date. Never
+                    // assert "up to date" without live data behind it.
+                    println!("update      : unknown (snapshot is stale)");
                 }
                 None => {
                     if daemon == DaemonState::Running {
                         println!("connection  : (no live snapshot — daemon starting, or an older binary)");
                     }
-                    println!("update      : up to date");
+                    // PACKET 40 (audit 18): no snapshot at all — the CLI knows
+                    // NOTHING about update state. Say so instead of "up to date".
+                    println!("update      : unknown (no recent snapshot)");
                 }
             }
             Ok(())
@@ -763,6 +902,7 @@ async fn main() -> anyhow::Result<()> {
             token,
             allow_real_jobs,
         } => {
+            validate_dispatch_url(&dispatch_url)?;
             let token = resolve_token(token)?;
             let register = build_register();
             let config = ConnectionConfig {
@@ -786,5 +926,194 @@ async fn main() -> anyhow::Result<()> {
             let _ = conn.await;
             Ok(())
         }
+    }
+}
+
+// ── PACKET 40 tests ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod packet40_tests {
+    use super::*;
+
+    // Step 1: scheme validation.
+    #[test]
+    fn wss_urls_are_accepted_everywhere() {
+        assert!(validate_dispatch_url("wss://decent-render-dispatch.fly.dev/ws").is_ok());
+        assert!(validate_dispatch_url("wss://example.com/?a=1&b=2").is_ok());
+    }
+
+    #[test]
+    fn plain_ws_is_allowed_only_for_localhost() {
+        // The e2e harness and local development.
+        assert!(validate_dispatch_url("ws://localhost:8790/ws").is_ok());
+        assert!(validate_dispatch_url("ws://127.0.0.1:8790/ws").is_ok());
+        assert!(validate_dispatch_url("ws://[::1]:8790/ws").is_ok());
+        // A REMOTE host over ws:// ships the JWT in cleartext — refused,
+        // with a message that says why and names the fix.
+        let err = validate_dispatch_url("ws://dispatch.example.com/ws")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CLEARTEXT"), "got: {err}");
+        assert!(
+            err.contains("wss://dispatch.example.com/ws"),
+            "must name the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn non_ws_schemes_are_refused_with_the_scheme_named() {
+        let err = validate_dispatch_url("http://example.com/ws")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("http"), "got: {err}");
+        assert!(validate_dispatch_url("not a url at all").is_err());
+    }
+
+    // Step 3a: token shape validation. Never echoes the token.
+    fn jwt_with(payload_json: &str) -> String {
+        let b64 = |s: &str| {
+            // minimal base64url encode for test fixtures
+            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let bytes = s.as_bytes();
+            let mut out = String::new();
+            let mut buf: u32 = 0;
+            let mut bits = 0;
+            for &b in bytes {
+                buf = (buf << 8) | b as u32;
+                bits += 8;
+                while bits >= 6 {
+                    bits -= 6;
+                    out.push(A[((buf >> bits) & 0x3f) as usize] as char);
+                }
+            }
+            if bits > 0 {
+                out.push(A[((buf << (6 - bits)) & 0x3f) as usize] as char);
+            }
+            out
+        };
+        format!(
+            "{}.{}.{}",
+            b64("{\"alg\":\"HS256\",\"typ\":\"JWT\"}"),
+            b64(payload_json),
+            b64("signature-material-long-enough-to-be-realistic")
+        )
+    }
+
+    #[test]
+    fn a_well_formed_worker_token_passes_shape_validation() {
+        let tok = jwt_with("{\"service\":\"render-worker\",\"tenant\":\"t\",\"workerId\":\"w\"}");
+        assert!(validate_worker_token_shape(&tok).is_ok());
+    }
+
+    #[test]
+    fn placeholders_and_malformed_tokens_are_rejected_without_being_echoed() {
+        for bad in [
+            "paste-your-token-here",
+            "",
+            "abc",                                                // not 3 parts
+            "a.b.c",                                              // too short + undecodable
+            jwt_with("{\"sub\":\"some-other-system\"}").as_str(), // JWT without worker claims
+        ] {
+            let res = validate_worker_token_shape(bad);
+            assert!(res.is_err(), "must reject: {} chars", bad.len());
+            let msg = res.unwrap_err().to_string();
+            // THE RED LINE: the message must never CONTAIN the token.
+            if !bad.is_empty() {
+                assert!(!msg.contains(bad), "error message echoes the token!");
+                assert!(!msg.contains(&bad[..bad.len().min(12)]));
+            }
+        }
+    }
+
+    // Step 4: credential file mode. Temp HOME; never touches the real one.
+    #[cfg(unix)]
+    #[test]
+    fn saved_token_file_is_created_0600_immediately() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!(
+            "p40-token-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        // Scoped HOME override (tests run in parallel: restore in ALL paths).
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &home) };
+        let result = (|| {
+            let tok =
+                jwt_with("{\"service\":\"render-worker\",\"tenant\":\"t\",\"workerId\":\"w\"}");
+            save_token(&tok)?;
+            let path = home.join(".config/decent/worker-token");
+            let mode = std::fs::metadata(&path)?.permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "token file must be 0600 (got {:o})",
+                mode & 0o777
+            );
+            // The 0700 parent too.
+            let parent_mode = std::fs::metadata(home.join(".config/decent"))?
+                .permissions()
+                .mode();
+            assert_eq!(parent_mode & 0o777, 0o700, "config dir must be 0700");
+            // No temp residue.
+            let tmp = home.join(".config/decent/worker-token.token.tmp");
+            assert!(!tmp.exists(), "temp file left behind");
+            Ok::<(), anyhow::Error>(())
+        })();
+        match prev {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        std::fs::remove_dir_all(&home).ok();
+        result.unwrap();
+    }
+
+    // Step 4: the MIGRATION path must tighten, not preserve, permissions.
+    #[cfg(unix)]
+    #[test]
+    fn migrated_token_gets_0600_even_from_a_world_readable_old_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!(
+            "p40-mig-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let old_dir = home.join(".config/decent-node");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let tok = jwt_with("{\"service\":\"render-worker\",\"tenant\":\"t\",\"workerId\":\"w\"}");
+        // The pre-hardening shape: a WORLD-READABLE token at the old path.
+        std::fs::write(old_dir.join("worker-token"), format!("{tok}\n")).unwrap();
+        std::fs::set_permissions(
+            old_dir.join("worker-token"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &home) };
+        let result = (|| {
+            let path = token_path()?; // runs the migration
+            let mode = std::fs::metadata(&path)?.permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "migrated token must be tightened to 0600, got {:o}",
+                mode & 0o777
+            );
+            Ok::<(), anyhow::Error>(())
+        })();
+        match prev {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        std::fs::remove_dir_all(&home).ok();
+        result.unwrap();
     }
 }
