@@ -109,6 +109,27 @@ impl ConnectionConfig {
     }
 }
 
+/// PACKET 40 (audit-api-ux): classify tungstenite connect errors.
+/// `Error::Http(resp)` is the handshake being REFUSED at the HTTP layer —
+/// auth/version policy, not reachability.
+fn is_auth_rejection(e: &tokio_tungstenite::tungstenite::Error) -> bool {
+    matches!(
+        rejection_status_opt(e),
+        Some(reqwest::StatusCode::UNAUTHORIZED) | Some(reqwest::StatusCode::FORBIDDEN)
+    )
+}
+
+fn rejection_status_opt(e: &tokio_tungstenite::tungstenite::Error) -> Option<reqwest::StatusCode> {
+    match e {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => Some(resp.status()),
+        _ => None,
+    }
+}
+
+fn rejection_status(e: &tokio_tungstenite::tungstenite::Error) -> reqwest::StatusCode {
+    rejection_status_opt(e).unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 /// Connect, register, heartbeat, and process server messages.
 ///
 /// Returns `Ok(())` on a clean self-initiated close (heartbeat limit reached,
@@ -218,6 +239,23 @@ async fn run_session(
         };
         match connect {
             Ok((ws, _resp)) => break ws,
+            // PACKET 40 (audit-api-ux): an HTTP-level rejection (401/403)
+            // is NOT "dispatch unreachable" — retrying it 15 times sends
+            // the operator to debug their network when the token is bad or
+            // revoked. Fail fast, name the real cause.
+            Err(e) if is_auth_rejection(&e) => {
+                let msg = format!(
+                    "Dispatch rejected this node's credentials (HTTP {}): the worker token                      is invalid, expired, or revoked. Re-run `decent login` with a fresh                      token. (Retrying will not help.)",
+                    rejection_status(&e)
+                );
+                tracing::error!(status = %rejection_status(&e), "auth rejected at connect");
+                obs.update_status(|s| {
+                    s.connection = ConnectionState::Disconnected;
+                    s.last_error = Some(msg.clone());
+                });
+                obs.log(LogLine::error(&msg));
+                return Err(e).context(msg);
+            }
             Err(e) if attempts < config.max_connect_attempts => {
                 tracing::info!(
                     attempt = attempts,
@@ -622,7 +660,6 @@ async fn run_session(
                                             continue;
                                         }
                                         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-                                        let mut pending_cancel = Some(cancel_tx);
                                         let job_id_owned = assign.job_id.clone();
                                         let tier = format!("{:?}", assign.kind).to_lowercase();
                                         obs.update_status(|s| {
@@ -675,7 +712,7 @@ async fn run_session(
                                         // PACKET 5: keep the JoinHandle — every exit path awaits it.
                                         in_flight = Some(InFlightJob {
                                             job_id: job_id_owned,
-                                            cancel: pending_cancel.take(),
+                                            cancel: Some(cancel_tx),
                                             cache_keys: crate::runner::cache_keys_for(&assign_snapshot),
                                             handle,
                                         });
@@ -1034,6 +1071,66 @@ fn log_server_message(msg: &ServerMessage, allow_real_jobs: bool) {
 
 #[cfg(test)]
 mod tests {
+    // ── PACKET 40 (audit-api-ux): 401 ≠ unreachable ─────────────────────────────
+
+    /// A TCP listener that completes the TCP+HTTP exchange but answers the
+    /// websocket upgrade with an HTTP 401 — the shape dispatch returns for a
+    /// bad/revoked token.
+    async fn serve_401() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = socket.read(&mut buf).await; // the upgrade request
+                    let resp = "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn an_http_401_at_connect_is_an_auth_failure_not_unreachable() {
+        let addr = serve_401().await;
+        let config = ConnectionConfig {
+            max_connect_attempts: 20, // a full retry ladder — the test asserts we DON'T climb it
+            connect_retry_delay: Duration::from_millis(200),
+            ..ConnectionConfig::new(format!("ws://{addr}/ws"), "test-jwt.token")
+        };
+        let register = test_register();
+        let obs = Observability::default();
+        let started = std::time::Instant::now();
+        let err = run(&config, &register, &obs, never_shutdown())
+            .await
+            .expect_err("401 must fail the run");
+        // FAST: no retry ladder against an auth rejection. The ladder here is
+        // 20 attempts × 200ms ≈ 4s+; the auth arm fails on attempt 1 (~0s).
+        // (Verified by mutation: with the auth arm disabled this test took
+        // 3.85s and failed these assertions.)
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "auth rejection must fail fast, took {:?}",
+            started.elapsed()
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("credentials"),
+            "must name the credential cause (only the auth arm says credentials), got: {msg}"
+        );
+        assert!(msg.contains("401"), "must name the status, got: {msg}");
+        assert!(
+            !msg.to_lowercase().contains("unreachable"),
+            "must NOT be reported as unreachable, got: {msg}"
+        );
+    }
 
     use super::*;
     use crate::protocol::{Capabilities, Platform, PROTOCOL_VERSION};

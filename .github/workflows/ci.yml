@@ -21,9 +21,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p supervisor-core -p decent --all-targets --all-features -- -D warnings
+      # PACKET 40 (audit / AGENTS.md invariant 6): gate the whole workspace
+      # EXCEPT the Tauri crate. The old -p supervisor-core -p decent scope
+      # left bins/decent-node-shim never compiled, clippy'd, or tested —
+      # that gap is now closed. decent-app (Tauri) is deliberately excluded
+      # here: it ships macOS-only, and compiling its GTK/WebKit stack on
+      # Linux is the exact failure that broke the v0.0.8 release
+      # (see dist-workspace.toml's precise-builds note). It is gated on
+      # macOS in the decent-app-rust job below, on the platform it ships to.
+      - run: cargo clippy --workspace --exclude decent-app --all-targets --all-features -- -D warnings
       # Includes Rust cross-language fixture conformance.
-      - run: cargo test -p supervisor-core -p decent
+      - run: cargo test --workspace --exclude decent-app
       - run: cargo build -p decent
       - run: ./target/debug/decent --version
       - run: ./target/debug/decent --help
@@ -79,6 +87,22 @@ jobs:
         working-directory: packages/runner-core
         env:
           REQUIRE_FF: '1'
+
+  decent-app-rust:
+    name: Tauri crate (macOS — the platform it ships to)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      # PACKET 40: the Tauri crate ships macOS-only (the app's dist target is
+      # aarch64-apple-darwin), so it is gated HERE, not on ubuntu — compiling
+      # its GTK/WebKit stack on Linux is the known trap that broke the v0.0.8
+      # release despite `dist = false` (see dist-workspace.toml's
+      # precise-builds note). AGENTS.md invariant 6 (one core, every surface
+      # gated) is satisfied per-platform instead of pretending ubuntu can
+      # cover a crate it never builds for release.
+      - run: cargo clippy -p decent-app --all-targets --all-features -- -D warnings
+      - run: cargo test -p decent-app
 
   app-frontend:
     name: Tauri frontend build + tests

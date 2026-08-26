@@ -7,18 +7,11 @@
 
 use crate::protocol::Capabilities;
 
-/// Measurement (2026-08-19) found no throughput gain from concurrency at 1080p,
-/// 4K or WebGPU, and outright failure at 16 (Remotion's internal static server
-/// saturates). So the default is one job, and the ceiling exists to stop an
-/// operator configuring their node into a state that cannot finish work.
-const DEFAULT_MAX_CONCURRENT_JOBS: u32 = 1;
-const MAX_CONCURRENT_JOBS_CEILING: u32 = 8;
-
 /// Probe this machine, honouring operator overrides.
 ///
-/// `DECENT_GPU=0|1` and `DECENT_MAX_CONCURRENT_JOBS=<n>` win over the probe: an
-/// operator knows their box better than a heuristic does, and a wrong probe
-/// should be correctable without a new release.
+/// `DECENT_GPU=0|1` wins over the probe: an operator knows their box better
+/// than a heuristic does, and a wrong probe should be correctable without a
+/// new release. (Concurrency is NOT configurable — see max_concurrent_jobs.)
 pub fn detect_capabilities() -> Capabilities {
     Capabilities {
         gpu: gpu_override().unwrap_or_else(detect_gpu),
@@ -36,35 +29,17 @@ fn gpu_override() -> Option<bool> {
     }
 }
 
-/// The DECLARED max is clamped to 1 (packet 19): the connection loop runs one
-/// job at a time and rejects any second assignment unconditionally
-/// (connection.rs: in-flight is Option, not a counter), so declaring N > 1 on
-/// the wire would be a lie dispatch selection believes (`inFlight <
-/// maxConcurrentJobs`) — an operator asking for 4 would receive 4 assignments
-/// and reject 3 of them. Per the measured decision in the multi-platform
-/// design doc §11.3 (concurrency flat or worse above 1), stop declaring what
-/// we do not honor; the parse + ceiling stay for the day the select loop
-/// actually holds N jobs.
+/// PACKET 40 (audit 19): the node declares exactly ONE concurrent job —
+/// the connection loop runs a single in-flight slot and rejects any second
+/// assignment unconditionally, so declaring N > 1 would make dispatch
+/// believe a lie (`inFlight < maxConcurrentJobs`) and waste assignments.
+/// The `DECENT_MAX_CONCURRENT_JOBS` env knob was REMOVED: it parsed, was
+/// clamped, was logged — and then ignored (declared_concurrency returned 1
+/// regardless), which is worse than no knob (an operator setting it
+/// believes it worked). When the select loop genuinely holds N jobs,
+/// reintroduce the knob together with the loop change, not before.
 fn max_concurrent_jobs() -> u32 {
-    let configured = std::env::var("DECENT_MAX_CONCURRENT_JOBS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_MAX_CONCURRENT_JOBS);
-    let clamped = configured.min(MAX_CONCURRENT_JOBS_CEILING);
-    if clamped > 1 {
-        tracing::info!(
-            requested = clamped,
-            declared = 1,
-            "operator requested {clamped} concurrent jobs; the supervisor runs one job at a time today, declaring 1"
-        );
-    }
-    declared_concurrency(clamped)
-}
-
-/// The honest declaration: one job, always, until the select loop holds N.
-fn declared_concurrency(_configured: u32) -> u32 {
-    1
+    1 // see the doc comment: one in-flight slot is what the loop honors
 }
 
 /// Can this node render the GPU path?
@@ -133,29 +108,20 @@ mod tests {
     fn defaults_to_one_job() {
         // Concurrency showed no measured gain; the default must not drift up
         // silently just because a machine looks big.
-        assert_eq!(max_concurrent_jobs(), DEFAULT_MAX_CONCURRENT_JOBS);
+        assert_eq!(max_concurrent_jobs(), 1);
     }
 
-    /// Packet 19: the DECLARED concurrency is 1 regardless of what the env
-    /// asks for — the connection loop rejects a second assignment, so any
-    /// higher declaration is a lie on the wire. Pure-fn shape: the parse
-    /// still honors the ceiling for the day the loop holds N; the clamp is
-    /// what the register frame reports.
+    /// PACKET 40 (audit 19): DECENT_MAX_CONCURRENT_JOBS was an inert knob —
+    /// parsed, clamped, logged, and then ignored (the declaration was always
+    /// 1). Deleted rather than honoured: honouring it without a connection-
+    /// loop rewrite would make dispatch assign N jobs we reject N-1 of.
+    /// Pin BOTH halves: the declaration is 1, and the knob no longer exists
+    /// anywhere in the source.
     #[test]
-    fn declared_concurrency_is_one_even_when_the_env_asks_for_more() {
-        // No env mutation in the parallel test binary — drive the pure fn
-        // with the values the env could carry.
-        for asked in [1u32, 2, 4, 8, 99] {
-            let clamped = asked.min(MAX_CONCURRENT_JOBS_CEILING);
-            // What max_concurrent_jobs() must declare, whatever the env said:
-            // the register frame carries 1; the log fires for clamped > 1
-            // (asserted separately below to keep this test pure).
-            assert_eq!(
-                declared_concurrency(clamped),
-                1,
-                "env asking {asked} must still declare 1"
-            );
-        }
+    fn concurrency_declaration_is_one_and_the_env_knob_is_gone() {
+        assert_eq!(max_concurrent_jobs(), 1);
+        // The knob must not creep back as a parse that goes nowhere.
+        assert!(!std::env::vars().any(|(k, _)| k == "DECENT_MAX_CONCURRENT_JOBS"));
     }
 
     #[test]
