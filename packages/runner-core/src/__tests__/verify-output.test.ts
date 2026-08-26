@@ -68,6 +68,25 @@ afterAll(() => {
 
 const base = {expectedFrames: 30, expectedWidth: 64, expectedHeight: 36, binariesDirectory: systemFfDir};
 
+describe('the ffmpeg gate itself', () => {
+	it('fails LOUDLY when REQUIRE_FF=1 and the system ffmpeg is missing', () => {
+		// PACKET 39 (audit item 9): the verification suites used to
+		// `describe.skipIf(!haveSystemFf)` silently — CI had no ffmpeg, so the
+		// black-frame/dead-GPU guard reported green having executed ZERO
+		// assertions. CI now installs ffmpeg and sets REQUIRE_FF=1; this test
+		// makes the skip impossible: if the tooling ever disappears again
+		// (a workflow edit, a broken apt mirror), the job FAILS here instead
+		// of quietly disarming. Locally (no REQUIRE_FF) a missing ffmpeg
+		// still skips, as before.
+		if (process.env.REQUIRE_FF === '1') {
+			expect(
+				haveSystemFf,
+				'REQUIRE_FF=1 but ffmpeg/ffprobe was not found — the output-verification gate would silently skip; refusing to run disarmed',
+			).toBe(true);
+		}
+	});
+});
+
 describe.skipIf(!haveSystemFf)('verifyRenderedOutput', () => {
 	it('accepts a healthy render and returns MEASURED values', () => {
 		const probe = verifyRenderedOutput({...base, outputLocation: clip('good.mp4')});
@@ -216,6 +235,12 @@ describe('the output size cap', () => {
  *
  * So: run the real thing against the real binaries.
  */
+// LOCAL-ONLY INTEGRATION TEST — NOT CI COVERAGE. This block additionally
+// requires a real render payload cached in ~/.decent-worker/payloads, which
+// only an actual operator machine has (CI installs ffmpeg but has no
+// payload). It is skipped everywhere CI runs and pins the DEVELOPER-machine
+// path (payload ffmpeg is stripped and dyld-sensitive — see the long comment
+// above). Do not read its green-in-CI absence as coverage.
 const payloadBinaries = findPayloadBinaries();
 describe.skipIf(!haveSystemFf || payloadBinaries === null)("the render payload's own ffmpeg", () => {
 	it('supports every operation the verifier depends on', () => {

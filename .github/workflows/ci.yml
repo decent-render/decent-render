@@ -64,9 +64,21 @@ jobs:
         working-directory: packages/runner-core
       - run: bun run build
         working-directory: packages/runner-core
-      # The stdout-discipline suite spawns `bun` subprocesses (setup-bun above).
+      # The output-verification gate needs a REAL ffmpeg/ffprobe: without it
+      # those suites silently skip and CI reports green having executed zero
+      # of their assertions (audit-tests item 9). Install it and then FAIL
+      # if it is missing, so a future workflow edit that drops this step (or
+      # an apt mirror serving a broken package) cannot quietly disarm the
+      # dead-GPU guard again.
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # REQUIRE_FF=1 turns the suites' `describe.skipIf(!haveSystemFf)` into a
+      # hard failure: the guard that catches "succeeded but produced garbage"
+      # must never silently not-run. (See verify-output.test.ts /
+      # verify-before-upload.test.ts gate tests.)
       - run: bun run test
         working-directory: packages/runner-core
+        env:
+          REQUIRE_FF: '1'
 
   app-frontend:
     name: Tauri frontend build + tests

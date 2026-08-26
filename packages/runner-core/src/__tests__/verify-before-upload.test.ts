@@ -75,6 +75,25 @@ function rendererProducing(fixture: string) {
 	};
 }
 
+describe('the ffmpeg gate itself', () => {
+	it('fails LOUDLY when REQUIRE_FF=1 and the system ffmpeg is missing', () => {
+		// PACKET 39 (audit item 9): the verification suites used to
+		// `describe.skipIf(!haveSystemFf)` silently — CI had no ffmpeg, so the
+		// black-frame/dead-GPU guard reported green having executed ZERO
+		// assertions. CI now installs ffmpeg and sets REQUIRE_FF=1; this test
+		// makes the skip impossible: if the tooling ever disappears again
+		// (a workflow edit, a broken apt mirror), the job FAILS here instead
+		// of quietly disarming. Locally (no REQUIRE_FF) a missing ffmpeg
+		// still skips, as before.
+		if (process.env.REQUIRE_FF === '1') {
+			expect(
+				haveSystemFf,
+				'REQUIRE_FF=1 but ffmpeg/ffprobe was not found — the output-verification gate would silently skip; refusing to run disarmed',
+			).toBe(true);
+		}
+	});
+});
+
 describe.skipIf(!haveSystemFf)('renderJob verifies before uploading', () => {
 	it('uploads a healthy render and reports the MEASURED frame count', async () => {
 		const puts = stubNetwork();
