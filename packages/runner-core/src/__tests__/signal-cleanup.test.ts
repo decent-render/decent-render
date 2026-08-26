@@ -35,10 +35,20 @@ function spawnSignalRunner(): RunnerHandle {
 	writeFileSync(bundlePath, bundle.bytes);
 	const probe = path.join(dir, 'workdir-probe');
 
+	// HOME override: the runner resolves its cache root (~/.decent-worker)
+	// from HOME, so without this the subprocess writes into the LIVE operator
+	// cache — this file was the one sibling missing it (stdout-discipline and
+	// liveness both mkdtemp a HOME), and it seeded 266 dirs / 3.5 GB of real
+	// bundles there, one per run: helpers.ts' `tar -czf` embeds mtime, so
+	// every run produces a new sha and nothing is ever overwritten. That is
+	// the same cache root the production LRU sweeper manages.
+	const home = mkdtempSync(path.join(tmpdir(), 'runner-core-signal-home-'));
+
 	const child = spawn('bun', [path.join(fixtures, 'harness-signal.ts')], {
 		stdio: ['pipe', 'pipe', 'pipe'],
 		env: {
 			...process.env,
+			HOME: home,
 			FIXTURE_BUNDLE_PATH: bundlePath,
 			FIXTURE_WORKDIR_PROBE: probe,
 		},
