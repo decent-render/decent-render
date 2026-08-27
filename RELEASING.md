@@ -56,6 +56,55 @@ cargo-dist auto-generates and pushes `Formula/decent.rb` to the tap on tag
 `Formula/decent-node.rb` (compatibility shim) is maintained by the
 `update-homebrew-shim.yml` workflow, which runs on release completion.
 
+### `HOMEBREW_TAP_TOKEN` — what it must be (learned the hard way, v0.0.9)
+
+The `publish-homebrew-formula` job pushes to `decent-render/homebrew-tap`,
+a **different repo** from this one, so `GITHUB_TOKEN` cannot do it. The
+`HOMEBREW_TAP_TOKEN` secret must be a **fine-grained PAT** with:
+
+- **Resource owner: `decent-render`** (the ORG, not a personal account).
+  This is fixed at creation and cannot be edited afterwards. A token created
+  against a personal account can never see org repos — it shows
+  "access to zero repositories" and fails with
+  `remote: Permission to decent-render/homebrew-tap.git denied` / HTTP 403.
+- Repository access: **Only select repositories → `homebrew-tap`**
+- Repository permissions: **Contents: Read and write**. Nothing else.
+  (Metadata read-only is automatic.) Not Actions, not Deployments, not
+  Secrets — the job only commits and pushes one file, and this secret lives
+  in a PUBLIC repo, so extra scope is pure blast radius. For the same reason
+  prefer this over a classic `repo`-scope token, which would also reach the
+  private `farm-web`.
+
+**Verify the token, not your own login.** Checking `gh api repos/... --jq
+.permissions` with your ambient `gh` credentials reports what YOUR ACCOUNT
+can do and will happily say `push: true` for a token that has nothing. Ask
+GitHub as the token:
+
+```sh
+curl -s -H "Authorization: Bearer $TOKEN" \
+  https://api.github.com/repos/decent-render/homebrew-tap \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin).get("permissions"))'
+```
+
+**When the token expires the job fails silently in exactly this way.** The
+release itself still succeeds — only the tap goes stale — so `brew install`
+quietly serves the previous version. If a release looks fine but
+`brew info decent-render/tap/decent` shows the old version, check the token
+first.
+
+**Manual fallback** (used for 0.0.8 `5963aa0` and 0.0.9 `869c38f`): the
+release publishes the generated formula as an asset, so
+
+```sh
+gh release download vX.Y.Z --repo decent-render/decent-render --pattern 'decent.rb' -O /tmp/decent.rb
+git clone https://github.com/decent-render/homebrew-tap /tmp/tap
+cp /tmp/decent.rb /tmp/tap/Formula/decent.rb
+cd /tmp/tap && git commit -m "decent X.Y.Z" -- Formula/decent.rb && git push
+```
+
+Then confirm: `brew info decent-render/tap/decent` reports the new version,
+and the formula's sha256 equals the release's `.tar.xz.sha256`.
+
 ## Failed release recovery
 
 - A tag with no GitHub Release is incomplete.
