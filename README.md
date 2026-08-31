@@ -151,6 +151,13 @@ operator explicitly opts in — both on the CLI (`--allow-real-jobs`) and in the
 app (UI toggle). The app cannot bypass the purge rule; it observes and
 controls, the core enforces workdir deletion structurally (`WorkDir::Drop`).
 
+**Updates are manual by design.** The node never self-updates (a bad release
+must not brick an unattended machine); `decent upgrade` runs
+`brew upgrade decent` on macOS or the installer on Linux and restarts the
+daemon. The wire has an `updateAvailable` frame the CLI already renders as a
+banner, but the dispatch service does not send it yet — release notification
+is tracked as open work on the platform side.
+
 ## Development
 
 ```sh
