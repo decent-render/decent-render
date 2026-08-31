@@ -100,6 +100,12 @@ jobs:
       # compiling the Rust crate, not merely of shipping it.
       - run: bun install --frozen-lockfile
         working-directory: apps/decent-app
+      # The Tauri dep tree cold-builds in ~4-5 min on the 10x-billed macOS
+      # runner; cache it (keyed on the lockfile) so steady-state is fast.
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: .
+          cache-on-failure: true
       - run: bun run build
         working-directory: apps/decent-app
       # PACKET 40: the Tauri crate ships macOS-only (the app's dist target is
