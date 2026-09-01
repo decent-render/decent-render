@@ -197,6 +197,7 @@ async fn run_session(
     register: &RegisterMessage,
     obs: &Observability,
     shutdown: &mut oneshot::Receiver<()>,
+    protected_keys: &mut Vec<String>,
 ) -> anyhow::Result<Disconnect> {
     // Initialize status snapshot with identity + dispatch URL.
     obs.update_status(|s| {
@@ -314,15 +315,31 @@ async fn run_session(
     }
 
     // Cache LRU sweep (2.9, packet 17): enforce the size cap at startup,
-    // before any jobAssign can arrive — nothing is in flight yet, so the
-    // protected set is empty. This is also the sweep that eventually
+    // before any jobAssign can arrive. On the FIRST connect nothing has been
+    // seen, so the protected set is empty — but on a RECONNECT the caller
+    // hands back the cache keys of the jobs this supervisor has already run
+    // (D-10): an empty set here would let the sweep evict a payload/browser
+    // this very node may be re-assigned the moment it re-registers (and, on
+    // a machine with more than one supervisor sharing a worker root, one a
+    // SIBLING is still using — the cache sweep has no pid-liveness rule of
+    // its own; the protected set is the only thing standing between an LRU
+    // pass and a live artifact). This is also the sweep that eventually
     // reclaims the pre-eviction residue (old test-* dirs and every
     // superseded payload/browser/bundle) on real nodes.
-    match crate::cache::sweep_node_caches(&[]) {
-        Ok(out) if out.evicted > 0 => {
+    match crate::cache::sweep_node_caches(protected_keys) {
+        Ok(out) if out.evicted > 0 || !protected_keys.is_empty() => {
+            // Surface evictions on the status log (TUI log pane + daemon log)
+            // — packet 20: an operator should see the cache being reclaimed
+            // without reading tracing output. D-10: the protected count rides
+            // along — after a job ran, a reconnect sweep reporting an EMPTY
+            // protected set is exactly the bug this line exposes.
             obs.log(LogLine::info(format!(
-                "Cache sweep: {} entries, {} -> {} bytes ({} evicted)",
-                out.entries, out.bytes_before, out.bytes_after, out.evicted
+                "Cache sweep: {} entries, {} -> {} bytes ({} evicted, {} protected)",
+                out.entries,
+                out.bytes_before,
+                out.bytes_after,
+                out.evicted,
+                protected_keys.len()
             )));
         }
         Ok(_) => {}
@@ -575,8 +592,12 @@ async fn run_session(
                         // timer during a render (packet 9's interference
                         // budget). Blocking is fine: the terminal frame was
                         // already sent; the next heartbeat tick can wait.
-                        let protected = in_flight.as_ref().map(|j| j.cache_keys.clone()).unwrap_or_default();
-                        match crate::cache::sweep_node_caches(&protected) {
+                        // D-10: the keys are also REMEMBERED (into the
+                        // caller's set) so the next reconnect's startup
+                        // sweep protects them too.
+                        *protected_keys =
+                            in_flight.as_ref().map(|j| j.cache_keys.clone()).unwrap_or_default();
+                        match crate::cache::sweep_node_caches(protected_keys) {
                             Ok(out) if out.evicted > 0 => {
                                 // Surface evictions on the status log (TUI log
                                 // pane + daemon log) — packet 20: an operator
@@ -740,9 +761,11 @@ async fn run_session(
                                             // path below would never run it. Run it
                                             // NOW with this job's cache keys protected
                                             // (same shape as the terminal-frame sweep).
+                                            // D-10: remembered for the next reconnect
+                                            // sweep as well.
                                             {
-                                                let protected = job.cache_keys.clone();
-                                                match crate::cache::sweep_node_caches(&protected) {
+                                                *protected_keys = job.cache_keys.clone();
+                                                match crate::cache::sweep_node_caches(protected_keys) {
                                                     Ok(out) if out.evicted > 0 => {
                                                         obs.log(LogLine::info(format!(
                                                             "Cache sweep: {} entries, {} -> {} bytes ({} evicted)",
@@ -1001,9 +1024,24 @@ pub async fn run(
     let mut backoff =
         ReconnectBackoff::new(config.reconnect_backoff_base, config.reconnect_backoff_max);
 
+    // D-10: the cache keys of the jobs this supervisor has seen, remembered
+    // ACROSS sessions. The startup sweep of every (re)connect protects them
+    // instead of sweeping blind; empty until the first job's terminal/cancel
+    // sweep fills it.
+    let mut last_protected: Vec<String> = Vec::new();
+
     loop {
         let session_start = std::time::Instant::now();
-        match run_session(config, &request, register, obs, &mut shutdown).await {
+        match run_session(
+            config,
+            &request,
+            register,
+            obs,
+            &mut shutdown,
+            &mut last_protected,
+        )
+        .await
+        {
             Ok(Disconnect::Shutdown)
             | Ok(Disconnect::HeartbeatLimit)
             | Ok(Disconnect::UpgradeRequired) => {
@@ -1597,6 +1635,114 @@ echo '{"type":"done","outputSizeInBytes":1,"wallTimeMs":1}'
         let _ = std::fs::remove_dir_all(&stale);
     }
 
+    /// D-10 wiring: a RECONNECT session's startup cache sweep receives the
+    /// last job's cache keys — visible in the sweep's operator log line
+    /// ("N protected"). A first-connect session (no job seen yet) stays
+    /// silent, as before. The eviction SEMANTICS of a protected set are
+    /// pinned by cache.rs's sweep_caches unit tests; this pins the
+    /// connection-side wiring: after a job ran, the reconnect sweep is NOT
+    /// handed an empty set. (An end-to-end over-cap eviction variant of this
+    /// test was tried first and retired: tripping the 1 GiB floor cap from a
+    /// parallel test binary required an env window around the sweep, and the
+    /// window's sweeps raced the kill tests' fixtures — see packet 56
+    /// receipt, OWED.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconnect_hands_the_startup_sweep_the_last_jobs_keys() {
+        // Install the redirected worker root (first-write-wins): the sweeps
+        // in this test must never see the real ~/.decent-worker.
+        let _root = test_worker_root();
+        let pid = std::process::id();
+        let sha = format!("test-reconnkeys-{pid}");
+        let job_id = format!("job-reconnkeys-{pid}");
+
+        let payload_dir = seed_fake_payload(
+            &sha,
+            r#"#!/bin/sh
+echo '{"type":"done","outputSizeInBytes":1,"wallTimeMs":1}'
+"#,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = ConnectionConfig {
+            heartbeat_interval: Duration::from_millis(50),
+            max_connect_attempts: 20,
+            connect_retry_delay: Duration::from_millis(50),
+            heartbeat_limit: None,
+            reconnect: true,
+            reconnect_backoff_base: Duration::from_millis(50),
+            reconnect_backoff_max: Duration::from_secs(1),
+            ..ConnectionConfig::new(format!("ws://127.0.0.1:{port}/ws"), "test-jwt.token")
+        };
+        let register = test_register();
+        let (obs, mut status_rx, mut log_rx) =
+            Observability::channels(crate::status::SupervisorStatus::default());
+        obs.set_allow_real_jobs(true);
+
+        let obs2 = obs.clone();
+        let client =
+            tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+        // Session 1: a real job runs to completion — the terminal sweep
+        // remembers {payloads:<sha>, bundles:s} for the next session.
+        let (mut ws, _) = accept_ws(&listener).await;
+        let _register = next_text(&mut ws).await;
+        ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+            &job_id, &sha,
+        ))))
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            status_rx.wait_for(|s| s.jobs_completed == 1 && s.current_job.is_none()),
+        )
+        .await
+        .expect("job did not complete in time")
+        .expect("status channel closed");
+
+        // Force the reconnect: a clean server close, then session 2. The
+        // startup sweep runs BEFORE the register frame, so a register on
+        // session 2 proves the sweep already ran with whatever set the
+        // loop remembered.
+        ws.send(Message::Close(None)).await.ok();
+        drop(ws);
+        let (mut ws2, _) = tokio::time::timeout(Duration::from_secs(10), accept_ws(&listener))
+            .await
+            .expect("no reconnection within 10s");
+        let second: serde_json::Value = serde_json::from_str(&next_text(&mut ws2).await).unwrap();
+        assert_eq!(second["type"], "register");
+
+        // THE SEMANTICS: the reconnect sweep must report the REMEMBERED
+        // protected set — cache_keys_for(assign) is 2 keys (payloads +
+        // bundles). Old code passed &[]: the line would never appear at
+        // all (nothing evicted, nothing protected).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut sweep_line = String::new();
+        while std::time::Instant::now() < deadline {
+            match log_rx.try_recv() {
+                Ok(line) => {
+                    if line.message.contains("Cache sweep") {
+                        sweep_line = line.message;
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            sweep_line.contains("2 protected"),
+            "reconnect sweep must hand the remembered keys to the cache sweep; got: {sweep_line:?}"
+        );
+
+        ws2.close(None).await.ok();
+        drop(ws2);
+        client.abort();
+        std::fs::remove_dir_all(payload_dir).ok();
+    }
     /// Packet 18: the idle-sleep assertion is held EXACTLY for the job's
     /// lifetime. Proven through keepawake's test-visible active-guard
     /// counter (a pgrep census cannot work here: the parallel test binary's
