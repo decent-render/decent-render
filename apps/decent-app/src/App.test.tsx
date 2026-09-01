@@ -212,6 +212,52 @@ describe('App', () => {
 		});
 	});
 
+	// C-8: the consent toggle is the operator's real-jobs opt-in, and Start
+	// must persist exactly what it shows. Without opting in, the IPC carries
+	// allowRealJobsDefault: false; after clicking the toggle, true — and the
+	// same click flips the live gate via set_allow_real_jobs.
+	it('consent toggle drives allowRealJobsDefault on start', async () => {
+		render(<App />);
+		const tokenInput = await screen.findByPlaceholderText('JWT worker token');
+		await act(async () => {
+			fireEvent.change(tokenInput, {target: {value: 'test-jwt-token'}});
+		});
+
+		// Default: consent OFF → Start must persist false.
+		await act(async () => {
+			fireEvent.click(screen.getByText('Start'));
+		});
+		await waitFor(() => {
+			expect(invokeMock).toHaveBeenCalledWith('save_app_config', {
+				dispatchUrl: 'ws://localhost:8790/ws',
+				workdirRoot: null,
+				allowRealJobsDefault: false,
+			});
+		});
+
+		// Opt in: the toggle flips the live gate AND the persisted default.
+		const toggle = screen.getByRole('checkbox', {
+			name: /accept real render jobs/i,
+		});
+		await act(async () => {
+			fireEvent.click(toggle);
+		});
+		expect(invokeMock).toHaveBeenCalledWith('set_allow_real_jobs', {
+			value: true,
+		});
+
+		await act(async () => {
+			fireEvent.click(screen.getByText('Start'));
+		});
+		await waitFor(() => {
+			expect(invokeMock).toHaveBeenCalledWith('save_app_config', {
+				dispatchUrl: 'ws://localhost:8790/ws',
+				workdirRoot: null,
+				allowRealJobsDefault: true,
+			});
+		});
+	});
+
 	it('session stats increment when status updates', async () => {
 		render(<App />);
 		await waitFor(() => {
@@ -234,9 +280,17 @@ describe('App', () => {
 			});
 		});
 
-		expect(screen.getByText('3')).toBeInTheDocument();
-		expect(screen.getByText('1')).toBeInTheDocument();
-		expect(screen.getByText('2')).toBeInTheDocument();
+		// C-8: each stat is found via its LABEL, not by bare value text (which
+		// can collide as the UI grows) and not by row index (which silently
+		// keeps passing after a row reorder).
+		const statValue = (label: string): string => {
+			const stat = screen.getByText(label).closest('.stat');
+			expect(stat).not.toBeNull();
+			return (stat as HTMLElement).querySelector('.stat-num')?.textContent ?? '';
+		};
+		expect(statValue('Completed')).toBe('3');
+		expect(statValue('Failed')).toBe('1');
+		expect(statValue('Canceled')).toBe('2');
 	});
 
 	// Packet 20: the Earnings panel must state the honest contract —
