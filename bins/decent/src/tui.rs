@@ -32,6 +32,7 @@ use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::{broadcast, oneshot, watch};
 
+use supervisor_core::keepawake::KeepAwakeState;
 use supervisor_core::status::{ConnectionState, JobPhase, LogLevel, LogLine, SupervisorStatus};
 
 /// Max log lines kept in the on-screen ring buffer.
@@ -255,6 +256,25 @@ fn draw_status_panel(frame: &mut Frame, area: Rect, status: &SupervisorStatus) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// The job panel's power row: wording from `crate::idle_sleep_label`, color
+/// from the outcome (green = held, red = failed, yellow = no implementation,
+/// gray = no guard alive yet).
+fn idle_sleep_line(state: Option<KeepAwakeState>) -> Line<'static> {
+    let color = match state {
+        Some(KeepAwakeState::Held) => Color::Green,
+        Some(KeepAwakeState::FailedToAcquire) => Color::Red,
+        Some(KeepAwakeState::Unavailable) => Color::Yellow,
+        None => Color::DarkGray,
+    };
+    Line::from(vec![
+        Span::styled("power ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("idle-sleep: {}", crate::idle_sleep_label(state)),
+            Style::default().fg(color),
+        ),
+    ])
+}
+
 fn draw_job_panel(frame: &mut Frame, area: Rect, status: &SupervisorStatus) {
     let block = Block::default().borders(Borders::ALL).title("Current job");
     match &status.current_job {
@@ -288,16 +308,10 @@ fn draw_job_panel(frame: &mut Frame, area: Rect, status: &SupervisorStatus) {
                     Span::styled("phase ", Style::default().fg(Color::DarkGray)),
                     Span::styled(phase_label, Style::default().fg(phase_color)),
                 ]),
-                // Packet 20: idle-sleep indicator — an active job holds a
-                // caffeinate assertion (keepawake.rs), so the operator can
-                // see why the machine will not idle-sleep mid-render.
-                Line::from(vec![
-                    Span::styled("power ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        "idle-sleep held while rendering",
-                        Style::default().fg(Color::Green),
-                    ),
-                ]),
+                // Packet 20 / B-5: idle-sleep indicator. Reads the guard's
+                // ACTUAL outcome (keepawake.rs) — "held" only when a live
+                // caffeinate child exists; otherwise it says what happened.
+                idle_sleep_line(supervisor_core::keepawake::current_state()),
             ]);
             frame.render_widget(info, chunks[0]);
             let gauge = Gauge::default()

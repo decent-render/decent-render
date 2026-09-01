@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 use service::{DaemonState, ServiceSpec};
 use supervisor_core::capabilities::detect_capabilities;
 use supervisor_core::connection::{self, ConnectionConfig};
+use supervisor_core::keepawake::{self, KeepAwakeState};
 use supervisor_core::protocol::{Platform, RegisterMessage, PROTOCOL_VERSION};
 use supervisor_core::status::{Observability, SupervisorStatus};
 
@@ -212,12 +213,25 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// B-5 (audit U-4): the one wording for the idle-sleep line, shared by
+/// `decent status` and the TUI. "held" is printed ONLY when a live guard
+/// reports it; every other outcome says what actually happened.
+pub(crate) fn idle_sleep_label(state: Option<KeepAwakeState>) -> &'static str {
+    match state {
+        Some(s) => s.describe(),
+        None => "not held",
+    }
+}
+
 /// The daemon's live status snapshot, parsed from the `daemon-status` file the
 /// running daemon writes every few seconds. Read by the separate `status`
 /// command so an operator can see connection/job state without the TUI.
 struct DaemonSnapshot {
     connection: String,
     current_job: Option<(String, String, f64)>,
+    /// What the daemon's idle-sleep guard actually did (B-5). `None` = no
+    /// guard alive (idle, download phase, or a daemon predating the line).
+    keep_awake: Option<KeepAwakeState>,
     jobs_completed: u64,
     jobs_failed: u64,
     jobs_canceled: u64,
@@ -259,6 +273,7 @@ fn read_daemon_snapshot() -> Option<DaemonSnapshot> {
     Some(DaemonSnapshot {
         connection: val("connection").to_string(),
         current_job,
+        keep_awake: KeepAwakeState::from_token(val("keep_awake")),
         jobs_completed: val("jobs_completed").parse().unwrap_or(0),
         jobs_failed: val("jobs_failed").parse().unwrap_or(0),
         jobs_canceled: val("jobs_canceled").parse().unwrap_or(0),
@@ -663,6 +678,12 @@ async fn main() -> anyhow::Result<()> {
                                     .map(|j| j.progress.to_string())
                                     .unwrap_or_default(),
                             );
+                            line(
+                                "keep_awake",
+                                keepawake::current_state()
+                                    .map(|k| k.as_token())
+                                    .unwrap_or(""),
+                            );
                             line("jobs_completed", &s.jobs_completed.to_string());
                             line("jobs_failed", &s.jobs_failed.to_string());
                             line("jobs_canceled", &s.jobs_canceled.to_string());
@@ -831,7 +852,10 @@ async fn main() -> anyhow::Result<()> {
                         None => println!("current job : idle"),
                     }
                     if has_job {
-                        println!("power       : idle-sleep held while rendering");
+                        println!(
+                            "power       : idle-sleep: {}",
+                            idle_sleep_label(s.keep_awake)
+                        );
                     }
                     println!(
                         "jobs        : {} done · {} failed · {} canceled",
@@ -998,6 +1022,47 @@ fn login_next_step_message_names_the_daemon_state() {
     // On the fresh HOME the daemon is NotInstalled — and the message the
     // operator gets must say the token applies to the NEXT start.
     assert_eq!(state, service::DaemonState::NotInstalled);
+}
+
+#[cfg(test)]
+mod packet45_tests {
+    use super::*;
+
+    /// B-5: the "held" line must be ABSENT unless a live guard says so.
+    #[test]
+    fn idle_sleep_line_says_held_only_for_a_held_guard() {
+        assert_eq!(idle_sleep_label(Some(KeepAwakeState::Held)), "held");
+        // A guard whose acquire produced no child (child: None).
+        assert_eq!(
+            idle_sleep_label(Some(KeepAwakeState::FailedToAcquire)),
+            "failed to acquire"
+        );
+        assert_eq!(
+            idle_sleep_label(Some(KeepAwakeState::Unavailable)),
+            "not available on this platform"
+        );
+        assert_eq!(idle_sleep_label(None), "not held");
+        for not_held in [
+            Some(KeepAwakeState::FailedToAcquire),
+            Some(KeepAwakeState::Unavailable),
+            None,
+        ] {
+            assert_ne!(idle_sleep_label(not_held), "held");
+        }
+    }
+
+    /// The label follows the guard object itself, not a hardcoded string.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn idle_sleep_line_follows_a_real_guard() {
+        let guard = keepawake::JobKeepAwake::acquire("p45-status");
+        let label = idle_sleep_label(Some(guard.state()));
+        if guard.is_held() {
+            assert_eq!(label, "held");
+        } else {
+            assert_eq!(label, "failed to acquire");
+        }
+    }
 }
 
 #[cfg(test)]

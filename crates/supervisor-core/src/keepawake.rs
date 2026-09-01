@@ -71,17 +71,99 @@
 
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
-
-/// Test observability: how many caffeinate guards are currently held in
-/// THIS process. Production code never reads it; the integration test
-/// uses it to prove acquire/drop wiring without pgrep censuses (which
-/// cannot distinguish sibling tests' caffeinates — same parent pid).
 #[cfg(target_os = "macos")]
-static ACTIVE_GUARDS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+use std::sync::atomic::{AtomicI64, Ordering};
+
+/// How many caffeinate guards are currently HELD (live child) in THIS
+/// process. Read by [`current_state`] for the status surfaces and by the
+/// integration test to prove acquire/drop wiring without pgrep censuses
+/// (which cannot distinguish sibling tests' caffeinates — same parent pid).
+#[cfg(target_os = "macos")]
+static ACTIVE_GUARDS: AtomicI64 = AtomicI64::new(0);
+
+/// How many guards in THIS process tried to acquire and got no child
+/// (caffeinate missing/broken). Lets a status surface say "failed to
+/// acquire" instead of silently reporting nothing.
+#[cfg(target_os = "macos")]
+static FAILED_GUARDS: AtomicI64 = AtomicI64::new(0);
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn active_guard_count_for_tests() -> i64 {
-    ACTIVE_GUARDS.load(std::sync::atomic::Ordering::SeqCst)
+    ACTIVE_GUARDS.load(Ordering::SeqCst)
+}
+
+/// What a status surface may HONESTLY say about the idle-sleep assertion.
+///
+/// B-5 (audit U-4): `decent status` and the TUI used to print "idle-sleep
+/// held while rendering" unconditionally — on Linux, where nothing is ever
+/// held, and on a Mac whose caffeinate failed to spawn. The line now
+/// derives from the guard's actual outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeepAwakeState {
+    /// A live caffeinate child holds the assertion right now.
+    Held,
+    /// `acquire` ran on a platform that implements the assertion, but the
+    /// spawn failed; the job renders without it.
+    FailedToAcquire,
+    /// This platform has no implementation (Linux — see module docs).
+    Unavailable,
+}
+
+impl KeepAwakeState {
+    /// Operator-facing wording, shared by the CLI and the TUI.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::FailedToAcquire => "failed to acquire",
+            Self::Unavailable => "not available on this platform",
+        }
+    }
+
+    /// Stable token for the daemon's status snapshot file (`keep_awake=…`).
+    pub fn as_token(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::FailedToAcquire => "failed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    /// Inverse of [`Self::as_token`]; `None` for "" / unknown.
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "held" => Some(Self::Held),
+            "failed" => Some(Self::FailedToAcquire),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
+
+/// Process-wide view for status surfaces that do not hold the guard
+/// (the daemon's snapshot writer, the TUI): what the assertion is doing
+/// for the jobs currently in flight in THIS process.
+///
+/// `None` means no guard is alive (idle, or a job still in its download
+/// phase before `acquire` runs). On platforms without an implementation
+/// this is always `Some(Unavailable)` — surfaces gate on a job being in
+/// flight before printing anything, so "unavailable" is never shown for
+/// an idle node.
+pub fn current_state() -> Option<KeepAwakeState> {
+    #[cfg(target_os = "macos")]
+    {
+        if ACTIVE_GUARDS.load(Ordering::SeqCst) > 0 {
+            Some(KeepAwakeState::Held)
+        } else if FAILED_GUARDS.load(Ordering::SeqCst) > 0 {
+            Some(KeepAwakeState::FailedToAcquire)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(KeepAwakeState::Unavailable)
+    }
 }
 
 /// What the job holds while it runs. On non-macOS this is a no-op guard
@@ -113,7 +195,7 @@ impl JobKeepAwake {
                 .spawn()
             {
                 Ok(child) => {
-                    ACTIVE_GUARDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ACTIVE_GUARDS.fetch_add(1, Ordering::SeqCst);
                     tracing::debug!(
                         job_id,
                         pid = child.id(),
@@ -123,6 +205,7 @@ impl JobKeepAwake {
                 }
                 Err(e) => {
                     tracing::warn!(job_id, error = %e, "caffeinate unavailable; rendering without an idle-sleep assertion");
+                    FAILED_GUARDS.fetch_add(1, Ordering::SeqCst);
                     Self { child: None }
                 }
             }
@@ -139,16 +222,54 @@ impl JobKeepAwake {
     pub fn child_pid(&self) -> Option<u32> {
         self.child.as_ref().map(|c| c.id())
     }
+
+    /// `true` only when `acquire` produced a live caffeinate child — the
+    /// one condition under which "idle-sleep held" is a true statement.
+    pub fn is_held(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.child.is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// What this guard may honestly be reported as.
+    pub fn state(&self) -> KeepAwakeState {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_held() {
+                KeepAwakeState::Held
+            } else {
+                KeepAwakeState::FailedToAcquire
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            KeepAwakeState::Unavailable
+        }
+    }
 }
 
 impl Drop for JobKeepAwake {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
-        if let Some(mut child) = self.child.take() {
-            ACTIVE_GUARDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            // SIGTERM first (caffeinate exits cleanly and releases the
-            // assertion), SIGKILL if it somehow lingers past a second.
-            kill_child_tree(&mut child);
+        match self.child.take() {
+            Some(mut child) => {
+                ACTIVE_GUARDS.fetch_sub(1, Ordering::SeqCst);
+                // SIGTERM first (caffeinate exits cleanly and releases the
+                // assertion), SIGKILL if it somehow lingers past a second.
+                kill_child_tree(&mut child);
+            }
+            None => {
+                // A failed acquire is over too. Saturate at zero so a guard
+                // built directly in a test (never counted) cannot push the
+                // counter negative and mask a later real failure.
+                let _ = FAILED_GUARDS
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some((n - 1).max(0)));
+            }
         }
     }
 }
@@ -179,6 +300,47 @@ fn kill_child_tree(child: &mut std::process::Child) {
     }
 }
 
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    /// B-5: a guard whose acquire produced no child must never be
+    /// reported as "held" — that is exactly the lie the status line told.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn guard_without_a_child_is_not_held() {
+        let guard = JobKeepAwake { child: None };
+        assert!(!guard.is_held());
+        assert_eq!(guard.state(), KeepAwakeState::FailedToAcquire);
+        assert_eq!(guard.state().describe(), "failed to acquire");
+        assert_ne!(guard.state().describe(), "held");
+        drop(guard); // saturating decrement; must not panic or go negative
+        assert!(super::FAILED_GUARDS.load(Ordering::SeqCst) >= 0);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_guard_is_never_held() {
+        let guard = JobKeepAwake::acquire("no-op-platform");
+        assert!(!guard.is_held());
+        assert_eq!(guard.state(), KeepAwakeState::Unavailable);
+        assert_eq!(current_state(), Some(KeepAwakeState::Unavailable));
+    }
+
+    #[test]
+    fn snapshot_tokens_round_trip() {
+        for s in [
+            KeepAwakeState::Held,
+            KeepAwakeState::FailedToAcquire,
+            KeepAwakeState::Unavailable,
+        ] {
+            assert_eq!(KeepAwakeState::from_token(s.as_token()), Some(s));
+        }
+        assert_eq!(KeepAwakeState::from_token(""), None);
+        assert_eq!(KeepAwakeState::from_token("bogus"), None);
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -195,6 +357,10 @@ mod tests {
             .child_pid()
             .expect("caffeinate must spawn on macOS CI/dev machines");
         assert!(pid_alive(pid), "caffeinate child alive while job runs");
+        // B-5: a live child is the ONE condition for "held".
+        assert!(guard.is_held());
+        assert_eq!(guard.state(), KeepAwakeState::Held);
+        assert_eq!(current_state(), Some(KeepAwakeState::Held));
         drop(guard);
         // Released: the child is reaped by Drop's wait, so the pid is
         // gone (or at minimum no longer caffeinate — ESRCH after reaping
