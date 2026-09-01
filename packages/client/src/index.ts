@@ -222,6 +222,20 @@ export type BundleAndUploadOptions = RequestOptions & {
 export type BundleAndUploadResult = {sha256: string; remotionVersion: string; sizeBytes: number; alreadyRegistered: boolean};
 
 export async function bundleAndUpload(options: BundleAndUploadOptions): Promise<BundleAndUploadResult> {
+  // D-15 (U-16 tail): archiving the whole project takes seconds — validate
+  // the cheap, required field FIRST so a malformed version fails fast
+  // instead of after the bundle. Strict semver (no prerelease/build
+  // suffix): the farm's bundle registry stays authoritative, but there is
+  // no reason to spend the archive on a version it will refuse.
+  if (!/^\d+\.\d+\.\d+$/.test(options.remotionVersion)) {
+    throw new FarmApiError(
+      400,
+      `remotionVersion must be a full semver release (major.minor.patch), got: ${JSON.stringify(options.remotionVersion)}`,
+      'INVALID_REMOTION_VERSION',
+      undefined,
+      'client',
+    );
+  }
   const {bundle} = await import('@remotion/bundler');
   const bundleLocation = await bundle({
     entryPoint: options.entryPoint,
