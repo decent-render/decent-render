@@ -98,7 +98,7 @@ lines (`progress`, `heartbeat`, `done`, `error`). That contract is pinned by
 `fixtures/runner-stdout-v1.json` — an `accept` list (what both sides agree on
 today) and a `reject` list (what must fail on both sides):
 
-- **TS (emitter):** `@decent-render/runner-core` exports `runnerEventSchema`
+- **TS (emitter):** `@decent-render/runner-core` defines `runnerEventSchema`
   (`src/runner-stdout-schema.ts`); its conformance test asserts every fixture
   case, and the emitter's own tests validate every stdout frame against it
   (`src/__tests__/runner-stdout-conformance.test.ts`, `stdout-discipline.test.ts`,
