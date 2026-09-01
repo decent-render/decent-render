@@ -69,6 +69,47 @@ pub const fn manager_name() -> &'static str {
 
 pub use imp::{install, manual_restart_hint, pause, restart, resume, state, uninstall};
 
+/// One systemd ExecStart argument, double-quoted per systemd.syntax: `\`
+/// and `"` are backslash-escaped inside the quotes, and a literal `%` is
+/// written as `%%` (systemd specifier escape — `%h`, `%t` and friends must
+/// not expand inside an operator-supplied URL or install path).
+/// Compiled on Linux (the unit builder uses it) and under test on every
+/// host, so the exact line shape is pinned even from a macOS checkout.
+#[cfg(any(target_os = "linux", test))]
+fn quote_exec_arg(arg: &str) -> String {
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    for c in arg.chars() {
+        match c {
+            '\\' | '"' => {
+                quoted.push('\\');
+                quoted.push(c);
+            }
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// The systemd `ExecStart` line for the node's user unit. String building
+/// is platform-free and test-pinned on every host; only the Linux unit
+/// writer consumes it in production. Every argument is quoted (D-13): an
+/// unquoted space in a URL or install path would word-split into arguments
+/// the daemon never sees.
+#[cfg(any(target_os = "linux", test))]
+fn exec_start_line(exe: &Path, dispatch_url: &str) -> String {
+    format!(
+        "ExecStart={} {} {} {} {}",
+        quote_exec_arg(&exe.display().to_string()),
+        quote_exec_arg("start"),
+        quote_exec_arg("--dispatch-url"),
+        quote_exec_arg(dispatch_url),
+        quote_exec_arg("--allow-real-jobs"),
+    )
+}
+
 // ── macOS: launchd ──────────────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
@@ -484,7 +525,7 @@ mod imp {
              \n\
              [Service]\n\
              Type=simple\n\
-             ExecStart={exe} start --dispatch-url {url} --allow-real-jobs\n\
+             ExecStart={exec_start}\n\
              Restart=always\n\
              RestartSec=10\n\
              TimeoutStopSec=30\n\
@@ -494,8 +535,7 @@ mod imp {
              \n\
              [Install]\n\
              WantedBy=default.target\n",
-            exe = spec.exe.display(),
-            url = spec.dispatch_url.replace('%', "%%"),
+            exec_start = exec_start_line(&spec.exe, &spec.dispatch_url),
             log = spec.log_path.display(),
         )
     }
@@ -825,6 +865,29 @@ mod tests {
         );
     }
 
+    /// AUDIT R-8, Linux half (D-13): a legal dispatch URL with systemd-hostile
+    /// characters must reach the daemon INTACT. systemd word-splits ExecStart
+    /// on unquoted whitespace and expands `%` specifiers, so every argument
+    /// is double-quoted per systemd.syntax with `\` and `"` backslash-escaped
+    /// inside, and a literal `%` written as `%%`.
+    #[test]
+    fn hostile_but_legal_url_escapes_in_unit_exec_start() {
+        let hostile = ServiceSpec {
+            exe: PathBuf::from("/opt/decent/bin/decent"),
+            // Legal URL shape carrying a space, a double quote, a backslash
+            // and a percent sign.
+            dispatch_url: "wss://dispatch.example.com/ws?team=a b\"q\"\\d%h".to_string(),
+            log_path: PathBuf::from("/tmp/log path/decent.log"),
+        };
+        let line = exec_start_line(&hostile.exe, &hostile.dispatch_url);
+        assert_eq!(
+            line,
+            "ExecStart=\"/opt/decent/bin/decent\" \"start\" \"--dispatch-url\" \
+             \"wss://dispatch.example.com/ws?team=a b\\\"q\\\"\\\\d%%h\" \"--allow-real-jobs\"",
+            "hostile URL must be quoted and escaped, got:\n{line}"
+        );
+    }
+
     /// The daemon exists to render, so the unit MUST pass --allow-real-jobs.
     /// Without it `start` registers and heartbeats forever while refusing every
     /// job — a node that looks perfectly healthy and never does any work.
@@ -892,7 +955,7 @@ mod tests {
                 .find(|l| l.starts_with("ExecStart="))
                 .expect("unit has ExecStart");
             assert!(
-                exec_start.starts_with(&format!("ExecStart={expected} ")),
+                exec_start.starts_with(&format!("ExecStart=\"{expected}\" ")),
                 "unit:\n{text}"
             );
         }
@@ -940,7 +1003,8 @@ mod tests {
                 .expect("unit has ExecStart");
             assert_eq!(
                 exec_start,
-                "ExecStart=/opt/decent/bin/decent start --dispatch-url wss://dispatch.example.com/ws --allow-real-jobs",
+                "ExecStart=\"/opt/decent/bin/decent\" \"start\" \"--dispatch-url\" \
+                 \"wss://dispatch.example.com/ws\" \"--allow-real-jobs\"",
                 "unit:\n{text}"
             );
         }
