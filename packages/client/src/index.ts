@@ -26,7 +26,22 @@ import {
   type WorkerAvailabilityResponse,
 } from './schemas.js';
 
-export * from './schemas.js';
+// D-15 (U-16): the zod schemas live behind the `@decent-render/client/schemas`
+// subpath (package.json `exports`). The root re-exports ONLY the types the
+// public function signatures above need — a bare `export *` here would leak
+// the whole schema module through the root entry point (guarded against by
+// src/__tests__/surface.test.ts).
+export type {
+  BalanceResponse,
+  CancelRenderResponse,
+  EnqueueRenderRequest,
+  EnqueueRenderResponse,
+  LatestBundleResponse,
+  RenderStatusResponse,
+  VersionsResponse,
+  WebhookEndpoint,
+  WorkerAvailabilityResponse,
+} from './schemas.js';
 
 const DEFAULT_API_URL = 'https://decent-render-dispatch.fly.dev';
 
