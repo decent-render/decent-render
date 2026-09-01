@@ -33,11 +33,33 @@ const DEFAULT_API_URL = 'https://decent-render-dispatch.fly.dev';
 type Auth = {apiKey: string; apiUrl?: string};
 type RequestOptions = Auth & {signal?: AbortSignal};
 
+/**
+ * An error thrown by this package. `kind` tells you WHERE it failed:
+ *
+ * - `kind: 'http'` — `status` is a REAL HTTP status code from a farm or
+ *   storage response; `code`/`details` carry the farm's error body.
+ * - `kind: 'client'` — the failure happened OFF the HTTP path (a poll
+ *   timeout, an abort, a terminal render state delivered inside a 200
+ *   poll response, a client-side precondition). `status` is SYNTHETIC
+ *   here: an HTTP-shaped hint (408 timeout, 409 conflict, 500 client
+ *   bug) that no server sent — never treat it as a response status.
+ */
 export class FarmApiError extends Error {
-  constructor(public readonly status: number, message: string, public readonly code?: string, public readonly details?: unknown) {
+  constructor(
+    public readonly status: number,
+    message: string,
+    public readonly code?: string,
+    public readonly details?: unknown,
+    public readonly kind: 'http' | 'client' = 'http',
+  ) {
     super(message);
     this.name = 'FarmApiError';
   }
+}
+
+/** Type guard: true when `error` is a {@link FarmApiError} from this package. */
+export function isFarmApiError(error: unknown): error is FarmApiError {
+  return error instanceof FarmApiError;
 }
 
 function endpoint(options: Auth, pathname: string): string {
@@ -161,11 +183,11 @@ export async function renderMediaOnFarm(options: RenderMediaOnFarmOptions): Prom
       return {outputUrl: status.outputUrl, renderId: status.renderId, creditsSettled: status.creditsSettled, verification: status.verification};
     }
     if (status.status === 'failed' || status.status === 'canceled') {
-      throw new FarmApiError(409, status.error ?? `Render ${status.status}`, `RENDER_${status.status.toUpperCase()}`, status);
+      throw new FarmApiError(409, status.error ?? `Render ${status.status}`, `RENDER_${status.status.toUpperCase()}`, status, 'client');
     }
-    if (options.waitForCompletion) throw new FarmApiError(500, 'Webhook completion callback returned a non-terminal status');
+    if (options.waitForCompletion) throw new FarmApiError(500, 'Webhook completion callback returned a non-terminal status', undefined, undefined, 'client');
     if (Date.now() >= deadline) {
-      return abandon(new FarmApiError(408, `Timed out waiting for render ${enqueued.renderId}`, 'RENDER_TIMEOUT'));
+      return abandon(new FarmApiError(408, `Timed out waiting for render ${enqueued.renderId}`, 'RENDER_TIMEOUT', undefined, 'client'));
     }
     try {
       await sleep(options.pollIntervalMs ?? 1000, options.signal);
@@ -198,13 +220,13 @@ export async function bundleAndUpload(options: BundleAndUploadOptions): Promise<
     method: 'POST', body: JSON.stringify(metadata),
   });
   if (!upload.alreadyRegistered) {
-    if (!upload.uploadUrl) throw new FarmApiError(500, 'Farm did not provide a bundle upload URL');
+    if (!upload.uploadUrl) throw new FarmApiError(500, 'Farm did not provide a bundle upload URL', undefined, undefined, 'client');
     const uploaded = await fetch(upload.uploadUrl, {method: 'PUT', body: Uint8Array.from(archive), signal: options.signal});
     if (!uploaded.ok) throw new FarmApiError(uploaded.status, `Bundle upload failed (${uploaded.status})`);
     const completed = await requestJson(options, `/api/v1/bundles/${sha256}/complete`, bundleCompleteResponseSchema, {
       method: 'POST', body: JSON.stringify({remotionVersion: options.remotionVersion, sizeBytes: archive.byteLength}),
     });
-    if (completed.sha256 !== sha256) throw new FarmApiError(500, 'Farm registered a different bundle SHA-256');
+    if (completed.sha256 !== sha256) throw new FarmApiError(500, 'Farm registered a different bundle SHA-256', undefined, undefined, 'client');
   }
   return {...metadata, alreadyRegistered: upload.alreadyRegistered};
 }
