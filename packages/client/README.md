@@ -32,7 +32,9 @@ console.log(result.verification); // pending, passed, or flagged
 
 Public functions:
 
-- `bundleAndUpload()`
+- `bundleAndUpload()` — validates `remotionVersion` (strict semver,
+  `major.minor.patch`) BEFORE archiving; a malformed version throws a
+  `FarmApiError` with `kind: 'client'` and no fs/network work done.
 - `renderMediaOnFarm()`
 - `enqueueRender()` — enqueue a render and return immediately with its
   `renderId`; poll with `getRenderProgress()` and cancel with
@@ -60,7 +62,9 @@ either, because the render may still complete — use `getRenderProgress()` or
 bundle registration or enqueue requests fail with
 `UNSUPPORTED_REMOTION_VERSION` and the supported version names. Completed
 renders always expose their output immediately; verification can later be
-`passed` or `flagged` without removing the output URL.
+`passed` or `flagged` without removing the output URL. On complete statuses
+`creditsSettled` is `number | null` — null when the job completed before
+measured settlement existed (pre-migration-0016 rows), not a zero.
 
 `@remotion/bundler` is an optional peer dependency used only by `bundleAndUpload()`. The package's only runtime dependency is Zod. Response types are inferred from the exported Zod schemas that the farm handlers also use.
 
@@ -69,7 +73,18 @@ non-2xx API response, carrying the HTTP `status`, the farm's error `code`, and
 the raw `details` body; the per-call option/result types (`GetRenderProgressOptions`,
 `CancelRenderOptions`, `RenderMediaOnFarmOptions`, `RenderMediaOnFarmResult`,
 `EnqueueRenderOptions`, `BundleAndUploadOptions`, `BundleAndUploadResult`);
-and a star re-export of `./schemas` — the Zod schemas (`renderStatusSchema`,
-`enqueueRenderRequestSchema`, `renderStatusResponseSchema`, …) and their
-inferred types (`RenderStatusResponse`, `EnqueueRenderRequest`,
-`VerificationStatus`, …) that the request/response methods validate with.
+and a re-export of the response/request TYPES the function signatures use.
+
+**`FarmApiError.kind`** — `'http' | 'client'` tells you where an error came
+from. `kind: 'http'` means `status` is a REAL HTTP status code from a farm or
+storage response. `kind: 'client'` means the failure happened off the HTTP
+path (poll timeout, abort, a terminal render state delivered inside a 200
+poll, a client-side precondition like the `remotionVersion` check) and the
+`status` is SYNTHETIC — an HTTP-shaped hint no server sent. Use the
+`isFarmApiError(e)` type guard to distinguish these from other errors.
+
+**`./schemas` subpath** — the Zod request/response schemas are importable
+from `@decent-render/client/schemas`. The root entry point no longer
+re-exports them: it exports only the response/request types the function
+signatures use. If you imported schemas from the root, move those imports to
+the subpath.
