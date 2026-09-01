@@ -1,0 +1,79 @@
+{
+  "contractVersion": 1,
+  "description": "Canonical fixtures for the runner↔supervisor stdout contract v1: NDJSON lines on the runner's stdout. Emitted by @decent-render/runner-core (src/index.ts, writeEvent); parsed by crates/supervisor-core/src/runner.rs (RunnerEvent, internally tagged on `type`). @decent-render/runner-core validates emitted events against runnerEventSchema and asserts every case here (src/__tests__/runner-stdout-conformance.test.ts); supervisor-core parses the SAME file in runner_stdout_fixtures_round_trip (runner.rs tests). The `accept` list is what both sides agree on today; the `reject` list is the negative contract — every entry MUST fail to parse on BOTH sides, so a schema that silently loosens (progress 1.5, a done without its output size, unknown types) is caught here.",
+  "accept": [
+    {
+      "name": "progress 0 (render start)",
+      "wire": { "type": "progress", "progress": 0 }
+    },
+    {
+      "name": "progress 0.5 (mid-render)",
+      "wire": { "type": "progress", "progress": 0.5 }
+    },
+    {
+      "name": "progress 1 (final)",
+      "wire": { "type": "progress", "progress": 1 }
+    },
+    {
+      "name": "heartbeat (liveness, no payload)",
+      "wire": { "type": "heartbeat" }
+    },
+    {
+      "name": "done (envelope size + full inner metrics)",
+      "wire": {
+        "type": "done",
+        "outputSizeInBytes": 1234567,
+        "wallTimeMs": 48123,
+        "metrics": {
+          "wallMs": 48123,
+          "frames": 900,
+          "outputSizeInBytes": 1234567
+        }
+      }
+    },
+    {
+      "name": "done (legacy runner without inner metrics)",
+      "wire": {
+        "type": "done",
+        "outputSizeInBytes": 2048,
+        "wallTimeMs": 912
+      }
+    },
+    {
+      "name": "error (message)",
+      "wire": { "type": "error", "message": "Render timed out: no progress for 120s" }
+    }
+  ],
+  "reject": [
+    {
+      "name": "unknown event type",
+      "wire": { "type": "crash", "exitCode": 3 },
+      "reason": "progress, heartbeat, done, error are the whole contract; an unknown type is some foreign process writing to stdout"
+    },
+    {
+      "name": "progress out of range (1.5)",
+      "wire": { "type": "progress", "progress": 1.5 },
+      "reason": "progress is a fraction in [0, 1] on both sides — protocol v2's jobProgress carries the identical bound, and dispatch would refuse to persist 1.5 anyway"
+    },
+    {
+      "name": "progress negative (-0.1)",
+      "wire": { "type": "progress", "progress": -0.1 },
+      "reason": "progress is a fraction in [0, 1]."
+    },
+    {
+      "name": "done missing outputSizeInBytes",
+      "wire": { "type": "done", "wallTimeMs": 100 },
+      "reason": "the done envelope always carries the output size; the supervisor stamps it onto the metrics dispatch persists"
+    },
+    {
+      "name": "error missing message",
+      "wire": { "type": "error" },
+      "reason": "an error without a message cannot be surfaced to the operator"
+    },
+    {
+      "name": "non-object line (renderer chatter)",
+      "wire": "chatter via console.log",
+      "reason": "stdout is NDJSON; a bare string is renderer chatter. The supervisor tolerates it AT RUNTIME (warn + continue) so chatter cannot kill a job, but it is not a contract event and the schema must reject it"
+    }
+  ]
+}
