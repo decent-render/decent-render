@@ -6,6 +6,15 @@ itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
 
 ## [Unreleased]
 
+- `register.protocolVersion` is now `z.literal(PROTOCOL_VERSION)` instead of any
+  integer: a node announcing a version this package does not speak fails to
+  parse rather than being treated as v2. Rust pins identically. No wire change.
+- `fixtures/v2.json` gained a `reject` array (negative contract): entries both
+  languages must FAIL to parse (`protocolVersion: 99`, `progress: 1.5`,
+  `progress: -0.1`, `codec: 'av1'`). The conformance suites also assert both
+  fixture sets are non-empty, so an empty or unreadable fixture file can no
+  longer pass vacuously.
+
 - Added optional `browserSha256` / `browserGetUrl` to `jobAssign`. The browser is
   now a standalone content-addressed artifact rather than part of the render
   payload: it is ~170MB and identical across Remotion versions that pin the same

@@ -12,6 +12,12 @@ const cases = JSON.parse(
 ) as {
 	protocolVersion: number;
 	cases: Array<{name: string; direction: 'worker' | 'server'; wire: unknown}>;
+	reject: Array<{
+		name: string;
+		direction: 'worker' | 'server';
+		reason: string;
+		wire: unknown;
+	}>;
 };
 
 /**
@@ -36,6 +42,17 @@ function deepKeyPaths(value: unknown, prefix = ''): string[] {
 }
 
 describe('protocol v2 — Rust⇄TS golden-fixture conformance', () => {
+	// Teeth (C-2): a suite that iterates an empty fixture set passes vacuously.
+	// Both sides assert the sets are populated so a broken fixture path or a
+	// gutted file cannot turn into a green run.
+	it('the positive fixture set is non-empty', () => {
+		expect(cases.cases.length).toBeGreaterThan(0);
+	});
+
+	it('the negative fixture set is non-empty', () => {
+		expect(cases.reject.length).toBeGreaterThan(0);
+	});
+
 	for (const c of cases.cases) {
 		it(`${c.direction} → ${c.name}: parses + round-trips with no field drift`, () => {
 			const schema =
@@ -104,6 +121,17 @@ describe('protocol v2 — Rust⇄TS golden-fixture conformance', () => {
 		delete legacyAssign.attempt;
 		expect(ServerMessageSchema.parse(legacyAssign)).toEqual(legacyAssign);
 	});
+
+	// Negative contract: every `reject` fixture must FAIL to parse. Rust asserts
+	// the same entries fail serde, so neither side can quietly loosen a bound
+	// (protocolVersion pin, progress range, codec set) without the other noticing.
+	for (const c of cases.reject) {
+		it(`${c.direction} -> REJECTS ${c.name}`, () => {
+			const schema =
+				c.direction === 'worker' ? WorkerMessageSchema : ServerMessageSchema;
+			expect(() => schema.parse(c.wire), c.reason).toThrow();
+		});
+	}
 
 	it('purgeAfter:false is rejected (privacy rule baked into the type)', () => {
 		const bad = {...firstOfType('jobAssign'), purgeAfter: false};

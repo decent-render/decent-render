@@ -1,6 +1,6 @@
 {
   "protocolVersion": 2,
-  "description": "Canonical wire-format fixtures for the decent render-network protocol v2. Rust (crates/supervisor-core) and TS (@decent-render/protocol) BOTH assert against these — a field present in a fixture but missing from an implementation fails that implementation's test. This is the drift tripwire (the outputSizeInBytes scar is covered by the two jobComplete variants).",
+  "description": "Canonical wire-format fixtures for the decent render-network protocol v2. Rust (crates/supervisor-core) and TS (@decent-render/protocol) BOTH assert against these — a field present in a fixture but missing from an implementation fails that implementation's test. This is the drift tripwire (the outputSizeInBytes scar is covered by the two jobComplete variants). The `reject` array is the negative contract: every entry MUST fail to parse on both sides, so a schema that silently loosens (accepting protocolVersion 99, progress 1.5, codec av1) is caught here.",
   "cases": [
     {
       "name": "register (capabilities without the newer hardware fields)",
@@ -211,6 +211,77 @@
         "tenant": "driffs",
         "supervisorVersion": "rust-0.0.2",
         "payloadVersion": "remotion-4.0.339"
+      }
+    }
+  ],
+  "reject": [
+    {
+      "name": "register with an unsupported protocolVersion (99)",
+      "direction": "worker",
+      "reason": "PROTOCOL_VERSION is pinned to 2 on both sides; a node speaking any other version must not be accepted as if it were v2.",
+      "wire": {
+        "type": "register",
+        "tenant": "driffs",
+        "protocolVersion": 99,
+        "operator": null,
+        "platform": "company",
+        "chip": "Apple M4 Max (darwin)",
+        "ramGb": 64,
+        "supervisorVersion": "spike-0.0.2",
+        "payloadVersion": "none",
+        "capabilities": {
+          "gpu": true
+        }
+      }
+    },
+    {
+      "name": "jobProgress out of range (1.5)",
+      "direction": "worker",
+      "reason": "progress is a fraction in [0, 1]; a value outside it is a runner bug, not a wire value to forward.",
+      "wire": {
+        "type": "jobProgress",
+        "tenant": "driffs",
+        "jobId": "spike-1",
+        "attempt": 1,
+        "progress": 1.5
+      }
+    },
+    {
+      "name": "jobProgress negative (-0.1)",
+      "direction": "worker",
+      "reason": "progress is a fraction in [0, 1].",
+      "wire": {
+        "type": "jobProgress",
+        "tenant": "driffs",
+        "jobId": "spike-1",
+        "attempt": 1,
+        "progress": -0.1
+      }
+    },
+    {
+      "name": "jobAssign with an unknown codec (av1)",
+      "direction": "server",
+      "reason": "codec is the closed set h264 | vp8; an unknown codec cannot be rendered and must fail to parse rather than reach the runner.",
+      "wire": {
+        "type": "jobAssign",
+        "tenant": "driffs",
+        "jobId": "job-render-abc123",
+        "attempt": 1,
+        "kind": "gpu",
+        "durationFrames": 300,
+        "fps": 30,
+        "codec": "av1",
+        "bundleSha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "bundleGetUrl": "https://r2.example.com/bundles/9f86.tar.gz?sig=1",
+        "payloadSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "payloadGetUrl": "https://r2.example.com/render-payloads/aaaa.tar.gz?sig=payload",
+        "inputPropsGetUrl": "https://r2.example.com/renders/t1/input-props.json?sig=2",
+        "assetGetUrls": [
+          "https://r2.example.com/assets/a.png?sig=3"
+        ],
+        "outputPutUrl": "https://r2.example.com/renders/t1/out.mp4?sig=4",
+        "outputKey": "renders/t1/out.mp4",
+        "purgeAfter": true
       }
     }
   ]

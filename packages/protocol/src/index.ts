@@ -29,7 +29,12 @@ export const PROTOCOL_VERSION = 2;
 export const RegisterMessageSchema = z.object({
 	type: z.literal('register'),
 	tenant: z.string(),
-	protocolVersion: z.number().int(),
+	/**
+	 * Pinned, not ranged: this package speaks exactly `PROTOCOL_VERSION`. A
+	 * node announcing any other version is rejected at parse time instead of
+	 * being treated as v2 (C-2). Rust pins the same way in protocol.rs.
+	 */
+	protocolVersion: z.literal(PROTOCOL_VERSION),
 	/**
 	 * ADVISORY ONLY — the verified operator identity comes from the signed
 	 * worker token (operator claim), NOT from this field. Dispatch ignores

@@ -16,6 +16,35 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Must match the dispatch's `PROTOCOL_VERSION` (protocol.ts).
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// `register.protocolVersion` is pinned, not ranged: this crate speaks exactly
+/// [`PROTOCOL_VERSION`], and a frame announcing any other version fails to
+/// parse instead of being treated as v2. The TS side pins with
+/// `z.literal(PROTOCOL_VERSION)`; the `reject` fixtures hold both to it.
+fn pinned_protocol_version<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    let v = u32::deserialize(deserializer)?;
+    if v == PROTOCOL_VERSION {
+        Ok(v)
+    } else {
+        Err(D::Error::custom(format!(
+            "unsupported protocolVersion {v}; this node speaks {PROTOCOL_VERSION}"
+        )))
+    }
+}
+
+/// `jobProgress.progress` is a fraction in `[0, 1]` (TS: `.min(0).max(1)`).
+/// Anything else is a runner bug, and a bug should fail to parse rather than
+/// travel the wire as a number.
+fn unit_interval<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    let v = f64::deserialize(deserializer)?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(D::Error::custom(format!(
+            "progress must be in [0, 1], got {v}"
+        )))
+    }
+}
+
 // ── Worker → server ─────────────────────────────────────────────────────────
 
 /// Who operates this node.
@@ -60,6 +89,7 @@ pub struct Capabilities {
 #[serde(rename_all = "camelCase")]
 pub struct RegisterMessage {
     pub tenant: String,
+    #[serde(deserialize_with = "pinned_protocol_version")]
     pub protocol_version: u32,
     pub operator: Option<String>,
     pub platform: Platform,
@@ -94,6 +124,7 @@ pub struct JobProgressMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
     /// Render progress in `[0, 1]`.
+    #[serde(deserialize_with = "unit_interval")]
     pub progress: f64,
 }
 
@@ -445,7 +476,11 @@ mod tests {
             .expect("fixtures/v2.json must exist (run from the decent-render workspace)");
         let parsed: Value = serde_json::from_str(&raw).expect("fixtures are valid JSON");
 
-        for case in parsed["cases"].as_array().expect("cases array") {
+        // Teeth (C-2): an empty set iterates zero times and passes vacuously.
+        let cases = parsed["cases"].as_array().expect("cases array");
+        assert!(!cases.is_empty(), "positive fixture set must be non-empty");
+
+        for case in cases {
             let name = case["name"].as_str().unwrap();
             let direction = case["direction"].as_str().unwrap();
             let wire = case["wire"].clone();
@@ -468,5 +503,43 @@ mod tests {
             // makes the re-serialized value differ from the fixture.
             assert_eq!(re, wire, "fixture drifted: {name} ({direction})");
         }
+    }
+
+    /// Negative contract: every entry in the fixture file's `reject` array
+    /// must FAIL to parse. TS asserts the same entries against its zod
+    /// schemas, so neither side can quietly loosen a bound (protocolVersion
+    /// pin, progress range, codec set) without the other side noticing.
+    #[test]
+    fn cross_language_fixtures_reject() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packages/protocol/fixtures/v2.json"
+        );
+        let raw = fs::read_to_string(path).expect("fixtures/v2.json must exist");
+        let parsed: Value = serde_json::from_str(&raw).expect("fixtures are valid JSON");
+        let reject = parsed["reject"].as_array().expect("reject array");
+        assert!(!reject.is_empty(), "negative fixture set must be non-empty");
+
+        // Collect every accepted entry so one run names ALL the loose bounds.
+        let mut accepted = Vec::new();
+        for case in reject {
+            let name = case["name"].as_str().unwrap();
+            let direction = case["direction"].as_str().unwrap();
+            let reason = case["reason"].as_str().unwrap_or("");
+            let wire = case["wire"].clone();
+            let ok = match direction {
+                "worker" => serde_json::from_value::<WorkerMessage>(wire).is_ok(),
+                "server" => serde_json::from_value::<ServerMessage>(wire).is_ok(),
+                other => panic!("unknown direction {other}"),
+            };
+            if ok {
+                accepted.push(format!("{name} ({direction}) -- {reason}"));
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "negative fixtures were ACCEPTED:\n  {}",
+            accepted.join("\n  ")
+        );
     }
 }
