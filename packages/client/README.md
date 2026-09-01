@@ -34,10 +34,15 @@ Public functions:
 
 - `bundleAndUpload()`
 - `renderMediaOnFarm()`
+- `enqueueRender()` — enqueue a render and return immediately with its
+  `renderId`; poll with `getRenderProgress()` and cancel with
+  `cancelRender()`. `renderMediaOnFarm()` is this loop done for you.
 - `getRenderProgress()`
 - `cancelRender()`
 - `getBalance()`
 - `getLatestBundle()`
+- `getWorkerAvailability()` — which workers behind an `operator` are
+  currently available.
 - `getVersions()`
 - `verifyWebhookSignature()`
 - `listWebhooks()`, `createWebhook()`, `updateWebhook()`, `deleteWebhook()`
@@ -58,3 +63,13 @@ renders always expose their output immediately; verification can later be
 `passed` or `flagged` without removing the output URL.
 
 `@remotion/bundler` is an optional peer dependency used only by `bundleAndUpload()`. The package's only runtime dependency is Zod. Response types are inferred from the exported Zod schemas that the farm handlers also use.
+
+Exported alongside the functions: the `FarmApiError` class — thrown for every
+non-2xx API response, carrying the HTTP `status`, the farm's error `code`, and
+the raw `details` body; the per-call option/result types (`GetRenderProgressOptions`,
+`CancelRenderOptions`, `RenderMediaOnFarmOptions`, `RenderMediaOnFarmResult`,
+`EnqueueRenderOptions`, `BundleAndUploadOptions`, `BundleAndUploadResult`);
+and a star re-export of `./schemas` — the Zod schemas (`renderStatusSchema`,
+`enqueueRenderRequestSchema`, `renderStatusResponseSchema`, …) and their
+inferred types (`RenderStatusResponse`, `EnqueueRenderRequest`,
+`VerificationStatus`, …) that the request/response methods validate with.

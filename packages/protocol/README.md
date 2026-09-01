@@ -40,7 +40,7 @@ const msg = WorkerMessageSchema.parse(JSON.parse(raw));
 ```sh
 cd packages/protocol
 bun install
-bunx vitest run          # TS conformance (14 tests)
+bunx vitest run          # TS conformance (26 tests)
 ```
 
 Rust side, from the repo root:
@@ -79,11 +79,15 @@ GitHub, create the `publish` environment with Required reviewers = you. No
 Plain JSON, camelCase keys, messages discriminated by `type`.
 
 - **Worker → server:** `register`, `heartbeat`, `jobAccepted`, `jobProgress`,
-  `jobComplete` (metrics: `wallMs`, `frames`, `outputSizeInBytes?`), `jobFailed`.
+  `jobComplete` (metrics: `wallMs`, `frames`, `outputSizeInBytes?`), `jobFailed`,
+  `jobRejected` (the worker's refusal of an assignment it cannot honor).
 - **Server → worker:** `jobAssign`, `cancel`, `ping`, `updateAvailable`.
 - `jobAssign.attempt?` is an assignment lease echoed by accepted, progress,
   complete, and failed messages. It remains optional in protocol v2 so older
   supervisors and dispatch versions can be upgraded in either order.
+- `jobAssign.browserSha256?` / `browserGetUrl?` pin the render browser: the
+  worker downloads the tarball, verifies the sha, and reuses it across jobs.
+  Optional for payloads that still bundle a browser under `chrome/`.
 - `purgeAfter` is a `z.literal(true)` / Rust `PurgeAfter` — the privacy rule
   baked into the type (deserialization rejects `false`).
 
