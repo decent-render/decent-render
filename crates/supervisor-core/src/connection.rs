@@ -3012,7 +3012,9 @@ while true; do sleep 5; done
             .lines()
             .next()
             .unwrap_or("")
-            .trim()
+            .split_whitespace() // D-8: `<pid> <start time>`
+            .next()
+            .unwrap_or("")
             .parse()
             .expect("pidfile holds a pid");
         // ...and it must be OUTSIDE the runner's group: read its pgid via ps.
@@ -3187,7 +3189,9 @@ while true; do sleep 5; done
             .lines()
             .next()
             .unwrap_or("")
-            .trim()
+            .split_whitespace() // D-8: `<pid> <start time>`
+            .next()
+            .unwrap_or("")
             .parse()
             .expect("pidfile holds a pid");
 

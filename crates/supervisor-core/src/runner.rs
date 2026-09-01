@@ -353,11 +353,14 @@ fn browser_executable_in(dir: &Path) -> anyhow::Result<PathBuf> {
 /// POSIX shell script placed in the supervisor's per-job workdir:
 ///
 ///   #!/bin/sh
-///   echo $$ >> <pidfile>
+///   echo "$$ $(ps -o lstart= -p $$)" >> <pidfile>
 ///   exec "<real-executable>" "$@"
 ///
 /// Remotion spawns this script as the "browser executable"; the script's pid
-/// is written BEFORE `exec` replaces it with the real Chrome. Because
+/// is written BEFORE `exec` replaces it with the real Chrome, together with
+/// the process START TIME (D-8): `exec` keeps both pid and start time, so the
+/// pair identifies THIS Chrome and not whatever the OS later hands the same
+/// pid to. Without `ps` the line degrades to the bare pid (see the sweep). Because
 /// `detached: true` makes that pid a group leader, the pid IS the pgid of
 /// Chrome's whole tree — so `killpg(pid, SIGKILL)` later is exactly the
 /// containment Remotion itself uses when it closes a browser
@@ -380,7 +383,7 @@ fn write_browser_wrapper(
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\necho $$ >> {pidfile}\nexec \"{real}\" \"$@\"\n",
+            "#!/bin/sh\necho \"$$ $(ps -o lstart= -p $$ 2>/dev/null)\" >> {pidfile}\nexec \"{real}\" \"$@\"\n",
             pidfile = pidfile.display(),
             real = real_executable.display(),
         ),
@@ -391,6 +394,47 @@ fn write_browser_wrapper(
     Ok((wrapper, pidfile))
 }
 
+/// One pidfile line: `<pid>` (legacy) or `<pid> <process start time>` as
+/// written by the exec wrapper (D-8). Whitespace in the start time is
+/// normalised so `ps` padding cannot defeat the comparison.
+#[cfg(unix)]
+fn parse_pid_line(line: &str) -> Option<(u32, Option<String>)> {
+    let mut tokens = line.split_whitespace();
+    let pid = tokens.next()?.parse::<u32>().ok()?;
+    let identity = tokens.collect::<Vec<_>>().join(" ");
+    Some((
+        pid,
+        if identity.is_empty() {
+            None
+        } else {
+            Some(identity)
+        },
+    ))
+}
+
+/// The live process's start time as `ps` prints it (`lstart`), whitespace
+/// normalised — the identity the wrapper recorded at exec. None when the
+/// pid is gone or `ps` is unavailable; both mean "do not trust this pid".
+#[cfg(unix)]
+fn process_start_time(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Kill every browser pid recorded by the job's exec wrapper.
 ///
 /// Each recorded pid is a group leader BY CONSTRUCTION (detached spawn), so
@@ -399,7 +443,7 @@ fn write_browser_wrapper(
 ///
 /// Safety mirrors `terminate_child`'s runtime guard: never pid 0, never the
 /// supervisor's own pid, and (unlike the group kill) also never a pid that
-/// no longer belongs to us. A dead pid is simply skipped — ESRCH means the
+/// no longer belongs to us — verified by START TIME (D-8), not just liveness. A dead pid is simply skipped — ESRCH means the
 /// browser is already gone, which is success. The pidfile is deleted by the
 /// workdir purge; stale entries can only exist while the workdir does.
 ///
@@ -413,7 +457,7 @@ fn kill_recorded_browsers(pidfile: &Path) -> Vec<u32> {
     let me = std::process::id();
     let mut killed = Vec::new();
     for line in contents.lines() {
-        let Ok(pid) = line.trim().parse::<u32>() else {
+        let Some((pid, recorded)) = parse_pid_line(line) else {
             continue; // tolerate junk lines rather than aborting the sweep
         };
         if pid == 0 || pid == me {
@@ -422,11 +466,43 @@ fn kill_recorded_browsers(pidfile: &Path) -> Vec<u32> {
             tracing::warn!(pid, "browser pidfile contains unsafe pid — skipping");
             continue;
         }
-        if pid_exists(pid) {
-            let rc = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
-            tracing::info!(pid, rc, "browser group SIGKILL (recorded at exec)");
-            killed.push(pid);
+        match recorded {
+            Some(recorded) => {
+                // D-8 (audit R-9): the pid may have been RECYCLED since the
+                // wrapper recorded it. A group SIGKILL on a recycled pid that
+                // now leads someone else's group is catastrophic, so signal
+                // only when the live process still has the recorded start
+                // time. A missing/unreadable start time means "gone or
+                // unknowable" — err toward NOT killing.
+                match process_start_time(pid) {
+                    Some(live) if live == recorded => {}
+                    Some(live) => {
+                        tracing::warn!(
+                            pid,
+                            %recorded,
+                            %live,
+                            "browser pid was recycled by the OS — NOT signalling"
+                        );
+                        continue;
+                    }
+                    None => continue, // already gone (ESRCH-equivalent) — success
+                }
+            }
+            None => {
+                // Legacy / `ps`-less line: no identity to verify. Keep the
+                // pre-D-8 behaviour but say so — this is the unverified path.
+                if !pid_exists(pid) {
+                    continue;
+                }
+                tracing::warn!(
+                    pid,
+                    "browser pid has no recorded identity — signalling unverified"
+                );
+            }
         }
+        let rc = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+        tracing::info!(pid, rc, "browser group SIGKILL (recorded at exec)");
+        killed.push(pid);
     }
     killed
 }
@@ -926,6 +1002,120 @@ junk
         assert!(
             killed.is_empty(),
             "nothing should have been signalled: {killed:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-8 (audit R-9): a recorded pid can be RECYCLED by the OS between the
+    /// browser's exit and the sweep. Since every recorded pid is signalled as
+    /// a process GROUP, a recycled pid that happens to lead another group —
+    /// a user's terminal, a daemon — would take that whole group down with
+    /// SIGKILL. The pidfile therefore carries the process START TIME next to
+    /// the pid, and the sweep signals only when the live process still has
+    /// that start time.
+    #[cfg(unix)]
+    fn spawn_group_leader_sleeper() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[cfg(unix)]
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("decent-d8-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_lines_parse_pid_and_optional_identity() {
+        assert_eq!(super::parse_pid_line("123"), Some((123, None)));
+        assert_eq!(
+            super::parse_pid_line("123 Wed Sep  2 01:03:24 2026"),
+            Some((123, Some("Wed Sep 2 01:03:24 2026".to_string())))
+        );
+        assert_eq!(super::parse_pid_line("  123   "), Some((123, None)));
+        assert_eq!(super::parse_pid_line("junk"), None);
+        assert_eq!(super::parse_pid_line(""), None);
+        assert_eq!(super::parse_pid_line("12x 3"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recycled_pid_with_a_different_start_time_is_never_signalled() {
+        let dir = scratch("recycled");
+        let mut child = spawn_group_leader_sleeper();
+        let pid = child.id();
+        // Recorded identity from "another life" of this pid.
+        std::fs::write(dir.join("pids"), format!("{pid} Sat Jan 1 00:00:00 2000\n")).unwrap();
+        let killed = super::kill_recorded_browsers(&dir.join("pids"));
+        assert!(
+            killed.is_empty(),
+            "a recycled pid was signalled: {killed:?}"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the unrelated group leader must still be alive"
+        );
+        child.kill().ok();
+        child.wait().ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pid_whose_start_time_matches_is_group_killed() {
+        let dir = scratch("match");
+        let mut child = spawn_group_leader_sleeper();
+        let pid = child.id();
+        let start = super::process_start_time(pid).expect("ps reports a start time for a live pid");
+        std::fs::write(dir.join("pids"), format!("{pid} {start}\n")).unwrap();
+        let killed = super::kill_recorded_browsers(&dir.join("pids"));
+        assert_eq!(killed, vec![pid]);
+        let status = child.wait().unwrap();
+        assert!(
+            !status.success(),
+            "sleeper must have died from SIGKILL: {status:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_pid_only_line_still_kills_but_is_the_unverified_path() {
+        let dir = scratch("legacy");
+        let mut child = spawn_group_leader_sleeper();
+        let pid = child.id();
+        std::fs::write(dir.join("pids"), format!("{pid}\n")).unwrap();
+        let killed = super::kill_recorded_browsers(&dir.join("pids"));
+        assert_eq!(killed, vec![pid]);
+        child.wait().ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The wrapper itself must record the identity, not just the pid —
+    /// otherwise the sweep can only ever take the unverified path.
+    #[cfg(unix)]
+    #[test]
+    fn the_exec_wrapper_records_pid_and_start_time() {
+        let dir = scratch("wrapper");
+        let (wrapper, pidfile) =
+            super::write_browser_wrapper(&dir, std::path::Path::new("/usr/bin/true")).unwrap();
+        let status = std::process::Command::new(&wrapper)
+            .status()
+            .expect("run wrapper");
+        assert!(status.success());
+        let contents = std::fs::read_to_string(&pidfile).unwrap();
+        let (pid, identity) =
+            super::parse_pid_line(contents.lines().next().unwrap_or("")).expect("pid line");
+        assert!(pid > 0);
+        assert!(
+            identity.is_some(),
+            "wrapper must record the start time next to the pid: {contents:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
