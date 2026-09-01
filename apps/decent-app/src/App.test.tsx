@@ -17,6 +17,13 @@ vi.mock('@tauri-apps/api/core', () => ({
 	invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
 
+// The shell plugin's `open` — how "Connect this Mac" reaches the system
+// browser (A-3). Mocked so the test can assert the exact URL.
+const shellOpenMock = vi.fn(async (_url: string) => undefined);
+vi.mock('@tauri-apps/plugin-shell', () => ({
+	open: (url: string) => shellOpenMock(url),
+}));
+
 vi.mock('@tauri-apps/api/event', () => ({
 	listen: vi.fn(async (event: string, handler: EventHandler) => {
 		if (event === 'status-update') statusHandler = handler;
@@ -35,6 +42,7 @@ import App from './App';
 describe('App', () => {
 	beforeEach(() => {
 		invokeMock.mockReset();
+		shellOpenMock.mockClear();
 		statusHandler = null;
 		logHandler = null;
 
@@ -235,6 +243,24 @@ describe('App', () => {
 	// recorded, payouts coming later — and must NOT call the dead
 	// driffs-era fetch_earnings IPC (its /api/operator-earnings route
 	// does not exist in farm-web).
+	// A-3 (audit U-10): the onboarding link used to be derived from the dispatch
+	// URL and pointed at a driffs dev server (localhost:5173). Pairing lives at
+	// the farm's devices page — the same URL the CLI prints (main.rs).
+	it('"Connect this Mac" links to the production devices page and opens it in the system browser', async () => {
+		render(<App />);
+		const link = await screen.findByRole('link', {name: /connect this mac/i});
+		expect(link).toHaveAttribute('href', 'https://decent-render.farm/devices');
+		fireEvent.click(link);
+		await waitFor(() => {
+			expect(shellOpenMock).toHaveBeenCalledWith('https://decent-render.farm/devices');
+		});
+		expect(shellOpenMock).toHaveBeenCalledTimes(1);
+		// The old IPC built `<appUrl>/settings/devices` (a 404 on the farm) —
+		// it must not be called at all.
+		const calls = invokeMock.mock.calls.map(([cmd]) => cmd as string);
+		expect(calls).not.toContain('open_pairing_page');
+	});
+
 	it('earnings panel states the not-wired-up contract and makes no earnings IPC call', async () => {
 		render(<App />);
 

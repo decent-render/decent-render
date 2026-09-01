@@ -1,6 +1,16 @@
 import {useEffect, useState, useRef, useCallback} from 'react';
 import {invoke} from '@tauri-apps/api/core';
 import {listen, type UnlistenFn} from '@tauri-apps/api/event';
+import {open as openInBrowser} from '@tauri-apps/plugin-shell';
+
+/**
+ * Where an operator pairs this machine. The SAME page the CLI prints
+ * (`decent login` → "Manage devices at https://decent-render.farm/devices").
+ * A-3: this used to be derived from the dispatch URL and landed on a driffs
+ * dev server (localhost:5173) — and the old IPC appended `/settings/devices`,
+ * which is a 404 on the farm.
+ */
+const DEVICES_URL = 'https://decent-render.farm/devices';
 
 // ── Types (mirror supervisor-core/src/status.rs) ───────────────────────────
 
@@ -154,15 +164,17 @@ export default function App() {
 		await invoke('set_allow_real_jobs', {value});
 	}, []);
 
-	const handlePairDevice = useCallback(async () => {
-		// Extract the origin from the dispatch URL to construct the app URL.
-		// ws://localhost:8790/ws → http://localhost:5173 (driffs dev server)
-		// In production this would be the driffs domain.
-		const appUrl = dispatchUrl.startsWith('ws://localhost')
-			? 'http://localhost:5173'
-			: dispatchUrl.replace(/^ws/, 'http').replace(/:\d+\/ws$/, ':5173');
-		await invoke('open_pairing_page', {appUrl});
-	}, [dispatchUrl]);
+	const handlePairDevice = useCallback(async (e: React.MouseEvent<HTMLAnchorElement>) => {
+		// Stay in the app; the pairing page opens in the SYSTEM browser (shell
+		// plugin, `shell:allow-open` capability). The href is real so the link
+		// is honest even if the plugin call fails.
+		e.preventDefault();
+		try {
+			await openInBrowser(DEVICES_URL);
+		} catch (err) {
+			alert(`Failed to open browser: ${err}\nOpen ${DEVICES_URL} manually.`);
+		}
+	}, []);
 
 	const isConnected = status?.connection === 'connected' || status?.connection === 'registered';
 	const currentJob = status?.currentJob;
@@ -219,9 +231,9 @@ export default function App() {
 				</div>
 				{!isConnected && (
 					<div className="pair-device">
-						<button className="btn-link" onClick={handlePairDevice}>
+						<a className="btn-link" href={DEVICES_URL} onClick={handlePairDevice}>
 							Connect this Mac →
-						</button>
+						</a>
 						<span className="hint">
 							Opens your browser to create a device token. Copy it back here.
 						</span>
