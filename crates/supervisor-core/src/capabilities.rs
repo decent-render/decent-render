@@ -87,11 +87,34 @@ fn has_drm_render_node() -> bool {
 mod tests {
     use super::*;
 
+    /// DECENT_GPU is process-global env, and the test binary runs tests in
+    /// parallel threads — the same serialization pattern as bins/decent's
+    /// HOME_LOCK: any test that touches the override holds this lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII restore: a failing assert must not leak DECENT_GPU into sibling
+    /// tests any more than a set without the lock would.
+    struct OverrideVar;
+    impl OverrideVar {
+        fn set(&self, value: &str) {
+            std::env::set_var("DECENT_GPU", value);
+        }
+    }
+    impl Drop for OverrideVar {
+        fn drop(&mut self) {
+            std::env::remove_var("DECENT_GPU");
+        }
+    }
+
     /// The regression that motivated this module: capability must not be the
     /// operator's willingness switch. Whatever the probe decides, it decides it
     /// without being told whether real jobs are enabled.
     #[test]
     fn detection_takes_no_willingness_input() {
+        // Holds ENV_LOCK: detect_capabilities reads DECENT_GPU, and the
+        // override test mutates that very env — without the lock the two
+        // calls below can straddle an override flip and "fail" purity.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let a = detect_capabilities();
         let b = detect_capabilities();
         assert_eq!(a, b, "detection must be a pure function of the machine");
@@ -100,8 +123,49 @@ mod tests {
     #[test]
     fn reports_this_platform() {
         let caps = detect_capabilities();
-        assert_eq!(caps.os.as_deref(), Some(std::env::consts::OS));
-        assert_eq!(caps.arch.as_deref(), Some(std::env::consts::ARCH));
+        // EXACT strings, pinned against the compile-time cfg — not just
+        // non-empty. dispatch matches on these verbatim, so "darwin" vs
+        // "macos" or "arm64" vs "aarch64" would silently drop this node
+        // from every payload match; the constants are the contract.
+        let expected_os = if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "linux") {
+            "linux"
+        } else {
+            std::env::consts::OS
+        };
+        let expected_arch = if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else if cfg!(target_arch = "x86_64") {
+            "x86_64"
+        } else {
+            std::env::consts::ARCH
+        };
+        assert_eq!(caps.os.as_deref(), Some(expected_os));
+        assert_eq!(caps.arch.as_deref(), Some(expected_arch));
+    }
+
+    /// The override hook must WIN on every platform: an operator who knows
+    /// the probe is wrong about their box sets DECENT_GPU and the register
+    /// frame reports what they said, whatever /dev/dri or Metal looks like.
+    #[test]
+    fn gpu_override_wins_over_the_probe_on_every_platform() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let var = OverrideVar;
+        for falsy in ["0", "false", "no"] {
+            var.set(falsy);
+            assert!(
+                !detect_capabilities().gpu,
+                "DECENT_GPU={falsy} must force gpu=false on this platform"
+            );
+        }
+        for truthy in ["1", "true", "yes"] {
+            var.set(truthy);
+            assert!(
+                detect_capabilities().gpu,
+                "DECENT_GPU={truthy} must force gpu=true on this platform"
+            );
+        }
     }
 
     #[test]
@@ -129,6 +193,21 @@ mod tests {
         // ANGLE on Metal is always available on a supported Mac.
         if cfg!(target_os = "macos") {
             assert!(detect_gpu());
+        }
+    }
+
+    /// Linux-only wiring pin: with no DRM render node the probe must report
+    /// no GPU (a headless server claiming GPU accepts jobs it cannot finish).
+    /// On a GPU box the precondition inverts and the identity is asserted the
+    /// other way — either way detect_gpu → has_drm_render_node is what is
+    /// pinned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_gpu_tracks_drm_render_node() {
+        if has_drm_render_node() {
+            assert!(detect_gpu());
+        } else {
+            assert!(!detect_gpu());
         }
     }
 }
