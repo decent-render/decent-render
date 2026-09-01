@@ -91,6 +91,27 @@ Plain JSON, camelCase keys, messages discriminated by `type`.
 - `purgeAfter` is a `z.literal(true)` / Rust `PurgeAfter` — the privacy rule
   baked into the type (deserialization rejects `false`).
 
+## Runner stdout contract (v1)
+
+The runner inside a render payload talks to its supervisor over stdout NDJSON
+lines (`progress`, `heartbeat`, `done`, `error`). That contract is pinned by
+`fixtures/runner-stdout-v1.json` — an `accept` list (what both sides agree on
+today) and a `reject` list (what must fail on both sides):
+
+- **TS (emitter):** `@decent-render/runner-core` exports `runnerEventSchema`
+  (`src/runner-stdout-schema.ts`); its conformance test asserts every fixture
+  case, and the emitter's own tests validate every stdout frame against it
+  (`src/__tests__/runner-stdout-conformance.test.ts`, `stdout-discipline.test.ts`,
+  `liveness.test.ts`).
+- **Rust (parser):** `RunnerEvent` in `crates/supervisor-core/src/runner.rs`
+  round-trips the same file (`runner_stdout_fixtures_round_trip`).
+- **CI** exercises both legs (runner-core's `bun run test` and the workspace
+  `cargo test`) — read by relative path, never copied.
+
+The first conformance run caught real drift: `RunnerEvent::Progress` accepted
+any `f64`, while dispatch's protocol-v2 schema bounds progress to `[0, 1]` —
+the parser now applies the same `unit_interval` bound.
+
 ## Payload-agnostic (future, not this version)
 
 v2 is render-specific. The intended evolution — a **future** wire-version bump,
