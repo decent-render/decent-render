@@ -33,8 +33,11 @@ fn pinned_protocol_version<'de, D: Deserializer<'de>>(deserializer: D) -> Result
 
 /// `jobProgress.progress` is a fraction in `[0, 1]` (TS: `.min(0).max(1)`).
 /// Anything else is a runner bug, and a bug should fail to parse rather than
-/// travel the wire as a number.
-fn unit_interval<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+/// travel the wire as a number. Also reused for the runner-stdout contract's
+/// `progress` event (runner.rs RunnerEvent) — same bound, same rationale:
+/// dispatch's schema refuses out-of-range progress, so it must not leave the
+/// supervisor in the first place.
+pub(crate) fn unit_interval<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
     let v = f64::deserialize(deserializer)?;
     if (0.0..=1.0).contains(&v) {
         Ok(v)

@@ -114,6 +114,10 @@ pub struct InFlightJob {
 #[serde(tag = "type", rename_all = "camelCase")]
 enum RunnerEvent {
     Progress {
+        /// Same bound as protocol v2's jobProgress: a fraction in [0, 1].
+        /// (C-3: the shared fixture caught the drift — the lenient `f64`
+        /// accepted out-of-range values dispatch would refuse downstream.)
+        #[serde(deserialize_with = "crate::protocol::unit_interval")]
         progress: f64,
     },
     /// Liveness only — the runner is alive but has no progress to report (a
@@ -1124,6 +1128,64 @@ junk
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C-3 / audit U-12: the runner↔supervisor stdout contract is pinned by
+    /// the SAME fixture file the TS side (runner-core's conformance test)
+    /// asserts against — packages/protocol/fixtures/runner-stdout-v1.json.
+    /// Every accept case must deserialise into `RunnerEvent`; every reject
+    /// case must FAIL. A case that parses here but not there (or vice
+    /// versa) is exactly the drift the fixtures exist to catch — the first
+    /// run of this test caught one: the old lenient `progress: f64` happily
+    /// accepted progress 1.5, which dispatch's protocol-v2 schema refuses.
+    #[test]
+    fn runner_stdout_fixtures_round_trip() {
+        use std::fs;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packages/protocol/fixtures/runner-stdout-v1.json"
+        );
+        let raw = fs::read_to_string(path).expect("runner-stdout-v1.json must exist");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("fixtures are valid JSON");
+        let accept = parsed["accept"].as_array().expect("accept array");
+        let reject = parsed["reject"].as_array().expect("reject array");
+        assert!(!accept.is_empty(), "accept fixture set must be non-empty");
+        assert!(!reject.is_empty(), "reject fixture set must be non-empty");
+
+        for case in accept {
+            let name = case["name"].as_str().expect("accept case name");
+            let wire = &case["wire"];
+            let event: RunnerEvent = serde_json::from_value(wire.clone())
+                .unwrap_or_else(|e| panic!("accept case {name} must parse into RunnerEvent: {e}"));
+            // The tag survives: the parsed variant matches the fixture's type.
+            let expected = wire["type"].as_str().expect("wire type");
+            let actual = match &event {
+                RunnerEvent::Progress { .. } => "progress",
+                RunnerEvent::Heartbeat => "heartbeat",
+                RunnerEvent::Done { .. } => "done",
+                RunnerEvent::Error { .. } => "error",
+            };
+            assert_eq!(
+                actual, expected,
+                "accept case {name} parsed to the wrong variant"
+            );
+        }
+
+        // Collect every accepted entry so one run names ALL the loose bounds.
+        let mut accepted = Vec::new();
+        for case in reject {
+            let name = case["name"].as_str().expect("reject case name");
+            let wire = &case["wire"];
+            if serde_json::from_value::<RunnerEvent>(wire.clone()).is_ok() {
+                accepted.push(name.to_string());
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "negative runner-stdout fixtures were ACCEPTED:\n  {}",
+            accepted.join("\n  ")
+        );
+    }
 
     /// `DECENT_MAX_WORKDIR_BYTES` parsing. Drives the pure parse directly —
     /// NOT by mutating the env: the test binary is parallel and connection
