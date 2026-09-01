@@ -72,8 +72,14 @@ jobs:
         working-directory: packages/runner-core
       - run: bun run build
         working-directory: packages/runner-core
-      # The output-verification gate needs a REAL ffmpeg/ffprobe: without it
-      # those suites silently skip and CI reports green having executed zero
+      # C-3 / audit U-12: this suite includes the runner-stdout-v1 conformance
+      # test, which reads packages/protocol/fixtures/runner-stdout-v1.json BY
+      # RELATIVE PATH (no copy) and asserts every accept/reject case against
+      # runnerEventSchema. The Rust leg of the same file is parsed by
+      # supervisor-core's runner_stdout_fixtures_round_trip in the rust job
+      # above — one fixture, both languages, no drift.
+      # The output-verification gate also needs a REAL ffmpeg/ffprobe: without
+      # it those suites silently skip and CI reports green having executed zero
       # of their assertions (audit-tests item 9). Install it and then FAIL
       # if it is missing, so a future workflow edit that drops this step (or
       # an apt mirror serving a broken package) cannot quietly disarm the
