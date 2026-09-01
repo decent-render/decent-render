@@ -247,10 +247,16 @@ impl DaemonSnapshot {
 }
 
 fn read_daemon_snapshot() -> Option<DaemonSnapshot> {
-    let content = token_path()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("daemon-status")))
-        .and_then(|p| std::fs::read_to_string(&p).ok())?;
+    let path = token_path().ok()?.parent()?.join("daemon-status");
+    read_daemon_snapshot_from(&path)
+}
+
+/// C-11: parse the snapshot at `path`. Returns None rather than a partial
+/// struct: `updated_at_ms` is the LAST line the writer emits, so a torn /
+/// half-written file (crashed pre-atomic write, old daemon) lacks a
+/// parseable timestamp — that absence IS the torn signal.
+fn read_daemon_snapshot_from(path: &std::path::Path) -> Option<DaemonSnapshot> {
+    let content = std::fs::read_to_string(path).ok()?;
     let kv: std::collections::HashMap<&str, &str> = content
         .lines()
         .filter_map(|l| {
@@ -282,7 +288,7 @@ fn read_daemon_snapshot() -> Option<DaemonSnapshot> {
         } else {
             Some(upd.to_string())
         },
-        updated_at_ms: val("updated_at_ms").parse().unwrap_or(0),
+        updated_at_ms: val("updated_at_ms").parse().ok()?,
     })
 }
 
@@ -752,7 +758,17 @@ async fn main() -> anyhow::Result<()> {
                             );
                             line("updated_at_ms", &now_ms().to_string());
                         }
-                        let _ = std::fs::write(&status_path, snap);
+                        let _ = {
+                            // C-11: atomic write — `decent status` and the TUI poll
+                            // this file from another process, and a plain write can
+                            // be observed half-written (a torn snapshot). Write to a
+                            // tmp sibling, then rename over the target: rename is
+                            // atomic within a filesystem, so a reader sees either
+                            // the old file or the complete new one, never a mix.
+                            let tmp_path = dir.join("daemon-status.tmp");
+                            std::fs::write(&tmp_path, &snap)
+                                .and_then(|()| std::fs::rename(&tmp_path, &status_path))
+                        };
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     }
                 });
@@ -1252,6 +1268,87 @@ mod packet45_tests {
         } else {
             assert_eq!(label, "failed to acquire");
         }
+    }
+}
+
+/// C-11: the daemon-status file is written by the running daemon and read
+/// by `decent status` / the TUI in OTHER processes. A torn (half-written)
+/// file must parse to None — never a partial struct that looks like real
+/// state. Points the path-taking parser at a scratch dir under os.tmpdir;
+/// never reads the real ~/.config/decent.
+#[cfg(test)]
+mod daemon_status_tests {
+    use super::*;
+
+    /// A complete snapshot in exactly the shape the daemon's writer emits
+    /// (updated_at_ms is deliberately the LAST line — the torn-read guard
+    /// keys on that).
+    fn full_snapshot() -> String {
+        [
+            "connection=Registered",
+            "dispatch_url=ws://dispatch.example.com/ws",
+            "current_job_id=job-p3-proof",
+            "current_job_phase=Rendering",
+            "current_job_progress=0.42",
+            "keep_awake=",
+            "jobs_completed=3",
+            "jobs_failed=1",
+            "jobs_canceled=2",
+            "allow_real_jobs=true",
+            "update_available=",
+        ]
+        .join("\n")
+            + &format!("\nupdated_at_ms={}", now_ms())
+            + "\n"
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "p53-daemon-status-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn torn_snapshot_parses_to_none_never_a_partial_struct() {
+        let dir = scratch_dir("torn");
+        let path = dir.join("daemon-status");
+        let full = full_snapshot();
+        // Exactly half the bytes of a valid snapshot: the tail (including
+        // the updated_at_ms line) is missing — what a reader sees mid-write.
+        std::fs::write(&path, &full[..full.len() / 2]).unwrap();
+        assert!(
+            read_daemon_snapshot_from(&path).is_none(),
+            "a torn snapshot must parse to None, never a partial struct"
+        );
+        // A truncation INSIDE the timestamp line must not parse either.
+        std::fs::write(&path, "connection=Registered\nupdated_at_ms=").unwrap();
+        assert!(read_daemon_snapshot_from(&path).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn full_snapshot_round_trips() {
+        let dir = scratch_dir("full");
+        let path = dir.join("daemon-status");
+        std::fs::write(&path, full_snapshot()).unwrap();
+        let snap = read_daemon_snapshot_from(&path).expect("full snapshot parses");
+        assert_eq!(snap.connection, "Registered");
+        assert_eq!(snap.jobs_completed, 3);
+        assert_eq!(snap.jobs_failed, 1);
+        assert_eq!(snap.jobs_canceled, 2);
+        let (id, phase, progress) = snap.current_job.expect("current job present");
+        assert_eq!(id, "job-p3-proof");
+        assert_eq!(phase, "Rendering");
+        assert!((progress - 0.42).abs() < 1e-9);
+        assert!(snap.update_available.is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
