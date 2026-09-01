@@ -116,13 +116,46 @@ const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, 
   signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason); }, {once: true});
 });
 
+/**
+ * Enqueue a render and wait for it to finish.
+ *
+ * **Cancels what it abandons.** If this call stops waiting — the internal
+ * `timeoutMs` (default 30 min) elapses, or the caller's `signal` aborts — it
+ * POSTs the render's cancel endpoint BEFORE throwing, so the farm does not
+ * keep rendering (and billing) a job nobody is waiting for. The cancel is
+ * best-effort: a failure to cancel is swallowed and the original timeout /
+ * abort error is what you get. It is sent without the aborted `signal`, so an
+ * abort cannot cancel the cancel. Renders that reach `complete`, `failed`, or
+ * `canceled` on their own are never canceled by this function.
+ *
+ * Other errors (a network failure, a farm 5xx while polling) do NOT cancel:
+ * the render may still finish, and the farm will settle it; use
+ * `getRenderProgress()` / `cancelRender()` with the `renderId` if you want to
+ * resume or stop it.
+ */
 export async function renderMediaOnFarm(options: RenderMediaOnFarmOptions): Promise<RenderMediaOnFarmResult> {
   const enqueued = await enqueueRender(options);
   const deadline = Date.now() + (options.timeoutMs ?? 30 * 60 * 1000);
+
+  /** Best-effort cancel of the render we are walking away from, then rethrow. */
+  const abandon = async (error: unknown): Promise<never> => {
+    // No `signal`: on the abort path it is already aborted and would abort
+    // the cancel request itself before it reached the farm.
+    await cancelRender({apiKey: options.apiKey, apiUrl: options.apiUrl, renderId: enqueued.renderId}).catch(() => undefined);
+    throw error;
+  };
+
   for (;;) {
-    const status = options.waitForCompletion
-      ? await options.waitForCompletion(enqueued.renderId)
-      : await getRenderProgress({...options, renderId: enqueued.renderId});
+    let status: RenderStatusResponse;
+    try {
+      status = options.waitForCompletion
+        ? await options.waitForCompletion(enqueued.renderId)
+        : await getRenderProgress({...options, renderId: enqueued.renderId});
+    } catch (error) {
+      // An abort during the poll request surfaces as the fetch rejecting.
+      if (options.signal?.aborted) return abandon(error);
+      throw error;
+    }
     options.onProgress?.(status);
     if (status.status === 'complete') {
       return {outputUrl: status.outputUrl, renderId: status.renderId, creditsSettled: status.creditsSettled, verification: status.verification};
@@ -131,8 +164,15 @@ export async function renderMediaOnFarm(options: RenderMediaOnFarmOptions): Prom
       throw new FarmApiError(409, status.error ?? `Render ${status.status}`, `RENDER_${status.status.toUpperCase()}`, status);
     }
     if (options.waitForCompletion) throw new FarmApiError(500, 'Webhook completion callback returned a non-terminal status');
-    if (Date.now() >= deadline) throw new FarmApiError(408, `Timed out waiting for render ${enqueued.renderId}`, 'RENDER_TIMEOUT');
-    await sleep(options.pollIntervalMs ?? 1000, options.signal);
+    if (Date.now() >= deadline) {
+      return abandon(new FarmApiError(408, `Timed out waiting for render ${enqueued.renderId}`, 'RENDER_TIMEOUT'));
+    }
+    try {
+      await sleep(options.pollIntervalMs ?? 1000, options.signal);
+    } catch (error) {
+      // An abort during the poll interval rejects the sleep with the reason.
+      return abandon(error);
+    }
   }
 }
 

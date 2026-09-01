@@ -42,6 +42,15 @@ Public functions:
 - `verifyWebhookSignature()`
 - `listWebhooks()`, `createWebhook()`, `updateWebhook()`, `deleteWebhook()`
 
+`renderMediaOnFarm()` cancels what it abandons: if its `timeoutMs` (default
+30 minutes) elapses or the `signal` you pass aborts, it POSTs the render's
+cancel endpoint before throwing, so the farm stops rendering (and billing) a
+job nobody is waiting for. The cancel is best-effort and never masks the
+original timeout/abort error. Renders that finish, fail, or get canceled on
+their own are left alone; a network error while polling does not cancel
+either, because the render may still complete — use `getRenderProgress()` or
+`cancelRender()` with the `renderId` to resume or stop it yourself.
+
 `getVersions()` returns the active farm-managed runner matrix. Unsupported
 bundle registration or enqueue requests fail with
 `UNSUPPORTED_REMOTION_VERSION` and the supported version names. Completed

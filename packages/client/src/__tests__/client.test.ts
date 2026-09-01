@@ -7,6 +7,7 @@ import path from 'node:path';
 vi.mock('@remotion/bundler', () => ({bundle: vi.fn()}));
 import {bundle} from '@remotion/bundler';
 import {
+  FarmApiError,
   bundleAndUpload,
   cancelRender,
   getBalance,
@@ -24,6 +25,12 @@ const response = (body: unknown, status = 200) => new Response(JSON.stringify(bo
 
 afterEach(() => vi.restoreAllMocks());
 
+/** URLs of every POST to a `/cancel` endpoint seen by the fetch mock. */
+const cancelCalls = (fetchMock: {mock: {calls: unknown[][]}}) =>
+  fetchMock.mock.calls
+    .filter(([url, init]) => String(url).endsWith('/cancel') && (init as RequestInit | undefined)?.method === 'POST')
+    .map(([url]) => String(url));
+
 describe('farm client', () => {
   it('polls renderMediaOnFarm until complete and resolves a playable result', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
@@ -39,6 +46,86 @@ describe('farm client', () => {
     });
     expect(result).toEqual({outputUrl: 'https://cdn.test/video.mp4?sig=1', renderId: 'job-1', creditsSettled: 5, verification: 'passed'});
     expect(fetchMock).toHaveBeenCalledTimes(3);
+    // A-5: a render that completed is never canceled.
+    expect(cancelCalls(fetchMock)).toEqual([]);
+  });
+
+  // ── A-5: renderMediaOnFarm must cancel what it abandons ─────────────────
+  //
+  // A render the caller stopped waiting for keeps rendering (and billing) on
+  // the farm unless someone cancels it. Both abandonment paths — the internal
+  // timeout and an external AbortSignal — must POST the cancel endpoint for
+  // that render exactly once before surfacing the error.
+
+  const renderRequest = {
+    bundleSha256: 'd'.repeat(64), compositionId: 'Main', inputProps: {},
+    compositionWidth: 1, compositionHeight: 1, fps: 30, durationFrames: 1, codec: 'h264' as const,
+  };
+  const rendering = (renderId: string) => ({renderId, status: 'rendering', progress: 0.5, outputUrl: null, creditsReserved: 5, creditsSettled: null, error: null, createdAt: null, completedAt: null, verification: 'pending'});
+
+  /** Route by URL so the test is about ORDER OF EVENTS, not a fragile mockOnce chain. */
+  function farmThatNeverFinishes(renderId: string) {
+    return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/cancel')) return response({renderId, status: 'canceled'});
+      if (url.endsWith('/api/v1/renders') && init?.method === 'POST') return response({renderId, status: 'pending', taskId: `task-${renderId}`, creditsReserved: 5}, 202);
+      return response(rendering(renderId));
+    });
+  }
+
+  it('cancels the render on the internal timeout — exactly one POST /cancel — then throws 408', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = farmThatNeverFinishes('job-timeout');
+      const pending = renderMediaOnFarm({...auth, ...renderRequest, pollIntervalMs: 1000, timeoutMs: 2500});
+      const outcome = pending.then(() => 'resolved', (e: unknown) => e);
+      // Two polls at t=1000 and t=2000 land before the deadline; the third
+      // (t=3000) is past it.
+      await vi.advanceTimersByTimeAsync(5000);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(FarmApiError);
+      expect((error as FarmApiError).status).toBe(408);
+      expect((error as FarmApiError).code).toBe('RENDER_TIMEOUT');
+      expect(cancelCalls(fetchMock)).toEqual([`${API}/api/v1/renders/job-timeout/cancel`]);
+      // The cancel is the LAST thing that happens before the throw.
+      const last = fetchMock.mock.calls.at(-1)!;
+      expect(String(last[0])).toMatch(/\/cancel$/);
+      expect(last[1]?.method).toBe('POST');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels the render when an external AbortSignal fires — exactly one POST /cancel — then rejects with the abort reason', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = farmThatNeverFinishes('job-abort');
+      const controller = new AbortController();
+      const pending = renderMediaOnFarm({...auth, ...renderRequest, pollIntervalMs: 1000, timeoutMs: 60_000, signal: controller.signal});
+      const outcome = pending.then(() => 'resolved', (e: unknown) => e);
+      // Enqueue + first poll happen at t=0; the loop is now sleeping.
+      await vi.advanceTimersByTimeAsync(0);
+      const reason = new Error('caller went away');
+      controller.abort(reason);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(await outcome).toBe(reason);
+      expect(cancelCalls(fetchMock)).toEqual([`${API}/api/v1/renders/job-abort/cancel`]);
+      // The cancel request must NOT carry the already-aborted signal, or it
+      // would abort itself before reaching the farm.
+      const cancel = fetchMock.mock.calls.find(([u]) => String(u).endsWith('/cancel'))!;
+      expect(cancel[1]?.signal?.aborted ?? false).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not cancel a render that reached a terminal state on its own', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response({renderId: 'job-term', status: 'pending', taskId: 'render-t', creditsReserved: 5}, 202))
+      .mockResolvedValueOnce(response({renderId: 'job-term', status: 'canceled', progress: null, outputUrl: null, creditsReserved: 5, creditsSettled: null, error: null, createdAt: null, completedAt: null, verification: 'pending'}));
+    const fetchMock = vi.mocked(fetch);
+    await expect(renderMediaOnFarm({...auth, ...renderRequest, pollIntervalMs: 0})).rejects.toMatchObject({code: 'RENDER_CANCELED'});
+    expect(cancelCalls(fetchMock)).toEqual([]);
   });
 
   it('surfaces terminal farm failures', async () => {
