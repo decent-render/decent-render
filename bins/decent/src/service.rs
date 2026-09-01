@@ -525,7 +525,7 @@ mod imp {
              \n\
              [Service]\n\
              Type=simple\n\
-             ExecStart={exec_start}\n\
+             {exec_start}\n\
              Restart=always\n\
              RestartSec=10\n\
              TimeoutStopSec=30\n\
@@ -535,7 +535,7 @@ mod imp {
              \n\
              [Install]\n\
              WantedBy=default.target\n",
-            exec_start = exec_start_line(&spec.exe, &spec.dispatch_url),
+            exec_start = super::exec_start_line(&spec.exe, &spec.dispatch_url),
             log = spec.log_path.display(),
         )
     }
