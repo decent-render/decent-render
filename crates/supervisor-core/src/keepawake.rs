@@ -251,6 +251,15 @@ impl JobKeepAwake {
             KeepAwakeState::Unavailable
         }
     }
+
+    /// D-11: release on the BLOCKING pool. Drop runs wherever the value
+    /// dies — in run_job that is an async task — and the TERM → poll →
+    /// KILL teardown it performs can block up to ~1s. Callers on the async
+    /// runtime call this instead of letting the implicit drop run on a
+    /// runtime worker.
+    pub async fn release_blocking(self) {
+        let _ = tokio::task::spawn_blocking(move || drop(self)).await;
+    }
 }
 
 impl Drop for JobKeepAwake {

@@ -301,13 +301,23 @@ async fn run_session(
     obs.update_status(|s| s.connection = ConnectionState::Connected);
     obs.log(LogLine::info("Connected to dispatch"));
 
-    // Startup sweep (ITEM 3): SIGKILL/power-loss killed a previous
+    // Startup sweeps (ITEM 3, D-11): SIGKILL/power-loss killed a previous
     // supervisor before WorkDir::Drop could run, orphaning job workdirs
     // (customer content) under the temp dir. Once we are connected — and
     // before any job can be assigned — remove abandoned ones. The sweep's
     // own safety rule (pid-liveness for supervisor dirs, age gate for
     // runner dirs) is what keeps a live sibling supervisor's workdir safe.
-    let swept = crate::sweep::sweep_stale_workdirs();
+    // Both sweeps are blocking directory I/O: they run on the blocking
+    // pool, not the async runtime (D-11), and are awaited to completion so
+    // the ordering guarantee — swept before the register frame is sent —
+    // is unchanged.
+    let swept = match tokio::task::spawn_blocking(crate::sweep::sweep_stale_workdirs).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "startup workdir sweep join failed");
+            0
+        }
+    };
     if swept > 0 {
         obs.log(LogLine::info(format!(
             "Swept {swept} abandoned job workdir(s) left by a hard-killed supervisor"
@@ -326,8 +336,11 @@ async fn run_session(
     // pass and a live artifact). This is also the sweep that eventually
     // reclaims the pre-eviction residue (old test-* dirs and every
     // superseded payload/browser/bundle) on real nodes.
-    match crate::cache::sweep_node_caches(protected_keys) {
-        Ok(out) if out.evicted > 0 || !protected_keys.is_empty() => {
+    let sweep_keys = protected_keys.clone();
+    let sweep =
+        tokio::task::spawn_blocking(move || crate::cache::sweep_node_caches(&sweep_keys)).await;
+    match sweep {
+        Ok(Ok(out)) if out.evicted > 0 || !protected_keys.is_empty() => {
             // Surface evictions on the status log (TUI log pane + daemon log)
             // — packet 20: an operator should see the cache being reclaimed
             // without reading tracing output. D-10: the protected count rides
@@ -342,8 +355,9 @@ async fn run_session(
                 protected_keys.len()
             )));
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "startup cache sweep failed"),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "startup cache sweep failed"),
+        Err(e) => tracing::warn!(error = %e, "startup cache sweep join failed"),
     }
 
     let (mut sink, mut stream) = ws.split();
@@ -590,15 +604,21 @@ async fn run_session(
                         // used — protect them, evict older LRU entries down
                         // to the cap. Runs here, at termination, never on a
                         // timer during a render (packet 9's interference
-                        // budget). Blocking is fine: the terminal frame was
-                        // already sent; the next heartbeat tick can wait.
-                        // D-10: the keys are also REMEMBERED (into the
-                        // caller's set) so the next reconnect's startup
+                        // budget). D-11: blocking I/O — run it on the
+                        // blocking pool and await the result (the terminal
+                        // frame was already sent; the next heartbeat tick
+                        // can wait). D-10: the keys are also REMEMBERED (in
+                        // the caller's set) so the next reconnect's startup
                         // sweep protects them too.
                         *protected_keys =
                             in_flight.as_ref().map(|j| j.cache_keys.clone()).unwrap_or_default();
-                        match crate::cache::sweep_node_caches(protected_keys) {
-                            Ok(out) if out.evicted > 0 => {
+                        let sweep_keys = protected_keys.clone();
+                        let sweep = tokio::task::spawn_blocking(move || {
+                            crate::cache::sweep_node_caches(&sweep_keys)
+                        })
+                        .await;
+                        match sweep {
+                            Ok(Ok(out)) if out.evicted > 0 => {
                                 // Surface evictions on the status log (TUI log
                                 // pane + daemon log) — packet 20: an operator
                                 // should see the cache being reclaimed without
@@ -608,8 +628,13 @@ async fn run_session(
                                     out.entries, out.bytes_before, out.bytes_after, out.evicted
                                 )));
                             }
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!(error = %e, "cache sweep after job failed"),
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "cache sweep after job failed")
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "cache sweep after job join failed")
+                            }
                         }
                         in_flight = None;
                     }
@@ -762,18 +787,30 @@ async fn run_session(
                                             // NOW with this job's cache keys protected
                                             // (same shape as the terminal-frame sweep).
                                             // D-10: remembered for the next reconnect
-                                            // sweep as well.
+                                            // sweep as well. D-11: on the blocking pool.
                                             {
                                                 *protected_keys = job.cache_keys.clone();
-                                                match crate::cache::sweep_node_caches(protected_keys) {
-                                                    Ok(out) if out.evicted > 0 => {
+                                                let sweep_keys = protected_keys.clone();
+                                                let sweep = tokio::task::spawn_blocking(
+                                                    move || crate::cache::sweep_node_caches(&sweep_keys),
+                                                )
+                                                .await;
+                                                match sweep {
+                                                    Ok(Ok(out)) if out.evicted > 0 => {
                                                         obs.log(LogLine::info(format!(
                                                             "Cache sweep: {} entries, {} -> {} bytes ({} evicted)",
                                                             out.entries, out.bytes_before, out.bytes_after, out.evicted
                                                         )));
                                                     }
-                                                    Ok(_) => {}
-                                                    Err(e) => tracing::warn!(error = %e, "cache sweep after cancel failed"),
+                                                    Ok(Ok(_)) => {}
+                                                    Ok(Err(e)) => tracing::warn!(
+                                                        error = %e,
+                                                        "cache sweep after cancel failed"
+                                                    ),
+                                                    Err(e) => tracing::warn!(
+                                                        error = %e,
+                                                        "cache sweep after cancel join failed"
+                                                    ),
                                                 }
                                             }
                                             // PACKET 5 + 37: keep ownership of the task. The

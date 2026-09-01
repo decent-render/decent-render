@@ -497,15 +497,21 @@ pub async fn run_job(
     let tenant = assign.tenant.clone();
     let output_key = assign.output_key.clone();
     let attempt = assign.attempt;
-    match run_job_inner(
+    // D-11: hold the keep-awake guard HERE (not inside run_job_inner) and
+    // release it on the blocking pool after the body — the Drop teardown is
+    // a blocking TERM → wait → KILL poll. Still awaited BEFORE the terminal
+    // frame goes out, so the assertion provably covers the whole render.
+    let keep_awake = crate::keepawake::JobKeepAwake::acquire(&job_id);
+    let result = run_job_inner(
         assign,
         &mut cancel_rx,
         tx.clone(),
         wall_clock_limit,
         workdir_cap_bytes,
     )
-    .await
-    {
+    .await;
+    keep_awake.release_blocking().await;
+    match result {
         Ok(metrics) => {
             let _ = tx.send(WorkerMessage::JobComplete(JobCompleteMessage {
                 tenant,
@@ -543,11 +549,11 @@ async fn run_job_inner(
     }
     let browser = ensure_browser(&assign).await?;
     // Sleep assertion (packet 18): held for EXACTLY this job's lifetime —
-    // acquired once the job is committed, released by Drop on every exit
-    // path below (success, failure, cancel, wall-clock, disk cap, silence,
-    // stdout death — and run_job_inner being unwound by ? anywhere).
-    // Never held while idle: run_job_inner returning is what drops it.
-    let _keep_awake = crate::keepawake::JobKeepAwake::acquire(&assign.job_id);
+    // acquired once the job is committed (in run_job, above) and released
+    // there via release_blocking after this body returns: success, failure,
+    // cancel, wall-clock, disk cap, silence, stdout death — and this
+    // function being unwound by ? anywhere. Never held while idle:
+    // run_job_inner returning is what releases it.
     let workdir = WorkDir::new(&format!("job-{}", assign.job_id)).context("create workdir")?;
     let purged_path = workdir.path().to_path_buf();
     // Browser containment (Defect A): when the supervisor resolved a browser,
