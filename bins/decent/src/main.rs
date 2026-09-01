@@ -1126,18 +1126,35 @@ mod packet45_tests {
             "{\"service\":\"render-worker\",\"tenant\":\"t\",\"workerId\":\"w\",\"platform\":\"community\"}",
         );
         assert_eq!(platform_from_token(&tok), Ok(Platform::Community));
-        assert_eq!(build_register(&tok).platform, Platform::Community);
+        // Inside capture_warnings: a bare call can fire the warn! callsite
+        // subscriber-less and poison its interest cache (see doc above).
+        let mut platform = None;
+        capture_warnings(|| platform = Some(build_register(&tok).platform));
+        assert_eq!(platform, Some(Platform::Community));
     }
 
     #[test]
     fn company_token_registers_as_company() {
         let tok = jwt_with("{\"service\":\"render-worker\",\"platform\":\"company\"}");
-        assert_eq!(build_register(&tok).platform, Platform::Company);
+        let mut platform = None;
+        capture_warnings(|| platform = Some(build_register(&tok).platform));
+        assert_eq!(platform, Some(Platform::Company));
     }
 
     /// Shared log capture so the warning path is asserted, not assumed —
     /// and so the RED LINE (never log the token) is checked on the same
     /// output.
+    ///
+    /// Calls `tracing::callsite::rebuild_interest_cache()` first: the warn!
+    /// callsite inside `build_register` is process-global, and if the FIRST
+    /// thread to fire it had no subscriber in scope (a test calling
+    /// `build_register` outside `capture_warnings`), tracing caches its
+    /// interest as `never` and every later `with_default` here captures an
+    /// empty log — an intermittent failure that only shows up under the
+    /// right thread interleaving. Rebuilding wipes that cache so interest is
+    /// recomputed against THIS thread's scoped subscriber. Tests that fire
+    /// the callsite must still do so inside `capture_warnings` (so a
+    /// concurrent bare firer cannot re-poison mid-capture).
     fn capture_warnings(f: impl FnOnce()) -> String {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
@@ -1158,6 +1175,7 @@ mod packet45_tests {
             .with_ansi(false)
             .with_writer(move || sink.clone())
             .finish();
+        tracing::callsite::rebuild_interest_cache();
         tracing::subscriber::with_default(sub, f);
         let bytes = buf.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
@@ -1194,7 +1212,9 @@ mod packet45_tests {
             platform_from_token(&odd),
             Err(PlatformFallback::Unrecognized)
         );
-        assert_eq!(build_register(&odd).platform, Platform::Company);
+        let mut platform = None;
+        capture_warnings(|| platform = Some(build_register(&odd).platform));
+        assert_eq!(platform, Some(Platform::Company));
         assert_eq!(
             platform_from_token("not-a-jwt"),
             Err(PlatformFallback::Unreadable)
@@ -1215,7 +1235,9 @@ mod packet45_tests {
     #[test]
     fn community_platform_serializes_lowercase_on_the_wire() {
         let tok = jwt_with("{\"service\":\"render-worker\",\"platform\":\"community\"}");
-        let v = serde_json::to_value(build_register(&tok)).unwrap();
+        let mut v = None;
+        capture_warnings(|| v = Some(serde_json::to_value(build_register(&tok)).unwrap()));
+        let v = v.unwrap();
         assert_eq!(v["platform"], "community");
     }
 
