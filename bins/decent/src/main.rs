@@ -566,19 +566,77 @@ fn resolve_token(token: Option<String>) -> anyhow::Result<String> {
     Ok(token)
 }
 
-/// Build the register message from probed hardware.
+/// Why `register.platform` fell back to `company` instead of coming from the
+/// token. Surfaced so the warning path is testable without a log capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlatformFallback {
+    /// The token is not a decodable JWT payload (login validates shape, but
+    /// `--token` / `WORKER_TOKEN` bypass it).
+    Unreadable,
+    /// A readable payload with no `platform` claim.
+    ClaimAbsent,
+    /// A `platform` claim that is neither `company` nor `community`.
+    Unrecognized,
+}
+
+/// B-6 (audit U-13): read the `platform` claim out of the worker token.
 ///
-/// Deliberately takes no arguments: it used to accept `allow_real_jobs` and
-/// report it as the GPU capability, so a node's willingness to work was
-/// advertised as hardware. Capability is a property of the machine.
+/// Payload decode ONLY — no signature check. The node never holds the
+/// signing key, so it cannot verify and must not pretend to; dispatch
+/// verifies the signature and treats `register.platform` as advisory
+/// (AGENTS.md invariant 3). This exists so the advisory field stops being a
+/// hardcoded lie for community operators. Never logs the token.
+fn platform_from_token(token: &str) -> Result<Platform, PlatformFallback> {
+    let payload_b64 = token
+        .split('.')
+        .nth(1)
+        .ok_or(PlatformFallback::Unreadable)?;
+    let bytes = base64url_decode(payload_b64).ok_or(PlatformFallback::Unreadable)?;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| PlatformFallback::Unreadable)?;
+    match payload.get("platform") {
+        None => Err(PlatformFallback::ClaimAbsent),
+        Some(v) => match v.as_str() {
+            Some("company") => Ok(Platform::Company),
+            Some("community") => Ok(Platform::Community),
+            _ => Err(PlatformFallback::Unrecognized),
+        },
+    }
+}
+
+/// `platform_from_token` with the fallback applied and WARNED about — a
+/// silent fallback is exactly the hardcoded value this replaces.
+fn platform_for_register(token: &str) -> Platform {
+    match platform_from_token(token) {
+        Ok(p) => p,
+        Err(why) => {
+            tracing::warn!(
+                reason = ?why,
+                "worker token carries no usable `platform` claim; registering as \
+                 company (advisory only — dispatch decides from the signed token)"
+            );
+            Platform::Company
+        }
+    }
+}
+
+/// Build the register message from probed hardware + the token's claims.
+///
+/// Takes ONLY the token: it used to accept `allow_real_jobs` and report it
+/// as the GPU capability, so a node's willingness to work was advertised as
+/// hardware. Capability is a property of the machine; platform is a property
+/// of the credential.
 ///
 /// Shared by every foreground command (`start`, `tui`).
-fn build_register() -> RegisterMessage {
+fn build_register(token: &str) -> RegisterMessage {
     RegisterMessage {
         tenant: String::new(), // no longer used by farm dispatch (kept for protocol compat)
         protocol_version: PROTOCOL_VERSION,
         operator: None,
-        platform: Platform::Company,
+        // From the token's `platform` claim (company | community), company
+        // when the claim is missing — it used to be hardcoded Company, so a
+        // community operator's node introduced itself as company fleet.
+        platform: platform_for_register(token),
         chip: detect_chip(),
         ram_gb: detect_ram_gb(),
         supervisor_version: SUPERVISOR_VERSION.into(),
@@ -622,7 +680,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             validate_dispatch_url(&dispatch_url)?;
             let token = resolve_token(token)?;
-            let register = build_register();
+            let register = build_register(&token);
             tracing::info!(
                 dispatch_url = %dispatch_url,
                 chip = %register.chip,
@@ -936,7 +994,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             validate_dispatch_url(&dispatch_url)?;
             let token = resolve_token(token)?;
-            let register = build_register();
+            let register = build_register(&token);
             let config = ConnectionConfig {
                 heartbeat_limit: None,
                 allow_real_jobs,
@@ -1011,6 +1069,8 @@ fn login_next_step_message_names_the_daemon_state() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&home).unwrap();
+    // Tests that swap HOME must not overlap: HOME is process-global.
+    let _home_guard = crate::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var_os("HOME");
     unsafe { std::env::set_var("HOME", &home) };
     let state = service::state();
@@ -1023,6 +1083,12 @@ fn login_next_step_message_names_the_daemon_state() {
     // operator gets must say the token applies to the NEXT start.
     assert_eq!(state, service::DaemonState::NotInstalled);
 }
+
+/// Serializes the tests that override HOME (login, save_token, migration).
+/// The env var is process-global, and cargo runs tests in parallel — two
+/// such tests overlapping saw each other's HOME mid-assertion.
+#[cfg(test)]
+static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod packet45_tests {
@@ -1049,6 +1115,108 @@ mod packet45_tests {
         ] {
             assert_ne!(idle_sleep_label(not_held), "held");
         }
+    }
+
+    // B-6: platform comes from the token's claim, never a hardcode.
+    use super::packet40_tests::jwt_with;
+
+    #[test]
+    fn community_token_registers_as_community() {
+        let tok = jwt_with(
+            "{\"service\":\"render-worker\",\"tenant\":\"t\",\"workerId\":\"w\",\"platform\":\"community\"}",
+        );
+        assert_eq!(platform_from_token(&tok), Ok(Platform::Community));
+        assert_eq!(build_register(&tok).platform, Platform::Community);
+    }
+
+    #[test]
+    fn company_token_registers_as_company() {
+        let tok = jwt_with("{\"service\":\"render-worker\",\"platform\":\"company\"}");
+        assert_eq!(build_register(&tok).platform, Platform::Company);
+    }
+
+    /// Shared log capture so the warning path is asserted, not assumed —
+    /// and so the RED LINE (never log the token) is checked on the same
+    /// output.
+    fn capture_warnings(f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let sink = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn token_without_a_platform_claim_falls_back_to_company_with_a_warning() {
+        let tok = jwt_with("{\"service\":\"render-worker\",\"tenant\":\"t\",\"workerId\":\"w\"}");
+        assert_eq!(
+            platform_from_token(&tok),
+            Err(PlatformFallback::ClaimAbsent)
+        );
+        let mut platform = None;
+        let log = capture_warnings(|| platform = Some(build_register(&tok).platform));
+        assert_eq!(platform, Some(Platform::Company));
+        assert!(log.contains("WARN"), "fallback must warn; got: {log}");
+        assert!(
+            log.contains("platform"),
+            "warning must name the claim: {log}"
+        );
+        assert!(log.contains("ClaimAbsent"), "warning must say why: {log}");
+        // THE RED LINE: the token never appears in the log — not whole, not
+        // any of its segments.
+        assert!(!log.contains(&tok));
+        for part in tok.split('.') {
+            assert!(!log.contains(part), "log leaks a token segment");
+        }
+    }
+
+    #[test]
+    fn unrecognized_or_unreadable_platform_falls_back_to_company() {
+        let odd = jwt_with("{\"service\":\"render-worker\",\"platform\":\"enterprise\"}");
+        assert_eq!(
+            platform_from_token(&odd),
+            Err(PlatformFallback::Unrecognized)
+        );
+        assert_eq!(build_register(&odd).platform, Platform::Company);
+        assert_eq!(
+            platform_from_token("not-a-jwt"),
+            Err(PlatformFallback::Unreadable)
+        );
+        assert_eq!(
+            platform_from_token("a.!!!.c"),
+            Err(PlatformFallback::Unreadable)
+        );
+        let log = capture_warnings(|| {
+            let _ = build_register("not-a-jwt");
+        });
+        assert!(log.contains("WARN"));
+        assert!(!log.contains("not-a-jwt"));
+    }
+
+    /// A community token's platform survives into the register frame a
+    /// dispatch would parse (the wire value is the lowercase claim).
+    #[test]
+    fn community_platform_serializes_lowercase_on_the_wire() {
+        let tok = jwt_with("{\"service\":\"render-worker\",\"platform\":\"community\"}");
+        let v = serde_json::to_value(build_register(&tok)).unwrap();
+        assert_eq!(v["platform"], "community");
     }
 
     /// The label follows the guard object itself, not a hardcoded string.
@@ -1104,7 +1272,7 @@ mod packet40_tests {
     }
 
     // Step 3a: token shape validation. Never echoes the token.
-    fn jwt_with(payload_json: &str) -> String {
+    pub(super) fn jwt_with(payload_json: &str) -> String {
         let b64 = |s: &str| {
             // minimal base64url encode for test fixtures
             const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -1174,6 +1342,8 @@ mod packet40_tests {
         ));
         std::fs::create_dir_all(&home).unwrap();
         // Scoped HOME override (tests run in parallel: restore in ALL paths).
+        // Tests that swap HOME must not overlap: HOME is process-global.
+        let _home_guard = crate::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &home) };
         let result = (|| {
@@ -1229,6 +1399,10 @@ mod packet40_tests {
             std::fs::Permissions::from_mode(0o644),
         )
         .unwrap();
+
+        // Tests that swap HOME must not overlap: HOME is process-global.
+
+        let _home_guard = crate::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let prev = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &home) };
