@@ -13,7 +13,13 @@
 set -eu
 cd "$(dirname "$0")/.."
 IMAGE="${RUST_IMAGE:-rust:1.96-bookworm}"
-exec docker run --rm \
+# --init: tini as pid 1. Without it pid 1 is the `sh -c` below, which sits
+# in read() on the command substitution and never reaps orphans — the
+# kill-tree tests' grandchildren then linger as zombies, kill(pid, 0) still
+# succeeds on a zombie, and five containment tests report "survived"
+# (farm-web BACKLOG N-8, diagnosed 2026-09-02: STAT Z, PPID 1, every time).
+# Real hosts (systemd, launchd, the CI runner) reap orphans; the gate must too.
+exec docker run --rm --init \
   -v "$PWD":/src -w /src \
   -v decent-render-linux-target:/target \
   -v decent-render-linux-cargo:/usr/local/cargo/registry \
@@ -24,9 +30,9 @@ exec docker run --rm \
     cargo clippy --workspace --exclude decent-app --all-targets --all-features -- -D warnings
     # Full output on failure (a filtered summary hid the first real Linux
     # bug this script caught: an ExecStart=ExecStart= unit line).
-    # --test-threads=4: five connection.rs kill-tree tests are load-sensitive
-    # (farm-web BACKLOG N-8) and fail under the container'"'"'s 16-way default.
-    if ! out=$(cargo test --workspace --exclude decent-app -- --test-threads=4 2>&1); then
+    # Default test parallelism, as in CI: the "load-sensitive" reds that
+    # once pinned this to 4 threads were the missing-init zombies above.
+    if ! out=$(cargo test --workspace --exclude decent-app 2>&1); then
       printf "%s\n" "$out" | grep -vE "^\s*(Compiling|Running|Finished)" | tail -60
       exit 1
     fi
