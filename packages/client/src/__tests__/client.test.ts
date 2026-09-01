@@ -1,5 +1,5 @@
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {createHmac} from 'node:crypto';
+import {createHash, createHmac} from 'node:crypto';
 import {mkdtemp, mkdir, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
@@ -179,13 +179,25 @@ describe('farm client', () => {
     await writeFile(path.join(dir, 'assets', 'app.js'), 'console.log("render")');
     vi.mocked(bundle).mockResolvedValue(dir);
     let uploadedSha = '';
+    let putBodySha256 = '';
+    let putBodyBytes = -1;
     const fetchMock = vi.spyOn(globalThis, 'fetch')
       .mockImplementationOnce(async (_url, init) => {
         const request = JSON.parse(String(init?.body));
         uploadedSha = request.sha256;
         return response({sha256: uploadedSha, uploadUrl: 'https://r2.test/upload', expiresAt: '2026-07-12T11:00:00.000Z', alreadyRegistered: false}, 201);
       })
-      .mockResolvedValueOnce(new Response(null, {status: 200}))
+      .mockImplementationOnce(async (_url, init) => {
+        // C-9: hash the bytes that actually went up the wire. The sha the
+        // client REGISTERS must be the sha of the bytes it UPLOADS — that is
+        // the content-addressing contract the farm (and every node's sha256
+        // gate) relies on.
+        const body = init?.body;
+        if (!(body instanceof Uint8Array)) throw new Error(`PUT body must be bytes, got ${typeof body}`);
+        putBodySha256 = createHash('sha256').update(body).digest('hex');
+        putBodyBytes = body.byteLength;
+        return new Response(null, {status: 200});
+      })
       .mockImplementationOnce(async (_url, init) => {
         const request = JSON.parse(String(init?.body));
         return response({sha256: uploadedSha, remotionVersion: request.remotionVersion, registered: true}, 201);
@@ -196,5 +208,12 @@ describe('farm client', () => {
     expect(result.remotionVersion).toBe('4.0.349');
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock.mock.calls[1]?.[1]?.method).toBe('PUT');
+    // Registered sha == uploaded bytes' sha == reported sha; size likewise.
+    expect(putBodySha256).toBe(result.sha256);
+    expect(uploadedSha).toBe(result.sha256);
+    expect(putBodyBytes).toBe(result.sizeBytes);
+    // And the uploaded bytes are a real gzip stream (magic 1f 8b).
+    const put = fetchMock.mock.calls[1]?.[1]?.body as Uint8Array;
+    expect([put[0], put[1]]).toEqual([0x1f, 0x8b]);
   });
 });

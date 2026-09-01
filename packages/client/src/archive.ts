@@ -2,7 +2,14 @@ import {readdir, readFile, stat} from 'node:fs/promises';
 import path from 'node:path';
 import {gzipSync} from 'node:zlib';
 
-type Entry = {name: string; bytes: Buffer; mode: number};
+/**
+ * Minimal ustar writer for Remotion bundles. Files and EMPTY directories
+ * only: a non-empty directory is implied by its children (as every extractor
+ * creates parents), and emitting every directory would change the sha256 of
+ * every already-registered bundle for no gain in fidelity. Empty directories
+ * are emitted because dropping them makes the archive lossy.
+ */
+type Entry = {name: string; bytes: Buffer; mode: number; kind: 'file' | 'dir'};
 
 function writeText(target: Buffer, offset: number, length: number, value: string): void {
   target.write(value.slice(0, length), offset, length, 'utf8');
@@ -27,7 +34,8 @@ function splitTarPath(name: string): {name: string; prefix: string} {
 
 function tarHeader(entry: Entry): Buffer {
   const header = Buffer.alloc(512);
-  const names = splitTarPath(entry.name);
+  // ustar directory names carry a trailing slash; typeflag '5', size 0.
+  const names = splitTarPath(entry.kind === 'dir' ? `${entry.name}/` : entry.name);
   writeText(header, 0, 100, names.name);
   writeOctal(header, 100, 8, entry.mode & 0o777);
   writeOctal(header, 108, 8, 0);
@@ -35,7 +43,7 @@ function tarHeader(entry: Entry): Buffer {
   writeOctal(header, 124, 12, entry.bytes.byteLength);
   writeOctal(header, 136, 12, 0);
   header.fill(0x20, 148, 156);
-  header[156] = '0'.charCodeAt(0);
+  header[156] = (entry.kind === 'dir' ? '5' : '0').charCodeAt(0);
   writeText(header, 257, 6, 'ustar');
   writeText(header, 263, 2, '00');
   writeText(header, 345, 155, names.prefix);
@@ -52,8 +60,13 @@ async function collect(root: string, relative = ''): Promise<Entry[]> {
     const childRelative = relative ? path.posix.join(relative, name) : name;
     const child = path.join(root, childRelative);
     const info = await stat(child);
-    if (info.isDirectory()) entries.push(...await collect(root, childRelative));
-    else if (info.isFile()) entries.push({name: childRelative, bytes: await readFile(child), mode: info.mode});
+    if (info.isDirectory()) {
+      const children = await collect(root, childRelative);
+      if (children.length === 0) entries.push({name: childRelative, bytes: Buffer.alloc(0), mode: info.mode, kind: 'dir'});
+      else entries.push(...children);
+    } else if (info.isFile()) {
+      entries.push({name: childRelative, bytes: await readFile(child), mode: info.mode, kind: 'file'});
+    }
   }
   return entries;
 }

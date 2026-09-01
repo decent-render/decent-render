@@ -7,6 +7,9 @@
   before throwing/rejecting (best-effort, never masks the original error).
   Previously a timed-out or aborted caller left the job rendering and billing
   on the farm.
+- `bundleAndUpload()` archives now include empty directories (ustar type `5`).
+  They were silently dropped. Bundles without empty directories hash exactly
+  as before.
 
 ## 0.1.0
 
