@@ -6,6 +6,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 import {jobAssign, makeBundleArchive} from './helpers.js';
+import {runnerEventSchema} from '../runner-stdout-schema.js';
 
 /**
  * The runner's contract with the supervisor is a stdout NDJSON stream of
@@ -29,7 +30,14 @@ function runHarness(fixture: string, input: string, env: Record<string, string> 
 }
 
 const stdoutLines = (stdout: string) => stdout.trim().split('\n').filter(Boolean);
-const parseFrames = (stdout: string) => stdoutLines(stdout).map((line) => JSON.parse(line) as Record<string, unknown>);
+const parseFrames = (stdout: string) =>
+	stdoutLines(stdout).map((line) => {
+		const frame = JSON.parse(line) as Record<string, unknown>;
+		// D-62: every line the emitter writes must satisfy the shared
+		// runner-stdout-v1 schema (packages/protocol/fixtures/runner-stdout-v1.json).
+		runnerEventSchema.parse(frame);
+		return frame;
+	});
 
 describe('stdout/stderr protocol discipline', () => {
 	it('emits exactly one error frame on stdout and exits 1 when stdin is not JSON', () => {

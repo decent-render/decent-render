@@ -18,6 +18,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 import {jobAssign, makeBundleArchive} from './helpers.js';
+import {runnerEventSchema} from '../runner-stdout-schema.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtures = path.join(here, 'fixtures');
@@ -43,7 +44,13 @@ function runStall(env: Record<string, string>) {
 	const frames = result.stdout
 		.split('\n')
 		.filter(Boolean)
-		.map((line) => JSON.parse(line) as {type: string});
+		.map((line) => {
+			const frame = JSON.parse(line) as {type: string};
+			// D-62: every emitted frame must satisfy the shared runner-stdout-v1
+			// schema (packages/protocol/fixtures/runner-stdout-v1.json).
+			runnerEventSchema.parse(frame);
+			return frame;
+		});
 	return {frames, status: result.status, stderr: result.stderr};
 }
 
