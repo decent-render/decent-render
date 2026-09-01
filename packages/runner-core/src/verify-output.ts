@@ -1,11 +1,32 @@
 /**
  * Post-render, pre-upload verification of the rendered file.
  *
- * The failure this exists for is HONEST HARDWARE FAILURE on a trusted node —
- * a dead GPU or a broken ANGLE path silently emitting black frames — not a
- * lying operator. Every node is owned by us, so there is no adversary to
- * out-sample and nothing to make unpredictable; the checks run on every job,
- * in the open, and are as cheap as they can be.
+ * ## Trust model (read this before extending the checks)
+ *
+ * This code runs ON THE OPERATOR'S MACHINE. Operators are third parties: any
+ * machine that pairs with the farm can run this payload, and the node has
+ * no way to prove to anyone else what it observed. So be precise about what
+ * this check can and cannot protect:
+ *
+ * - It protects the TENANT from an honest-failure output: a dead GPU or a
+ *   broken ANGLE path silently emitting black frames, a truncated or
+ *   zero-byte file, a frame count that was copied off the composition
+ *   instead of measured. Those happen on well-meaning nodes, and catching
+ *   them here — before the upload — is cheap, deterministic, and runs on
+ *   every job in the open.
+ *
+ * - It does NOT protect against a hostile operator. A node that would lie
+ *   about its output can equally lie about the result of this check, or
+ *   patch it out. Nothing that runs on the node can settle that question;
+ *   it needs an independent referee off the node (sampled re-render /
+ *   output verification by the platform). That referee is NOT YET BUILT.
+ *   The tenant-visible hook for it already exists — a render's
+ *   `verification` status is `pending` until it is `passed` or `flagged` —
+ *   and until it lands, `verification: pending` is the honest reading of
+ *   any completed render.
+ *
+ * Consequently: keep these checks fast and public, and do not add anything
+ * here that pretends to be tamper-resistant. That is the referee's job.
  *
  * Before this existed, `renderJob` read the output and PUT it straight to R2,
  * and reported `frames` as `composition.durationInFrames` — a number copied
