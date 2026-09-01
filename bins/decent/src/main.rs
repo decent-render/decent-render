@@ -226,6 +226,8 @@ pub(crate) fn idle_sleep_label(state: Option<KeepAwakeState>) -> &'static str {
 /// The daemon's live status snapshot, parsed from the `daemon-status` file the
 /// running daemon writes every few seconds. Read by the separate `status`
 /// command so an operator can see connection/job state without the TUI.
+const FRESH_WINDOW_MS: u64 = 15_000;
+
 struct DaemonSnapshot {
     connection: String,
     current_job: Option<(String, String, f64)>,
@@ -242,7 +244,14 @@ struct DaemonSnapshot {
 impl DaemonSnapshot {
     /// Fresh = written within the last 15s (the daemon writes every 3s).
     fn is_fresh(&self) -> bool {
-        now_ms().saturating_sub(self.updated_at_ms) < 15_000
+        self.is_fresh_at(now_ms())
+    }
+
+    /// C-11: the boundary is INCLUSIVE — a snapshot written exactly at the
+    /// window edge is fresh; one ms past it is stale. `now` is injected so
+    /// the exact edge is unit-testable (is_fresh reads the clock itself).
+    fn is_fresh_at(&self, now: u64) -> bool {
+        now.saturating_sub(self.updated_at_ms) <= FRESH_WINDOW_MS
     }
 }
 
@@ -1276,6 +1285,143 @@ mod packet45_tests {
 /// file must parse to None — never a partial struct that looks like real
 /// state. Points the path-taking parser at a scratch dir under os.tmpdir;
 /// never reads the real ~/.config/decent.
+/// C-11 remainder: unit pins for the small main.rs helpers —
+/// resolve_token's precedence, build_register's field wiring, and the
+/// daemon-snapshot freshness boundary.
+#[cfg(test)]
+mod helper_unit_tests {
+    use super::*;
+    use crate::packet40_tests::jwt_with;
+
+    fn temp_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "p56-home-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join(".config/decent")).unwrap();
+        home
+    }
+
+    /// resolve_token: an explicit `--token`/WORKER_TOKEN arg wins over the
+    /// stored token file; with neither (stored empty/absent), it errors
+    /// naming the remedy (`decent login`). HOME is swapped under HOME_LOCK
+    /// so the stored-file leg reads a scratch dir, never the real one.
+    #[test]
+    fn resolve_token_explicit_arg_beats_stored_file_beats_error() {
+        let _home_guard = crate::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = temp_home("precedence");
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &home) };
+
+        // Stored token present, explicit arg absent → the stored file wins.
+        std::fs::write(
+            home.join(".config/decent/worker-token"),
+            "stored-jwt-token\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_token(None).unwrap(), "stored-jwt-token");
+        // Explicit arg beats the stored file (and is trimmed of paste noise).
+        assert_eq!(
+            resolve_token(Some("  explicit-jwt-token ".into())).unwrap(),
+            "explicit-jwt-token"
+        );
+        // Neither → error naming the remedy, never the (missing) token.
+        std::fs::remove_file(home.join(".config/decent/worker-token")).unwrap();
+        let err = resolve_token(None).unwrap_err().to_string();
+        assert!(
+            err.contains("decent login"),
+            "error must name the remedy, got: {err}"
+        );
+
+        match prev {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// PACKET 40 gate: a whole-line paste (`decent login --token <line>`)
+    /// or a paste with trailing shell is rejected by shape validation with
+    /// a message that names WHAT was wrong — never the token itself.
+    #[test]
+    fn whole_line_paste_is_rejected_with_a_message_that_names_the_problem() {
+        let valid = jwt_with("{\"service\":\"render-worker\",\"platform\":\"company\"}");
+        validate_worker_token_shape(&valid).expect("fixture must be shape-valid");
+
+        // A whole shell line pasted as the token contains spaces.
+        let line = format!("decent login --token {valid}");
+        let err = validate_worker_token_shape(&line).unwrap_err().to_string();
+        assert!(
+            err.contains("outside base64url"),
+            "message must name the whitespace/paste problem, got: {err}"
+        );
+        // A trailing paste artifact (quote + flag) is named just as plainly.
+        let quoted = format!("{valid}\" --allow-real-jobs");
+        let err = validate_worker_token_shape(&quoted)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("outside base64url"),
+            "message must name the paste artifact, got: {err}"
+        );
+    }
+
+    /// C-11: build_register's field wiring — the crate version, the token's
+    /// platform claim (the claim matrix itself is owned by the packet-45
+    /// B-6 tests), and machine capabilities from detect_capabilities().
+    #[test]
+    fn build_register_carries_crate_version_platform_and_probed_capabilities() {
+        let community = jwt_with("{\"service\":\"render-worker\",\"platform\":\"community\"}");
+        let reg = build_register(&community);
+        assert_eq!(reg.supervisor_version, SUPERVISOR_VERSION);
+        assert_eq!(
+            reg.supervisor_version,
+            format!("rust-{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(reg.platform, Platform::Community);
+        let company = jwt_with("{\"service\":\"render-worker\",\"platform\":\"company\"}");
+        assert_eq!(build_register(&company).platform, Platform::Company);
+        // Capabilities are the MACHINE probe — never a willingness switch.
+        assert_eq!(reg.capabilities, detect_capabilities());
+        assert_eq!(reg.capabilities.max_concurrent_jobs, Some(1));
+    }
+
+    /// The freshness boundary is INCLUSIVE at the window edge: a snapshot
+    /// written exactly 15_000 ms ago is fresh; one ms past it is stale.
+    #[test]
+    fn freshness_boundary_is_inclusive_at_the_window_edge() {
+        let now = now_ms();
+        let mk = |age_ms: u64| DaemonSnapshot {
+            connection: String::new(),
+            current_job: None,
+            keep_awake: None,
+            jobs_completed: 0,
+            jobs_failed: 0,
+            jobs_canceled: 0,
+            update_available: None,
+            updated_at_ms: now.saturating_sub(age_ms),
+        };
+        let window = FRESH_WINDOW_MS;
+        assert!(mk(0).is_fresh_at(now), "just-written snapshot is fresh");
+        assert!(
+            mk(window - 1).is_fresh_at(now),
+            "1ms inside the window is fresh"
+        );
+        assert!(
+            mk(window).is_fresh_at(now),
+            "exactly at the window is fresh"
+        );
+        assert!(
+            !mk(window + 1).is_fresh_at(now),
+            "1ms past the window is stale"
+        );
+    }
+}
+
 #[cfg(test)]
 mod daemon_status_tests {
     use super::*;
