@@ -56,7 +56,9 @@ const completeStatus = renderStatusBase.extend({
   status: z.literal('complete'),
   progress: z.literal(1),
   outputUrl: z.string().url(),
-  creditsSettled: z.number().int().nonnegative(),
+  // packet-48 OWED: rows completed before measured settlement existed
+  // (pre-migration-0016) settle nothing — null, not zero.
+  creditsSettled: z.number().int().nonnegative().nullable(),
 });
 export const renderStatusResponseSchema = z.discriminatedUnion('status', [completeStatus, nonCompleteStatus]);
 export type RenderStatusResponse = z.infer<typeof renderStatusResponseSchema>;

@@ -34,6 +34,25 @@ describe('public API schemas', () => {
     })).toThrow();
   });
 
+  // packet-48 OWED: rows completed before measured settlement existed
+  // (pre-migration-0016) carry creditsSettled = null even on complete.
+  it('parses a completed render with NULL settled credits (pre-measurement rows)', () => {
+    const parsed = renderStatusResponseSchema.parse({
+      renderId: 'job-render-2',
+      status: 'complete',
+      progress: 1,
+      outputUrl: 'https://cdn.example/output.mp4?signature=short-lived',
+      creditsReserved: 5,
+      creditsSettled: null,
+      error: null,
+      createdAt: '2026-07-12T10:00:00.000Z',
+      completedAt: '2026-07-12T10:01:00.000Z',
+      verification: 'pending',
+    });
+    expect(parsed.status).toBe('complete');
+    expect(parsed.creditsSettled).toBeNull();
+  });
+
   it('requires verification on status and webhook payloads', () => {
     expect(() => renderStatusResponseSchema.parse({
       renderId: 'job-1', status: 'complete', progress: 1,

@@ -137,7 +137,14 @@ export type RenderMediaOnFarmOptions = RequestOptions & EnqueueRenderRequest & {
   onProgress?: (status: RenderStatusResponse) => void;
   waitForCompletion?: (renderId: string) => Promise<RenderStatusResponse>;
 };
-export type RenderMediaOnFarmResult = {outputUrl: string; renderId: string; creditsSettled: number; verification: RenderStatusResponse['verification']};
+/** The result of a completed render. `creditsSettled` is null when the job
+ * completed before measured settlement existed (pre-migration-0016 rows). */
+export type RenderMediaOnFarmResult = {
+  outputUrl: string;
+  renderId: string;
+  creditsSettled: number | null;
+  verification: RenderStatusResponse['verification'];
+};
 
 export type EnqueueRenderOptions = RequestOptions & EnqueueRenderRequest;
 export function enqueueRender(options: EnqueueRenderOptions) {
@@ -195,7 +202,13 @@ export async function renderMediaOnFarm(options: RenderMediaOnFarmOptions): Prom
     }
     options.onProgress?.(status);
     if (status.status === 'complete') {
-      return {outputUrl: status.outputUrl, renderId: status.renderId, creditsSettled: status.creditsSettled, verification: status.verification};
+      return {
+        outputUrl: status.outputUrl,
+        renderId: status.renderId,
+        // Null when the job completed before measured settlement existed.
+        creditsSettled: status.creditsSettled,
+        verification: status.verification,
+      };
     }
     if (status.status === 'failed' || status.status === 'canceled') {
       throw new FarmApiError(409, status.error ?? `Render ${status.status}`, `RENDER_${status.status.toUpperCase()}`, status, 'client');
