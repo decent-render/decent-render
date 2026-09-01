@@ -139,26 +139,28 @@ pub(crate) fn pid_is_dead(_pid: u32) -> bool {
 /// Newest mtime at or below `path`. Never follows symlinks; an unreadable
 /// entry degrades to "older" (sweepable) rather than aborting the walk —
 /// if we cannot read it we also could not have written it recently.
+/// Walks with an explicit heap stack (D-9): workdir trees can be nested
+/// arbitrarily deep and a recursive walk would overflow the thread stack.
 fn newest_mtime(path: &Path) -> SystemTime {
-    fn walk(p: &Path, newest: &mut SystemTime) {
-        let Ok(md) = std::fs::symlink_metadata(p) else {
-            return;
+    let mut newest = SystemTime::UNIX_EPOCH;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(md) = std::fs::symlink_metadata(&p) else {
+            continue;
         };
         if let Ok(t) = md.modified() {
-            if t > *newest {
-                *newest = t;
+            if t > newest {
+                newest = t;
             }
         }
         if md.is_dir() {
-            if let Ok(rd) = std::fs::read_dir(p) {
+            if let Ok(rd) = std::fs::read_dir(&p) {
                 for entry in rd.flatten() {
-                    walk(&entry.path(), newest);
+                    stack.push(entry.path());
                 }
             }
         }
     }
-    let mut newest = SystemTime::UNIX_EPOCH;
-    walk(path, &mut newest);
     newest
 }
 
@@ -402,5 +404,49 @@ mod tests {
         let dir = s.mkdir(&format!("job-own-{me}-2000000000000000000-0"));
         sweep_dir(&s.0, Duration::ZERO);
         assert!(dir.exists(), "own-pid workdir must never be swept");
+    }
+
+    // D-9: `newest_mtime`'s walk must not recurse. The OS caps how deep a
+    // chain we can build (PATH_MAX refuses past ~490 levels on macOS, ~2000
+    // on Linux — far too shallow to overflow a default 8 MiB test stack), so
+    // the walk runs on a deliberately tiny stack: a recursive walker
+    // overflows it (the abort IS the red), while an explicit heap stack uses
+    // only constant thread stack, however deep the chain goes.
+    #[test]
+    fn newest_mtime_walks_deep_chains_without_recursing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = tmp.path().to_path_buf();
+        let mut depth = 0u32;
+        loop {
+            let next = p.join("d");
+            if std::fs::create_dir(&next).is_err() {
+                break; // OS refused (PATH_MAX): deepest chain available
+            }
+            p = next;
+            depth += 1;
+        }
+        // The leaf needs headroom under PATH_MAX; if it does not fit, give
+        // back one level and note the depth actually exercised.
+        let mut leaf = p.join("leaf.txt");
+        while std::fs::write(&leaf, b"deep").is_err() {
+            p = p.parent().unwrap().to_path_buf();
+            depth -= 1;
+            assert!(depth > 0, "OS allowed no usable chain depth");
+            leaf = p.join("leaf.txt");
+        }
+        std::fs::write(&leaf, b"deep").unwrap();
+        let leaf_mtime = std::fs::metadata(&leaf).unwrap().modified().unwrap();
+        eprintln!("chain depth the OS allowed: {depth}");
+
+        let root = tmp.path().to_path_buf();
+        let newest = std::thread::Builder::new()
+            .stack_size(32 * 1024)
+            .spawn(move || newest_mtime(&root))
+            .unwrap()
+            .join()
+            .expect("walker must not overflow its stack");
+        // The root's mtime predates the leaf (the leaf was written last), so
+        // seeing the leaf's mtime proves the walk reached the bottom.
+        assert!(newest >= leaf_mtime);
     }
 }

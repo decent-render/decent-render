@@ -438,29 +438,31 @@ fn pid_exists(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-/// Recursive apparent-size sum of a directory tree, tolerant of files that
+/// Apparent-size sum of a directory tree, tolerant of files that
 /// vanish mid-walk (a render deleting intermediates while we sample) and of
 /// symlinked directories (never followed: a workdir symlink escaping the
-/// workdir would make the "cap" measure some other tree).
+/// workdir would make the "cap" measure some other tree). Walks with an
+/// explicit heap stack (D-9, same shape as cache/sweep) — workdir trees can
+/// be nested arbitrarily deep and recursion would overflow the stack.
 fn workdir_bytes(path: &Path) -> u64 {
-    fn walk(dir: &Path, total: &mut u64) {
-        let entries = match std::fs::read_dir(dir) {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(_) => return, // vanished or unreadable: sample what exists
+            Err(_) => continue, // vanished or unreadable: sample what exists
         };
         for entry in entries.flatten() {
             let Ok(meta) = entry.metadata() else {
-                continue;
+                continue; // vanished mid-walk
             };
             if meta.is_dir() {
-                walk(&entry.path(), total);
+                stack.push(entry.path());
             } else if meta.is_file() {
-                *total += meta.len();
+                total += meta.len();
             }
         }
     }
-    let mut total = 0u64;
-    walk(path, &mut total);
     total
 }
 
@@ -1210,5 +1212,48 @@ mod tests {
         server.abort();
         // root intentionally NOT removed: it is a shared OnceLock root
         // across the packet-37 download tests; /tmp reclamation covers it.
+    }
+
+    // D-9 sibling: `workdir_bytes`' walk must not recurse either. Same
+    // tiny-stack trick as the sweep.rs test — the OS caps the chain depth
+    // (PATH_MAX) below what could overflow a default test stack, so a
+    // recursive walker is only caught by a deliberately small stack (the
+    // abort IS the red); the explicit heap stack needs constant thread
+    // stack, however deep the chain.
+    #[test]
+    fn workdir_bytes_sums_deep_chains_without_recursing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = tmp.path().to_path_buf();
+        let mut depth = 0u32;
+        loop {
+            let next = p.join("d");
+            if std::fs::create_dir(&next).is_err() {
+                break; // OS refused (PATH_MAX): deepest chain available
+            }
+            p = next;
+            depth += 1;
+        }
+        // Same PATH_MAX headroom for the leaf file name.
+        let mut leaf = p.join("leaf.bin");
+        let payload = vec![0x42u8; 12345];
+        while std::fs::write(&leaf, &payload).is_err() {
+            p = p.parent().unwrap().to_path_buf();
+            depth -= 1;
+            assert!(depth > 0, "OS allowed no usable chain depth");
+            leaf = p.join("leaf.bin");
+        }
+        std::fs::write(&leaf, &payload).unwrap();
+        eprintln!("chain depth the OS allowed: {depth}");
+
+        let root = tmp.path().to_path_buf();
+        let total = std::thread::Builder::new()
+            .stack_size(32 * 1024)
+            .spawn(move || workdir_bytes(&root))
+            .unwrap()
+            .join()
+            .expect("walker must not overflow its stack");
+        // The only file in the tree; an exact sum proves the walk reached
+        // the bottom (dirs contribute nothing in the file branch).
+        assert_eq!(total, payload.len() as u64);
     }
 }
