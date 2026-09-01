@@ -16,13 +16,17 @@
  *
  * Usage: bun scripts/e2e/local-dispatch.mjs [--cancel-after=N] [--artifacts=DIR] [--port=N]
  *   exit 0 on jobComplete (success run) or after clean cancel handling,
- *   exit 1 on jobFailed / schema violation / timeout.
+ *   exit 1 on jobFailed / schema violation / timeout / jobComplete WITHOUT
+ *   an uploaded video (C-7) / failed cancel-cleanup assertions.
+ * Env: E2E_EXPECT_FAIL=missing-upload — no-supervisor self-proof that a
+ *   missing video exits 1. E2E_WORKER_ROOT=<path> — the supervisor's state
+ *   root, enabling the cancel path's workdir-gone assertion.
  */
 import {
   ServerMessageSchema,
   WorkerMessageSchema,
 } from '../../packages/protocol/dist/index.js';
-import {readFileSync, writeFileSync, statSync} from 'node:fs';
+import {readFileSync, writeFileSync, statSync, readdirSync} from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
@@ -39,6 +43,17 @@ const CANCEL_THRESHOLD = Number(arg('cancel-threshold') || 0.3);
 // models dispatch redeploys / network blips DURING the supervisor's
 // CANCEL_GRACE window. The supervisor must still finish killing the tree.
 const DROP_CONNECTION_AFTER = Number(arg('drop-connection-after') || 0);
+// C-7: E2E_EXPECT_FAIL=missing-upload runs the harness WITHOUT a supervisor —
+// it feeds itself a schema-valid jobComplete whose upload is FORCED missing
+// and must exit 1 (the harness can never exit 0 without a video). A normal
+// run sets nothing.
+const E2E_EXPECT_FAIL = process.env.E2E_EXPECT_FAIL || '';
+// C-7: where the supervisor under test keeps its state root (the launcher
+// exports the same root it gave the supervisor via HOME/worker-root). Needed
+// for the cancel path's "workdir is gone" assertion; when unset that one
+// check is skipped (the harness cannot know where to look), the other two
+// assertions still run.
+const E2E_WORKER_ROOT = process.env.E2E_WORKER_ROOT || '';
 const OUT = path.join(ART, 'uploaded-output.mp4');
 
 const log = (...a) => console.error(`[dispatch]`, ...a);
@@ -59,6 +74,60 @@ const timer = setTimeout(() => {
 function finish(code, summary) {
   console.log(`[dispatch] ${summary}`);
   process.exit(code);
+}
+
+// C-7: the harness must never exit 0 without a video on disk, and the
+// cancel path must verify the supervisor actually cleaned up. Each failing
+// assertion finishes 1.
+function assertCleanAfterCancel() {
+  // (1) no bytes were uploaded.
+  const uploaded = statSync(OUT, {throwIfNoEntry: false});
+  if (uploaded && uploaded.size > 0) {
+    finish(1, `cancel path uploaded ${uploaded.size}b to ${OUT} — leak`);
+  }
+  // (2) the workdir is gone. Only checkable when the launcher told us where
+  // the supervisor keeps its state root (E2E_WORKER_ROOT); skipped otherwise.
+  if (E2E_WORKER_ROOT) {
+    let entries = [];
+    try {
+      entries = readdirSync(path.join(E2E_WORKER_ROOT, 'workdirs'));
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e; // no workdirs dir at all = purged
+    }
+    const left = entries.filter((n) => n.includes('job-p3-proof'));
+    if (left.length > 0) {
+      finish(1, `cancel path left workdirs under ${E2E_WORKER_ROOT}: ${left.join(', ')} — leak`);
+    }
+  } else {
+    log('workdir-gone check skipped: E2E_WORKER_ROOT unset');
+  }
+  // (3) no Chrome/runner process from this run remains. pgrep is read-only;
+  // a false positive (an unrelated local node) fails CONSERVATIVELY.
+  const pattern = E2E_WORKER_ROOT || '.decent-worker';
+  const pg = Bun.spawnSync(['pgrep', '-f', pattern]);
+  const pids = pg.stdout.toString().trim();
+  if (pids) {
+    finish(1, `cancel path left processes matching /${pattern}/: ${pids.split('\n').join(',')} — leak`);
+  }
+}
+
+// jobComplete landed. The VIDEO MUST BE ON DISK: a completion without an
+// uploaded output is the exact lie this harness exists to catch (C-7) —
+// exit 1, never 0.
+function handleJobComplete(frame, forceMissingUpload = false) {
+  clearTimeout(timer);
+  if (cancelSent) {
+    // A completion racing a late cancel is fine; record it.
+    sawAccepted = true;
+    result = 'complete';
+    log('jobComplete after cancel sent (race — not a leak)');
+    return;
+  }
+  const uploaded = forceMissingUpload ? undefined : statSync(OUT, {throwIfNoEntry: false});
+  if (!uploaded || uploaded.size === 0) {
+    finish(1, `jobComplete WITHOUT an uploaded video (${OUT} missing/empty) — refusing to exit 0`);
+  }
+  finish(0, `jobComplete: frames=${frame.metrics?.frames} wallMs=${frame.metrics?.wallMs} size=${frame.metrics?.outputSizeInBytes} uploaded=${uploaded.size}b`);
 }
 
 const server = Bun.serve({
@@ -201,23 +270,14 @@ const server = Bun.serve({
             }
             setTimeout(() => {
               clearTimeout(timer);
+              assertCleanAfterCancel();
               finish(0, `cancel settled + ws dropped: completeAfterCancel=${sawAccepted} failedLeaked=${result === 'failed'}`);
             }, 25_000);
           }
           break;
-        case 'jobComplete': {
-          clearTimeout(timer);
-          if (cancelSent) {
-            // A completion racing a late cancel is fine; record it.
-            sawAccepted = true;
-            result = 'complete';
-            log('jobComplete after cancel sent (race — not a leak)');
-            break;
-          }
-          const uploaded = statSync(OUT, {throwIfNoEntry: false});
-          finish(0, `jobComplete: frames=${frame.metrics?.frames} wallMs=${frame.metrics?.wallMs} size=${frame.metrics?.outputSizeInBytes} uploaded=${uploaded ? `${uploaded.size}b` : 'MISSING'}`);
+        case 'jobComplete':
+          handleJobComplete(frame);
           break;
-        }
         case 'jobFailed': {
           clearTimeout(timer);
           log(`jobFailed: ${frame.reason}`);
@@ -235,3 +295,21 @@ const server = Bun.serve({
 });
 
 log(`dispatch up: http+ws on 127.0.0.1:${PORT}  (cancel-after=${CANCEL_AFTER}ms)`);
+
+if (E2E_EXPECT_FAIL === 'missing-upload') {
+  // C-7 self-proof, no supervisor required: feed the jobComplete branch a
+  // schema-valid completion whose upload is FORCED missing. The harness must
+  // exit 1 — if this ever exits 0, the no-video guard is broken.
+  setTimeout(() => {
+    const synthetic = {
+      type: 'jobComplete',
+      tenant: 'driffs',
+      jobId: 'job-p3-proof',
+      outputKey: 'renders/p3/out.mp4',
+      metrics: {frames: 30, wallMs: 1_000, outputSizeInBytes: 0},
+    };
+    WorkerMessageSchema.parse(synthetic); // the hook must not lie about shape
+    log('E2E_EXPECT_FAIL=missing-upload: feeding synthetic jobComplete (upload forced missing)');
+    handleJobComplete(synthetic, /*forceMissingUpload=*/ true);
+  }, 2_000);
+}

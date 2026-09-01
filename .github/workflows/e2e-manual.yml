@@ -1,0 +1,57 @@
+# C-7: manual end-to-end render through the local dispatch harness. This is
+# NOT a push/PR gate — it needs machine-local artifacts (payload/browser/
+# bundle tarballs under /tmp/p3-artifacts, kept out of git by design, see
+# scripts/e2e/README.md) and a real Chrome render, so it only ever runs when
+# an operator explicitly dispatches it.
+#
+# The harness itself is the gate: it validates every frame against the real
+# protocol schemas and (since C-7) refuses to exit 0 without an uploaded
+# video, and asserts cancel-path cleanup (no bytes uploaded, workdir gone,
+# no Chrome left behind).
+name: e2e-manual
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: local dispatch e2e (harness)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      # The runner's output-verification needs a REAL ffmpeg/ffprobe; without
+      # it those suites silently skip. Same requirement as the runner-core CI
+      # job (REQUIRE_FF=1 turns skipIf into a hard failure).
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # The harness imports the protocol package's built dist (real zod
+      # schemas) — build it before starting the harness.
+      - run: bun install --frozen-lockfile
+        working-directory: packages/protocol
+      - run: bun run build
+        working-directory: packages/protocol
+      # Artifacts (payload/browser/bundle tarballs) are machine-local and NOT
+      # in the repo; a real render run needs them provisioned first (see
+      # scripts/e2e/README.md). Until then this job runs the harness's
+      # forced-fail self-proof: it MUST exit 1 (C-7 — the harness cannot exit
+      # 0 without a video), so this step failing is the harness WORKING.
+      - name: forced-fail self-proof (missing upload must exit 1)
+        run: |
+          set +e
+          E2E_EXPECT_FAIL=missing-upload bun scripts/e2e/local-dispatch.mjs --port=8790
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "::error::harness exited $code on a missing upload — must exit 1 (C-7)"
+            exit 1
+          fi
+          echo "harness correctly exited 1 on missing upload"
+      # A REAL end-to-end render (success + cancel paths) additionally needs:
+      # provisioned artifacts, a built supervisor binary, and the supervisor
+      # running with HOME redirected to a scratch dir. Wire those here when
+      # artifact provisioning lands in CI; until then it stays local-only
+      # (scripts/e2e/README.md has the full runbook).
