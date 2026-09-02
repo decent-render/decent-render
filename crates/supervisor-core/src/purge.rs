@@ -277,6 +277,33 @@ mod tests {
         clear_purge_failure(&blocked);
     }
 
+    /// PACKET 65 (C-13 mutation follow-up): a purge failure RECORDED for a
+    /// path must be clearable once a later sweep reclaims it — the operator
+    /// list must end up EMPTY, not stuck with a stale alarm. Catches the
+    /// clear_purge_failure mutants (no-op body; inverted retain predicate).
+    #[test]
+    fn recorded_purge_failure_is_cleared_when_reclaimed() {
+        let path = std::env::temp_dir().join(format!(
+            "p65-purge-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        record_purge_failure(PurgeFailure {
+            path: path.clone(),
+            error: "EBUSY (stale record)".into(),
+            attempts: PURGE_ATTEMPTS,
+        });
+        assert!(outstanding_purge_failures().iter().any(|f| f.path == path));
+        clear_purge_failure(&path);
+        assert!(
+            !outstanding_purge_failures().iter().any(|f| f.path == path),
+            "a reclaimed purge failure must be cleared for operator surfaces"
+        );
+    }
+
     #[cfg(unix)]
     fn nix_uid_is_root() -> bool {
         unsafe { libc::geteuid() == 0 }
