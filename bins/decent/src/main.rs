@@ -946,17 +946,7 @@ async fn main() -> anyhow::Result<()> {
                     );
                     println!(
                         "update      : {}",
-                        match s.update_available {
-                            Some(v) => {
-                                format!("⚠ {v} available — run `decent upgrade`")
-                            }
-                            // PACKET 40 (audit 18): "up to date" requires the
-                            // daemon to be CONNECTED (dispatch tells it on
-                            // register). A registered-but-disconnected or
-                            // never-connected node has no data — say unknown.
-                            None if s.connection == "connected" => "up to date".to_string(),
-                            None => "unknown (daemon not connected)".to_string(),
-                        }
+                        update_line(s.update_available.as_deref(), &s.connection)
                     );
                 }
                 Some(_) => {
@@ -1112,6 +1102,54 @@ fn login_next_step_message_names_the_daemon_state() {
 /// Serializes the tests that override HOME (login, save_token, migration).
 /// The env var is process-global, and cargo runs tests in parallel — two
 /// such tests overlapping saw each other's HOME mid-assertion.
+/// The `update` line of `decent status`.
+///
+/// PACKET 40 (audit 18): "up to date" requires live data — dispatch tells the
+/// daemon about newer releases when it REGISTERS, so only a snapshot in the
+/// `Registered` state may claim it. Anything earlier (Connecting, Connected
+/// before the register reply, Reconnecting, Disconnected) has no data.
+/// 2026-09-02: this compared against the lowercase word "connected" while
+/// the daemon writes the state with `{:?}` ("Registered"), so a healthy node
+/// always printed "unknown (daemon not connected)" — caught on the first
+/// real install after the token rotation.
+fn update_line(update_available: Option<&str>, connection: &str) -> String {
+    match update_available {
+        Some(v) => format!("⚠ {v} available — run `decent upgrade`"),
+        None if connection == "Registered" => "up to date".to_string(),
+        None => "unknown (daemon not registered with dispatch)".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod update_line_tests {
+    use super::update_line;
+
+    #[test]
+    fn registered_node_without_a_newer_release_is_up_to_date() {
+        assert_eq!(update_line(None, "Registered"), "up to date");
+    }
+
+    #[test]
+    fn newer_release_wins_regardless_of_state() {
+        assert!(update_line(Some("0.0.10"), "Registered").contains("0.0.10 available"));
+        assert!(update_line(Some("0.0.10"), "Disconnected").contains("0.0.10 available"));
+    }
+
+    #[test]
+    fn states_before_the_register_reply_are_unknown_not_up_to_date() {
+        for state in [
+            "Connected",
+            "Connecting",
+            "Reconnecting",
+            "Disconnected",
+            "connected",
+        ] {
+            let line = update_line(None, state);
+            assert!(line.starts_with("unknown"), "{state}: {line}");
+        }
+    }
+}
+
 #[cfg(test)]
 static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
