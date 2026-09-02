@@ -15,7 +15,7 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-manifest_version="$(awk -F'"' '/^version = / {print $2; exit}' bins/decent-node/Cargo.toml)"
+manifest_version="$(awk -F'"' '/^version = / {print $2; exit}' bins/decent/Cargo.toml)"
 
 if [[ "$manifest_version" != "$version" ]]; then
   echo "release check failed: manifest=$manifest_version requested=$version" >&2
@@ -33,16 +33,17 @@ if ! grep -Fq "## [$version]" CHANGELOG.md; then
 fi
 
 cargo fmt --all -- --check
-cargo clippy -p supervisor-core -p decent-node --all-targets --all-features -- -D warnings
-cargo test -p supervisor-core -p decent-node
-cargo build -p decent-node
+cargo clippy -p supervisor-core -p decent --all-targets --all-features -- -D warnings
+cargo test -p supervisor-core -p decent
+cargo build -p decent
 
-actual="$(./target/debug/decent-node --version)"
+bin="${CARGO_TARGET_DIR:-target}/debug/decent"
+actual="$("$bin" --version)"
 if [[ "$actual" != *"$version"* ]]; then
   echo "release check failed: binary reports '$actual'" >&2
   exit 1
 fi
-./target/debug/decent-node --help >/dev/null
+"$bin" --help >/dev/null
 
 (
   cd packages/protocol
@@ -58,4 +59,4 @@ fi
   bun run test
 )
 
-echo "release check passed for decent-node v$version"
+echo "release check passed for decent v$version"
