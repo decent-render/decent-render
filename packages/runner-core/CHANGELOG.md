@@ -1,7 +1,14 @@
 # Changelog
 
-## 0.1.3
+## 0.1.3 — 2026-09-02
 
+- Cap the extracted size of the tenant bundle and pin tar traversal
+  behaviour: `../` members, absolute members and symlink write-through are
+  refused, and a decompression bomb stops at the ceiling instead of filling
+  the operator's disk.
+- Every stdout frame the runner emits is validated in its own tests against
+  the shared `runner-stdout-v1` fixture set published with
+  `@decent-render/protocol` 0.1.3 (no wire change).
 - Retry the whole render (composition selection + renderMedia) exactly ONCE
   when the first attempt fails with a delayRender timeout — the GPU-adapter
   contention failure class where a hung `navigator.gpu.requestAdapter()`

@@ -1,6 +1,6 @@
 {
 	"name": "@decent-render/client",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"description": "Type-safe client for uploading Remotion bundles and rendering on the Decent network.",
 	"license": "Apache-2.0",
 	"repository": {

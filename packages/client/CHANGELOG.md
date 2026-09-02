@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-09-02
 
 - **Breaking (types):** `creditsSettled` on complete-status responses and in
   `RenderMediaOnFarmResult` is now `number | null` — null when the job

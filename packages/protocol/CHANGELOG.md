@@ -6,6 +6,14 @@ itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-09-02
+
+- `fixtures/runner-stdout-v1.json`: the runner→supervisor stdout contract
+  (`progress` / `heartbeat` / `done` / `error` NDJSON lines) now has a shared
+  accept/reject fixture set, parsed by `@decent-render/runner-core`'s zod
+  schema and by `supervisor-core`'s `RunnerEvent` in CI. The first run caught
+  the Rust parser accepting out-of-range `progress`; it now applies the same
+  `[0, 1]` bound as `jobProgress`.
 - `register.protocolVersion` is now `z.literal(PROTOCOL_VERSION)` instead of any
   integer: a node announcing a version this package does not speak fails to
   parse rather than being treated as v2. Rust pins identically. No wire change.
