@@ -325,6 +325,173 @@ mod tests {
         out.stdout
     }
 
+    // ── PACKET 66 (C-13 / N-13 rank B): the artifact caps are exact ──────
+    //
+    // A hostile or buggy artifact server is exactly the threat the caps
+    // exist for, so the boundary is pinned from BOTH sides: exactly-at-cap
+    // must pass, one byte over must fail — for the content-length
+    // pre-flight AND the streamed counter. The fake server is a raw
+    // TcpListener (hyper-free): it streams zeros with no content-length so
+    // the STREAMED counter is what fires.
+
+    /// One-shot fake artifact server: streams `total` bytes of zeros (in
+    /// `chunk`-byte pieces) with NO content-length, unless `content_length`
+    /// overrides the header (to test a lying pre-flight). Connection close
+    /// delimits the body.
+    async fn serve_zero_stream(
+        total: u64,
+        chunk: usize,
+        content_length: Option<u64>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 8192];
+            let _ = socket.read(&mut buf).await; // drain the request head
+            let cl = match content_length {
+                Some(n) => format!("content-length: {n}\r\n"),
+                None => String::new(),
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n{cl}connection: close\r\n\r\n"
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let zeros = vec![0u8; chunk];
+            let mut left = total;
+            while left > 0 {
+                let n = (left.min(chunk as u64)) as usize;
+                if socket.write_all(&zeros[..n]).await.is_err() {
+                    break;
+                }
+                left -= n as u64;
+            }
+            let _ = socket.shutdown().await;
+        });
+        (format!("http://{addr}/artifact"), handle)
+    }
+
+    fn scratch_dest(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "p66-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Exactly-at-cap content-length passes the pre-flight: the gate is
+    /// strictly-above, so the transfer proceeds (and fails on the truncated
+    /// body — "body read failed" — never on the ceiling wording).
+    #[tokio::test]
+    async fn content_length_exactly_at_cap_passes_the_preflight() {
+        let (url, server) = serve_zero_stream(0, 1024, Some(ARTIFACT_MAX_BYTES)).await;
+        let dest = scratch_dest("cl-exact");
+        let error = download_to_file_hashed(&artifact_client(), &url, &dest, "payloads")
+            .await
+            .expect_err("a truncated body must fail");
+        assert!(
+            error.to_string().contains("body read failed"),
+            "exactly-at-cap must pass the pre-flight and fail on truncation, got: {error}"
+        );
+        assert!(
+            !error.to_string().contains("exceeds"),
+            "exactly-at-cap must not trip the ceiling pre-flight, got: {error}"
+        );
+        let _ = tokio::fs::remove_file(&dest).await;
+        server.abort();
+    }
+
+    /// One byte over the cap in the content-length is rejected BY THE
+    /// PRE-FLIGHT, before any body bytes are read.
+    #[tokio::test]
+    async fn content_length_over_cap_is_rejected_by_the_preflight() {
+        let (url, server) = serve_zero_stream(0, 1024, Some(ARTIFACT_MAX_BYTES + 1)).await;
+        let dest = scratch_dest("cl-over");
+        let error = download_to_file_hashed(&artifact_client(), &url, &dest, "payloads")
+            .await
+            .expect_err("over-cap content-length must fail");
+        assert!(
+            error.to_string().contains("content-length"),
+            "the pre-flight must reject it, got: {error}"
+        );
+        assert!(error.to_string().contains("exceeds"), "got: {error}");
+        server.abort();
+    }
+
+    /// A streamed body of EXACTLY the cap is accepted — the streamed counter
+    /// is strictly-above too. Kills the `>` → `>=` mutant on the counter.
+    #[tokio::test]
+    async fn streamed_body_exactly_at_cap_is_accepted() {
+        let chunk = 1024 * 1024;
+        let (url, server) = serve_zero_stream(ARTIFACT_MAX_BYTES, chunk, None).await;
+        let dest = scratch_dest("stream-exact");
+        let sha = download_to_file_hashed(&artifact_client(), &url, &dest, "payloads")
+            .await
+            .expect("exactly-at-cap must stream successfully");
+        // sha pins that ALL 2 GiB were hashed (sha256 of 2 GiB of zeros).
+        let mut expected = Sha256::new();
+        let zeros = vec![0u8; chunk];
+        for _ in 0..(ARTIFACT_MAX_BYTES / chunk as u64) {
+            expected.update(&zeros);
+        }
+        assert_eq!(sha, hex_lower(&expected.finalize()));
+        assert!(dest.exists());
+        tokio::fs::remove_file(&dest).await.ok();
+        server.abort();
+    }
+
+    /// A streamed body one chunk OVER the cap is rejected and the oversized
+    /// temp file is REMOVED (the code promises the caller cannot be trusted
+    /// to know how far it got). Kills the `+=` → `*=` mutant: a zeroed
+    /// counter never fires and the body would complete successfully.
+    #[tokio::test]
+    async fn streamed_body_one_chunk_over_the_cap_is_rejected_and_temp_file_removed() {
+        let chunk = 1024 * 1024;
+        let (url, server) = serve_zero_stream(ARTIFACT_MAX_BYTES + chunk as u64, chunk, None).await;
+        let dest = scratch_dest("stream-over");
+        let error = download_to_file_hashed(&artifact_client(), &url, &dest, "payloads")
+            .await
+            .expect_err("an over-cap streamed body must fail");
+        assert!(error.to_string().contains("exceeded the"), "got: {error}");
+        assert!(
+            !dest.exists(),
+            "the oversized temp file must be removed after the streamed cap fires"
+        );
+        server.abort();
+    }
+
+    /// The extraction ceiling boundary is EXACT: a tree measuring exactly
+    /// the ceiling passes; one more block above it fires the gate.
+    #[test]
+    fn extracted_size_gate_exactly_at_the_ceiling_passes_and_above_fails() {
+        let s = Scratch::new("gate-exact");
+        let dest = s.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("a.bin"), vec![0u8; 512]).unwrap();
+        let measured = crate::cache::dir_size(&dest);
+        assert!(measured > 0, "sanity: the tree must measure non-zero");
+        verify_extracted_size_under(&dest, "payloads", measured)
+            .expect("exactly at the ceiling passes");
+
+        // One more block-worth of tree: now strictly above the old ceiling.
+        std::fs::write(dest.join("b.bin"), vec![0u8; 512]).unwrap();
+        let grown = crate::cache::dir_size(&dest);
+        assert!(grown > measured, "growing the tree must grow the measure");
+        let err = verify_extracted_size_under(&dest, "payloads", measured)
+            .expect_err("the grown tree is over the old ceiling");
+        assert!(err.to_string().contains("over the"), "got: {err}");
+        // And it fits its own (grown) measure — the failure above is the
+        // boundary, not the tree.
+        verify_extracted_size_under(&dest, "payloads", grown)
+            .expect("the grown tree fits the grown ceiling");
+    }
+
     /// PACKET 39 (2b): pinned MEASURED behaviour. bsdtar 3.5.3 (macOS) and
     /// GNU tar 1.34 (CI's ubuntu:22.04) both REFUSE `..` members outright.
     /// If a future tar/flag change weakens that, this test goes RED on the
