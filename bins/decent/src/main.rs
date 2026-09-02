@@ -504,6 +504,8 @@ fn parse_version_word(text: &str) -> Option<String> {
 }
 
 /// The version a Homebrew formula file pins (`  version "0.0.10"`).
+/// Read on macOS only; the Linux path asks the installed binary instead.
+#[cfg(any(target_os = "macos", test))]
 fn parse_formula_version(formula: &str) -> Option<String> {
     formula.lines().find_map(|l| {
         let l = l.trim_start();
