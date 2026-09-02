@@ -393,6 +393,181 @@ mod tests {
 
     const T0: u64 = 1_700_000_000;
 
+    /// PACKET 66 (N-13 rank B): dir_size accounts REAL bytes — a 4096-byte
+    /// file measures within [4096, 4096 + 1 block] (file rounding plus the
+    /// directory inode), not collapsed to ~a kilobyte (`*` → `+` in the
+    /// accounting) and not vanished (→ 0/1). The over-cap sweep below leans
+    /// on this accounting.
+    #[test]
+    fn dir_size_accounts_real_bytes_not_a_collapsed_proxy() {
+        let root = scratch("acct");
+        seed(&root, "payloads", "acct-entry", 4096, None);
+        let measured = dir_size(&root.join("payloads/acct-entry"));
+        assert!(
+            (4096..=4096 + 2 * 512).contains(&measured),
+            "dir_size must account the real bytes (+dir inode), got {measured}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// PACKET 66: an over-cap cache IS swept when the accounting is real:
+    /// one entry, cap = its measured size - 1 → the entry must be evicted.
+    #[test]
+    fn over_cap_cache_evicts_when_accounting_is_real() {
+        let root = scratch("overacct");
+        let dir = seed(&root, "payloads", "acct-entry", 4096, Some(T0));
+        let measured = dir_size(&dir);
+        let out = sweep_caches(&root, measured - 1, &[]);
+        assert_eq!(out.evicted, 1, "cap = size-1 must evict the entry");
+        assert!(!dir.exists(), "the over-cap entry must be gone");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// PACKET 66: an over-cap sweep must evict OLDEST-first, TERMINATE, and
+    /// never panic. Kills two mutants at once: `evict_at < len` → `<=`
+    /// indexes one past the end (panic), and `evict_at += 1` → `*=` sticks
+    /// at 0 and loops forever. The sweep runs on a worker thread with a
+    /// bounded wait so a hang is a FAILURE, not a wedged suite.
+    /// PACKET 66: the eviction loop must TERMINATE on unremovable entries.
+    /// A read-only cache root makes every removal fail (EACCES): the true
+    /// loop walks evict_at to len and exits (evicted 0, nothing removed).
+    /// Kills two mutants at once — `evict_at < len` → `<=` (walks one past
+    /// the end: index panic) and `evict_at += 1` → `*=` (sticks at 0:
+    /// infinite loop). Both are caught by the bounded wait below.
+    #[test]
+    fn eviction_loop_terminates_on_unremovable_entries() {
+        if nix_uid_is_root() {
+            eprintln!("running as root; read-only dirs are removable — skipping");
+            return;
+        }
+        let root = scratch("unremovable");
+        seed(&root, "payloads", "u1", 4096, Some(T0));
+        seed(&root, "payloads", "u2", 4096, Some(T0 + 1));
+        seed(&root, "payloads", "u3", 4096, Some(T0 + 2));
+
+        let payloads = root.join("payloads");
+        set_readonly(&payloads);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root_for_thread = root.clone();
+        std::thread::spawn(move || {
+            let out = sweep_caches(&root_for_thread, 1024, &[]);
+            tx.send(out).expect("sweep worker: receiver alive");
+        });
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the eviction loop did not terminate on unremovable entries");
+        assert_eq!(outcome.evicted, 0, "nothing is removable, nothing evicted");
+        assert_eq!(outcome.entries, 3, "all complete entries are accounted");
+
+        clear_readonly(&payloads);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    fn nix_uid_is_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    fn nix_uid_is_root() -> bool {
+        false
+    }
+
+    #[cfg(unix)]
+    fn set_readonly(p: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(p).unwrap().permissions();
+        perm.set_mode(0o555);
+        std::fs::set_permissions(p, perm).unwrap();
+    }
+    #[cfg(unix)]
+    fn clear_readonly(p: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(p).unwrap().permissions();
+        perm.set_mode(0o755);
+        let _ = std::fs::set_permissions(p, perm);
+    }
+
+    #[test]
+    fn over_cap_eviction_is_ordered_and_terminates() {
+        let root = scratch("bounded");
+        seed(&root, "payloads", "old", 4096, Some(T0));
+        seed(&root, "payloads", "mid", 4096, Some(T0 + 1));
+        seed(&root, "payloads", "new", 4096, Some(T0 + 2));
+        let cap = dir_size(&root.join("payloads/old")) + dir_size(&root.join("payloads/mid")) - 1;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root_for_thread = root.clone();
+        std::thread::spawn(move || {
+            let out = sweep_caches(&root_for_thread, cap, &[]);
+            tx.send(out).expect("sweep worker: receiver alive");
+        });
+        let out = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the eviction sweep did not terminate");
+        assert_eq!(out.evicted, 2, "the cap fits two of three entries");
+        assert!(
+            !root.join("payloads/old").exists(),
+            "oldest must be evicted first"
+        );
+        assert!(!root.join("payloads/mid").exists());
+        assert!(root.join("payloads/new").exists(), "newest must survive");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// PACKET 66: touching an entry is what PROTECTS it — a touched entry
+    /// survives a sweep that must evict an untouched, older neighbour.
+    /// Kills the `touch_entry_marker → ()` mutant (recency dead → the
+    /// recently used entry is the LRU victim).
+    #[test]
+    fn touched_entry_survives_a_sweep_that_evicts_an_untouched_older_one() {
+        let root = scratch("touch");
+        let x = seed(&root, "payloads", "touched", 4096, Some(1_000_000_000));
+        let o = seed(&root, "payloads", "older", 4096, Some(T0));
+        // A cache hit on X refreshes its recency past O's.
+        touch_entry_marker(&x);
+        let cap = dir_size(&x); // exactly one entry fits; the OLDEST must go.
+        let out = sweep_caches(&root, cap, &[]);
+        assert_eq!(out.evicted, 1);
+        assert!(x.exists(), "the touched entry must survive the sweep");
+        assert!(!o.exists(), "the untouched older entry must be the victim");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// PACKET 66: a COMPLETE entry (real marker) is recognised — counted and
+    /// evictable — while a TORN one (creator died mid-write, no marker) is
+    /// invisible to the sweep. Kills the `completion_marker → "xyzzy"`
+    /// mutant: with a dead marker name nothing is recognised.
+    #[test]
+    fn complete_entries_are_counted_and_evicted_torn_ones_are_ignored() {
+        let root = scratch("completion");
+        // Built WITHOUT seed(): the complete entry carries the REAL payload
+        // completion marker (the runner binary), written literally so the
+        // completion_marker mutant cannot self-mask by renaming the marker
+        // for both sides at once.
+        let complete = root.join("payloads").join("complete");
+        fs::create_dir_all(&complete).unwrap();
+        fs::write(complete.join("decent-render-runner"), vec![0u8; 4096]).unwrap();
+        fs::write(complete.join(LAST_USE_MARKER), T0.to_string()).unwrap();
+        // Torn: same bytes, but NO completion marker.
+        let torn = root.join("payloads").join("torn");
+        fs::create_dir_all(&torn).unwrap();
+        fs::write(torn.join("payload-blob"), vec![0u8; 4096]).unwrap();
+
+        let out = sweep_caches(&root, 1024, &[]);
+        assert_eq!(
+            out.entries, 1,
+            "only the complete entry is accounted: {out:?}"
+        );
+        assert_eq!(out.evicted, 1, "the complete entry is over the tiny cap");
+        assert!(!complete.exists(), "the complete entry must be evicted");
+        assert!(
+            torn.exists(),
+            "the torn entry is invisible to the sweep (never counted)"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn under_cap_nothing_evicted() {
         let root = scratch("under");
