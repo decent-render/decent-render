@@ -96,6 +96,23 @@ fn delete_token() -> anyhow::Result<()> {
 }
 
 /// Current epoch time in milliseconds (for status-snapshot freshness).
+/// Create the daemon log (if missing) and make it owner-only. launchd and
+/// systemd create `StandardOutPath`/`append:` targets with the default
+/// umask (0644) and never change an existing file's mode, so the file is
+/// created HERE first, at 0600: the log carries job ids, dispatch frames and
+/// error text that no other local user needs to read.
+fn ensure_private_log_file(path: &std::path::Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    set_owner_only(path, 0o600);
+    Ok(())
+}
+
 /// The last `n` lines of `text`, in order. `n == 0` → nothing.
 fn tail_lines(text: &str, n: usize) -> Vec<&str> {
     if n == 0 {
@@ -617,7 +634,12 @@ async fn main() -> anyhow::Result<()> {
     // loop emits its events via the obs.log() channel, which the TUI renders
     // directly, so nothing important is lost.
     if !matches!(command, Command::Tui { .. }) {
+        // Colour only on a terminal: under launchd/systemd stdout is the
+        // daemon log file, and escape codes there make `decent logs`, grep
+        // and support pastes unreadable.
+        let on_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
         tracing_subscriber::fmt()
+            .with_ansi(on_terminal)
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| "info".into()),
@@ -806,6 +828,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let exe = std::env::current_exe()?;
             let log_path = service::default_log_path(&token_path()?)?;
+            ensure_private_log_file(&log_path)?;
             let report = service::install(&ServiceSpec {
                 exe: exe.clone(),
                 dispatch_url,
@@ -1082,6 +1105,48 @@ fn update_line(update_available: Option<&str>, connection: &str) -> String {
         Some(v) => format!("⚠ {v} available — run `decent upgrade`"),
         None if connection == "Registered" => "up to date".to_string(),
         None => "unknown (daemon not registered with dispatch)".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod log_file_tests {
+    use super::*;
+
+    #[test]
+    fn log_check_levels() {
+        assert_eq!(log_check_from(false, 0, 0).level, Level::Warn);
+        assert_eq!(log_check_from(true, 0o644, 10).level, Level::Warn);
+        assert!(log_check_from(true, 0o644, 10).detail.contains("644"));
+        let ok = log_check_from(true, 0o600, 4096);
+        assert_eq!(ok.level, Level::Ok);
+        assert!(ok.detail.contains("4 KiB"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_log_file_creates_0600_and_tightens_an_existing_0644() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("p75-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("decent.log");
+        ensure_private_log_file(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&path, b"kept\n").unwrap();
+        ensure_private_log_file(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"kept\n",
+            "existing content is never truncated"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -1474,11 +1539,55 @@ fn version_check() -> Check {
     version_check_from(env!("CARGO_PKG_VERSION"), update.as_deref())
 }
 
+/// The pure log verdict: a missing log is a WARN (nothing written yet), a
+/// mode other than 0600 is a WARN naming the fix, otherwise OK with the size.
+fn log_check_from(exists: bool, mode: u32, bytes: u64) -> Check {
+    if !exists {
+        return Check {
+            name: "log",
+            level: Level::Warn,
+            detail: "no daemon log yet — `decent install` creates it".into(),
+        };
+    }
+    if mode != 0o600 {
+        return Check {
+            name: "log",
+            level: Level::Warn,
+            detail: format!("log file mode is {mode:o}, want 0600 — re-run `decent install`"),
+        };
+    }
+    Check {
+        name: "log",
+        level: Level::Ok,
+        detail: format!("{} KiB, owner-only", bytes / 1024),
+    }
+}
+
+fn log_check() -> Check {
+    let Ok(path) = token_path().and_then(|t| service::default_log_path(&t)) else {
+        return log_check_from(false, 0, 0);
+    };
+    match std::fs::metadata(&path) {
+        Ok(meta) => {
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                meta.permissions().mode() & 0o777
+            };
+            #[cfg(not(unix))]
+            let mode = 0o600;
+            log_check_from(true, mode, meta.len())
+        }
+        Err(_) => log_check_from(false, 0, 0),
+    }
+}
+
 async fn run_doctor() -> i32 {
     let checks = vec![
         token_check(),
         daemon_check(),
         status_file_check(),
+        log_check(),
         dispatch_check().await,
         disk_check(),
         version_check(),
