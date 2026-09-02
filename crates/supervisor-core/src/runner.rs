@@ -718,7 +718,14 @@ async fn run_job_inner(
     // credential to every render otherwise. `env_clear` first, then the
     // allowlist; DECENT_BROWSER_EXECUTABLE below is applied after this and
     // therefore still wins.
-    apply_child_env(&mut command, std::env::vars());
+    // `vars_os`, not `vars`: `std::env::vars()` PANICS on a non-UTF-8 value,
+    // and an operator's shell can carry one. Such a variable is simply not
+    // inherited — nothing on the allowlist is legitimately non-UTF-8.
+    apply_child_env(
+        &mut command,
+        std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+    );
     // The wire carries a sha and a URL; the local filesystem path is this
     // node's business alone, so it is handed over out-of-band rather than
     // being spliced into the jobAssign frame the runner parses.
