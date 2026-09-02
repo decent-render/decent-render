@@ -394,18 +394,20 @@ mod tests {
     const T0: u64 = 1_700_000_000;
 
     /// PACKET 66 (N-13 rank B): dir_size accounts REAL bytes — a 4096-byte
-    /// file measures within [4096, 4096 + 1 block] (file rounding plus the
-    /// directory inode), not collapsed to ~a kilobyte (`*` → `+` in the
-    /// accounting) and not vanished (→ 0/1). The over-cap sweep below leans
-    /// on this accounting.
+    /// file measures within [4096, 2 × 4096]: the file itself plus at most
+    /// one filesystem block for the directory inode (ext4 charges a 4096-byte
+    /// block for a directory, APFS charges nothing — the Linux gate caught
+    /// the tighter APFS-derived bound). Not collapsed to ~a kilobyte (`*` →
+    /// `+` in the accounting) and not vanished (→ 0/1). The over-cap sweep
+    /// below leans on this accounting.
     #[test]
     fn dir_size_accounts_real_bytes_not_a_collapsed_proxy() {
         let root = scratch("acct");
         seed(&root, "payloads", "acct-entry", 4096, None);
         let measured = dir_size(&root.join("payloads/acct-entry"));
         assert!(
-            (4096..=4096 + 2 * 512).contains(&measured),
-            "dir_size must account the real bytes (+dir inode), got {measured}"
+            (4096..=2 * 4096).contains(&measured),
+            "dir_size must account the real bytes (+ at most one dir block), got {measured}"
         );
         fs::remove_dir_all(&root).ok();
     }
