@@ -20,6 +20,7 @@ pub mod artifact_fetch;
 pub mod cache;
 pub mod capabilities;
 pub mod connection;
+pub mod dispatch_url;
 pub mod keepawake;
 pub mod protocol;
 pub mod purge;

@@ -56,7 +56,7 @@ struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            dispatch_url: "ws://localhost:8790/ws".into(),
+            dispatch_url: supervisor_core::dispatch_url::DEFAULT_DISPATCH_WS.into(),
             workdir_root: None,
             allow_real_jobs_default: false,
         }
@@ -207,6 +207,10 @@ async fn start_connection(
     dispatch_url: String,
     token: String,
 ) -> Result<(), String> {
+    // Same gate as the CLI: a ws:// URL to a remote host would ship the
+    // worker token in cleartext. Refused before the token is even saved.
+    supervisor_core::dispatch_url::validate_dispatch_url(&dispatch_url)
+        .map_err(|e| e.to_string())?;
     let mut conn_guard = state.conn.lock().await;
     if conn_guard.is_some() {
         return Err("Connection already running".into());

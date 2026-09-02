@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 use service::{DaemonState, ServiceSpec};
 use supervisor_core::capabilities::detect_capabilities;
 use supervisor_core::connection::{self, ConnectionConfig};
+use supervisor_core::dispatch_url::{validate_dispatch_url, DEFAULT_DISPATCH_WS};
 use supervisor_core::keepawake::{self, KeepAwakeState};
 use supervisor_core::protocol::{Platform, RegisterMessage, PROTOCOL_VERSION};
 use supervisor_core::status::{Observability, SupervisorStatus};
@@ -94,33 +95,6 @@ fn delete_token() -> anyhow::Result<()> {
 }
 
 /// Current epoch time in milliseconds (for status-snapshot freshness).
-/// PACKET 40 (audit 17): validate the dispatch URL scheme BEFORE anything
-/// dials it. A `ws://` URL to a remote host would ship the worker JWT in
-/// CLEARTEXT — refuse it and say exactly why. Plain `ws://` stays allowed
-/// for localhost/127.0.0.1 (the e2e harness and local development).
-/// Never silently "upgrade" the scheme: the operator must see the mistake.
-pub(crate) fn validate_dispatch_url(url: &str) -> anyhow::Result<()> {
-    let parsed = url::Url::parse(url)
-        .map_err(|e| anyhow::anyhow!("--dispatch-url is not a valid URL ({e}): {url}"))?;
-    let scheme = parsed.scheme();
-    let is_local = matches!(
-        parsed.host_str(),
-        Some("localhost") | Some("127.0.0.1") | Some("[::1]") | None
-    );
-    match scheme {
-        "wss" => Ok(()),
-        "ws" if is_local => Ok(()),
-        "ws" => anyhow::bail!(
-            "refusing to use ws:// to a non-local host: the worker token would be sent in              CLEARTEXT. Use wss://{host}{path} (or a localhost URL for local development).",
-            host = parsed.host_str().unwrap_or("<unknown>"),
-            path = parsed.path(),
-        ),
-        other => anyhow::bail!(
-            "--dispatch-url must be wss:// (or ws:// for localhost); got '{other}://'"
-        ),
-    }
-}
-
 /// PACKET 40 (audit-api-ux): a worker token is a JWT — three
 /// dot-separated base64url segments, each non-empty, header/payload
 /// decodable as JSON, and a payload carrying the claims this fleet mints
@@ -330,10 +304,6 @@ async fn await_termination() -> Option<&'static str> {
 async fn await_termination() -> Option<&'static str> {
     tokio::signal::ctrl_c().await.ok().map(|()| "ctrl-c")
 }
-
-/// The dispatch URL `Start`/`Install`/`Tui` default to — and the host
-/// `decent doctor` probes for reachability (ws→http, path `/health`).
-const DEFAULT_DISPATCH_WS: &str = "wss://decent-render-dispatch.fly.dev/ws";
 
 #[derive(Parser)]
 #[command(
@@ -2035,40 +2005,6 @@ mod daemon_status_tests {
 #[cfg(test)]
 mod packet40_tests {
     use super::*;
-
-    // Step 1: scheme validation.
-    #[test]
-    fn wss_urls_are_accepted_everywhere() {
-        assert!(validate_dispatch_url("wss://decent-render-dispatch.fly.dev/ws").is_ok());
-        assert!(validate_dispatch_url("wss://example.com/?a=1&b=2").is_ok());
-    }
-
-    #[test]
-    fn plain_ws_is_allowed_only_for_localhost() {
-        // The e2e harness and local development.
-        assert!(validate_dispatch_url("ws://localhost:8790/ws").is_ok());
-        assert!(validate_dispatch_url("ws://127.0.0.1:8790/ws").is_ok());
-        assert!(validate_dispatch_url("ws://[::1]:8790/ws").is_ok());
-        // A REMOTE host over ws:// ships the JWT in cleartext — refused,
-        // with a message that says why and names the fix.
-        let err = validate_dispatch_url("ws://dispatch.example.com/ws")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("CLEARTEXT"), "got: {err}");
-        assert!(
-            err.contains("wss://dispatch.example.com/ws"),
-            "must name the fix: {err}"
-        );
-    }
-
-    #[test]
-    fn non_ws_schemes_are_refused_with_the_scheme_named() {
-        let err = validate_dispatch_url("http://example.com/ws")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("http"), "got: {err}");
-        assert!(validate_dispatch_url("not a url at all").is_err());
-    }
 
     // Step 3a: token shape validation. Never echoes the token.
     pub(super) fn jwt_with(payload_json: &str) -> String {

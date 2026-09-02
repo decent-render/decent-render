@@ -90,7 +90,7 @@ export default function App() {
 	const [status, setStatus] = useState<SupervisorStatus | null>(null);
 	const [logs, setLogs] = useState<LogLine[]>([]);
 	const [config, setConfig] = useState<AppConfig | null>(null);
-	const [dispatchUrl, setDispatchUrl] = useState('ws://localhost:8790/ws');
+	const [dispatchUrl, setDispatchUrl] = useState('wss://decent-render-dispatch.fly.dev/ws');
 	const [token, setToken] = useState('');
 	const [allowRealJobs, setAllowRealJobs] = useState(false);
 	const [connecting, setConnecting] = useState(false);
@@ -208,7 +208,7 @@ export default function App() {
 						value={dispatchUrl}
 						onChange={(e) => setDispatchUrl(e.target.value)}
 						disabled={isConnected}
-						placeholder="ws://localhost:8790/ws"
+						placeholder="wss://decent-render-dispatch.fly.dev/ws"
 					/>
 				</div>
 				<div className="form-row">
