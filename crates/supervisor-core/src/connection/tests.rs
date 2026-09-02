@@ -2919,19 +2919,23 @@ async fn next_non_heartbeat(ws: &mut WebSocketStream<TcpStream>) -> serde_json::
 #[cfg(unix)]
 #[tokio::test]
 async fn late_attempt1_terminal_frame_leaves_attempt2_in_flight() {
-    let root = test_worker_root();
     let pid = std::process::id();
     let job_id = format!("job-attempt-guard-{pid}");
     let sha1 = format!("test-attempt1-{pid}");
     let sha2 = format!("test-attempt2-{pid}");
 
-    // Attempt 1's runner: survives TERM, emits nothing, dies at KILL.
+    // Attempt 1's runner: survives TERM, emits nothing, dies at KILL. It
+    // touches `armed` AFTER installing the trap so the test can wait for
+    // the trap to be live before cancelling — a TERM that lands before the
+    // trap would end attempt 1 instantly and the frame would not be late.
+    let armed = std::env::temp_dir().join(format!("decent-attempt-guard-{pid}.armed"));
+    let _ = std::fs::remove_file(&armed);
     let payload1 = seed_fake_payload(
         &sha1,
-        r#"#!/bin/sh
-trap '' TERM
-while true; do sleep 5; done
-"#,
+        &format!(
+            "#!/bin/sh\ntrap '' TERM\n: > {armed:?}\nwhile true; do sleep 5; done\n",
+            armed = armed.display().to_string()
+        ),
     );
     // Attempt 2's runner: same silence, but honors TERM so the test's
     // final drain is instant.
@@ -2982,10 +2986,17 @@ while true; do sleep 5; done
     assert_eq!(accepted1["type"], "jobAccepted");
     assert_eq!(accepted1["attempt"], 1);
 
-    // Give the runner's interpreter time to install its TERM trap: if the
-    // cancel's TERM arrived first, attempt 1 would die instantly and the
-    // late-frame ordering below could not materialize.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait until attempt 1's TERM trap is live (the runner touches `armed`
+    // right after installing it): only then is the cancel's TERM ignored
+    // and the terminal frame guaranteed to arrive LATE, at the grace KILL.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !armed.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "attempt 1's runner never armed its TERM trap"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     // Dispatch cancels J (records (J, Some(1)) as the awaited terminal)…
     ws.send(Message::Text(Utf8Bytes::from(format!(
@@ -3019,6 +3030,15 @@ while true; do sleep 5; done
     .await
     .expect("attempt 1's terminal frame never processed")
     .expect("status channel closed");
+    // The status pane must still show attempt 2, not idle-while-rendering.
+    assert!(
+        status_rx
+            .borrow()
+            .current_job
+            .as_ref()
+            .is_some_and(|j| j.id == job_id),
+        "status went idle while attempt 2 renders"
+    );
 
     // THE CONTRACT: attempt 2 must still be in flight — a third jobAssign is
     // rejected busy, not accepted onto an idle-looking node.
@@ -3038,14 +3058,7 @@ while true; do sleep 5; done
     ws.close(None).await.ok();
     while let Some(Ok(_)) = ws.next().await {}
     client.await.unwrap().expect("clean exit");
-    let _ = root;
-    let _ = (&payload1, &payload2);
-    let _ = std::fs::remove_dir_all(payload_dir_of(&sha1));
-    let _ = std::fs::remove_dir_all(payload_dir_of(&sha2));
-}
-
-/// Payload dir for a sha seeded by [`seed_fake_payload`] (cleanup helper).
-#[cfg(unix)]
-fn payload_dir_of(sha: &str) -> std::path::PathBuf {
-    test_worker_root().join("payloads").join(sha)
+    std::fs::remove_dir_all(&payload1).ok();
+    std::fs::remove_dir_all(&payload2).ok();
+    let _ = std::fs::remove_file(&armed);
 }

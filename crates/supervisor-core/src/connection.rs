@@ -187,13 +187,6 @@ enum Disconnect {
     Clean,
 }
 
-/// One connect-serve-disconnect session, ending in a [`Disconnect`].
-///
-/// All in-flight-job draining semantics live here and are unchanged from the
-/// packet-5 era: whichever way the socket dies, the session does not return
-/// until the render tree is dead and the workdir purged.
-///
-/// `run()` (below) calls this in a loop when `config.reconnect` is set.
 /// C-4 (audit T-15): does this terminal frame belong to the in-flight job?
 /// Both the job id AND the attempt must match — dispatch requeues a failed
 /// or refunded job as attempt+1 of the SAME job id, so a terminal frame for
@@ -216,6 +209,13 @@ fn frame_is_for(
     }
 }
 
+/// One connect-serve-disconnect session, ending in a [`Disconnect`].
+///
+/// All in-flight-job draining semantics live here and are unchanged from the
+/// packet-5 era: whichever way the socket dies, the session does not return
+/// until the render tree is dead and the workdir purged.
+///
+/// `run()` (below) calls this in a loop when `config.reconnect` is set.
 async fn run_session(
     config: &ConnectionConfig,
     request: &tokio_tungstenite::tungstenite::handshake::client::Request,
@@ -706,9 +706,14 @@ async fn run_session(
                         job_id = job_id,
                         "render terminal frame after cancel — suppressing {what}"
                     );
+                    // C-4: the status pane clears only when nothing is in
+                    // flight. If dispatch already re-assigned this job id
+                    // as the next attempt, `current_job` IS that attempt —
+                    // the suppressed frame belongs to the torn-down one.
+                    let idle = in_flight.is_none();
                     obs.update_status(|s| {
                         s.jobs_canceled += 1;
-                        if s.current_job.as_ref().is_some_and(|j| j.id == job_id) {
+                        if idle && s.current_job.as_ref().is_some_and(|j| j.id == job_id) {
                             s.current_job = None;
                         }
                     });
