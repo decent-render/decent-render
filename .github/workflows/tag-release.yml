@@ -1,0 +1,79 @@
+# Tag a decent release from CI — run it, approve it, done. Replaces the
+# local `git tag -a … && git push origin vX.Y.Z` ritual with the same
+# safety: nothing here runs on a push; a human starts it, the `release`
+# environment holds it for a required reviewer, and the gate below refuses
+# a version that does not match bins/decent/Cargo.toml or lacks a dated
+# CHANGELOG section. The tag push then triggers release.yml (cargo-dist)
+# exactly as a manual push would.
+#
+# Why a PAT: tags pushed with the built-in GITHUB_TOKEN do not trigger other
+# workflows, so release.yml would never run. One-time setup (Ray): a
+# fine-grained token, repository decent-render/decent-render, permission
+# Contents: read+write, stored as the repo secret RELEASE_TAG_TOKEN —
+#   gh secret set RELEASE_TAG_TOKEN --repo decent-render/decent-render
+#
+# Run it:  gh workflow run "Tag release" --repo decent-render/decent-render -f version=0.0.11
+#          (approve in the Actions tab, then) gh run watch --repo decent-render/decent-render
+name: Tag release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag, without the v (must equal bins/decent/Cargo.toml)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: gate + annotated tag (approval required)
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 10
+    steps:
+      - name: Refuse without the tagging token
+        run: |
+          if [ -z "${RELEASE_TAG_TOKEN:-}" ]; then
+            echo "::error::RELEASE_TAG_TOKEN is not set — see the header of this workflow"; exit 1
+          fi
+        env:
+          RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TAG_TOKEN }}
+
+      - name: Gate — version, changelog, tag not taken
+        run: |
+          v="${{ inputs.version }}"
+          case "$v" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version must look like X.Y.Z (got '$v')"; exit 1 ;;
+          esac
+          cargo_v=$(sed -n 's/^version = "\([^"]*\)"/\1/p' bins/decent/Cargo.toml | head -1)
+          if [ "$cargo_v" != "$v" ]; then
+            echo "::error::bins/decent/Cargo.toml is $cargo_v, not $v — land the bump on main first"; exit 1
+          fi
+          GITHUB_REF="refs/tags/v$v" ./scripts/check-release-consistency.sh
+          if git rev-parse -q --verify "refs/tags/v$v" >/dev/null || git ls-remote --exit-code --tags origin "v$v" >/dev/null 2>&1; then
+            echo "::error::tag v$v already exists"; exit 1
+          fi
+          echo "gate: OK — tagging v$v at $(git rev-parse --short HEAD)"
+
+      - name: Create and push the annotated tag
+        run: |
+          v="${{ inputs.version }}"
+          git config user.name "decent-release-bot"
+          git config user.email "release@decent-render.farm"
+          git tag -a "v$v" -m "decent $v (tagged by ${{ github.actor }} via Tag release workflow)"
+          git push origin "v$v"
+          echo "pushed v$v — release.yml (cargo-dist) takes it from here:"
+          echo "  gh run list --repo decent-render/decent-render --workflow release.yml --limit 1"

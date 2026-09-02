@@ -22,10 +22,17 @@ and downloaded binary all agree.
 0. `./scripts/check-release-consistency.sh` must print OK: the Cargo.toml
    version has a dated CHANGELOG section (CI enforces this on main and on
    the tag push; v0.0.10 shipped without one, which is why).
-1. Create an annotated tag: `git tag -a vX.Y.Z -m "decent vX.Y.Z"`.
-2. Push the release commit, then the single tag.
-3. Watch the `Release` cargo-dist workflow to completion.
-4. Do not manually upload a partial substitute if the workflow stalls or fails.
+1. Tag from CI (preferred): `gh workflow run "Tag release" --repo
+   decent-render/decent-render -f version=X.Y.Z`, approve it in the Actions
+   tab (the `release` environment requires a reviewer). The job re-runs
+   the consistency gate, refuses a version that is not on `main`'s
+   Cargo.toml or already tagged, and pushes the annotated tag with
+   `RELEASE_TAG_TOKEN` (a fine-grained PAT, Contents read+write on this
+   repo — the built-in token cannot trigger release.yml). By hand instead:
+   `git tag -a vX.Y.Z -m "decent vX.Y.Z" && git push origin vX.Y.Z`.
+2. Watch the `Release` cargo-dist workflow to completion:
+   `gh run watch --repo decent-render/decent-render`.
+3. Do not manually upload a partial substitute if the workflow stalls or fails.
    Fix the workflow/runner problem and rerun it.
 
 ### 3. Verify the release
