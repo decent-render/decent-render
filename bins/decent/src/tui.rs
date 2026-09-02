@@ -570,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn title_bar_update_text_matches_decent_status() {
+    fn update_text_matches_decent_status() {
         let logs = VecDeque::new();
         let registered = screen(100, 30, &registered_idle(), &logs);
         assert!(registered.contains("up to date"), "{registered}");
