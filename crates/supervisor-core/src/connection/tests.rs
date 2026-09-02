@@ -69,6 +69,16 @@ use tokio_tungstenite::WebSocketStream;
 /// Create a shutdown receiver that never fires (tests use heartbeat_limit
 /// or server close for clean exit instead). mem::forget the sender so the
 /// oneshot never resolves to Err(Closed).
+/// Deletes a test's scratch file when the test ends — pass or fail. Three
+/// group-kill tests wrote `<tmp>/<job>.gc-pid` and never removed it: 1,070
+/// stale files after a day of cargo runs (2026-09-02).
+struct RemoveOnDrop(std::path::PathBuf);
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn never_shutdown() -> oneshot::Receiver<()> {
     let (tx, rx) = oneshot::channel();
     std::mem::forget(tx);
@@ -1540,6 +1550,7 @@ async fn cancel_kills_the_runners_whole_process_group() {
     let gc_script = grandchild_script_evidence(&marker.to_string_lossy());
     let pid_file = std::env::temp_dir().join(format!("{job_id}.gc-pid"));
     let _ = std::fs::remove_file(&pid_file);
+    let _pid_file_cleanup = RemoveOnDrop(pid_file.clone());
     let payload_dir = seed_fake_payload(
         &sha,
         &group_kill_payload(
@@ -1650,6 +1661,7 @@ async fn cancel_escalates_to_group_sigkill_when_term_is_ignored() {
     ));
     let pid_file = std::env::temp_dir().join(format!("{job_id}.gc-pid"));
     let _ = std::fs::remove_file(&pid_file);
+    let _pid_file_cleanup = RemoveOnDrop(pid_file.clone());
     let payload_dir = seed_fake_payload(
         &sha,
         &group_kill_payload(
@@ -2766,6 +2778,7 @@ async fn error_event_terminates_child_tree_before_purge() {
     let gc_script = grandchild_script_evidence(&marker.to_string_lossy());
     let pid_file = std::env::temp_dir().join(format!("{job_id}.gc-pid"));
     let _ = std::fs::remove_file(&pid_file);
+    let _pid_file_cleanup = RemoveOnDrop(pid_file.clone());
     let payload_dir = seed_fake_payload(
         &sha,
         &group_kill_payload(
