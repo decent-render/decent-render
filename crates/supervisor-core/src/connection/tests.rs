@@ -2883,3 +2883,169 @@ fn frame_is_for_matches_id_and_attempt_pairs() {
     assert!(!frame_is_for(None, "job", Some(1)));
     assert!(!frame_is_for(None, "job", None));
 }
+
+// ── C-4 acceptance: a late attempt-1 terminal frame leaves attempt 2 in flight ──
+
+/// The backlog's acceptance scenario, through the real loop in ONE session
+/// (drain-in-place, no socket drop needed):
+///
+/// 1. attempt 1 of job J is assigned; its runner ignores TERM (so its
+///    teardown runs the full grace) and emits nothing.
+/// 2. dispatch cancels J → the job moves to `draining`, `canceled_job`
+///    records (J, Some(1)).
+/// 3. dispatch re-assigns J as attempt 2 (normal: failure/refund requeue) →
+///    accepted, `in_flight = (J, Some(2))`.
+/// 4. at grace end the KILL lands and attempt 1's LATE jobFailed arrives.
+///    The guard must NOT clear in_flight: attempt 2 is still rendering, so
+///    a third jobAssign is rejected `busy`.
+///
+/// Deterministic ordering: the late frame fires at the CANCEL_GRACE deadline
+/// (a 10 s constant), while the attempt-2 assign was processed within
+/// milliseconds of the cancel. The test waits for the suppressed frame via
+/// `jobs_canceled` before sending the third assign.
+/// Read the next NON-heartbeat frame: long_config's 50 ms heartbeat
+/// interleaves outbound heartbeats between the frames the test cares about.
+#[cfg(unix)]
+async fn next_non_heartbeat(ws: &mut WebSocketStream<TcpStream>) -> serde_json::Value {
+    loop {
+        let v: serde_json::Value = serde_json::from_str(&next_text(ws).await).unwrap();
+        if v["type"] == "heartbeat" {
+            continue;
+        }
+        return v;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn late_attempt1_terminal_frame_leaves_attempt2_in_flight() {
+    let root = test_worker_root();
+    let pid = std::process::id();
+    let job_id = format!("job-attempt-guard-{pid}");
+    let sha1 = format!("test-attempt1-{pid}");
+    let sha2 = format!("test-attempt2-{pid}");
+
+    // Attempt 1's runner: survives TERM, emits nothing, dies at KILL.
+    let payload1 = seed_fake_payload(
+        &sha1,
+        r#"#!/bin/sh
+trap '' TERM
+while true; do sleep 5; done
+"#,
+    );
+    // Attempt 2's runner: same silence, but honors TERM so the test's
+    // final drain is instant.
+    let payload2 = seed_fake_payload(
+        &sha2,
+        r#"#!/bin/sh
+while true; do sleep 5; done
+"#,
+    );
+
+    let assign_with_attempt = |job_id: &str, sha: &str, attempt: u32| {
+        format!(
+            r#"{{"type":"jobAssign","tenant":"driffs","jobId":"{job_id}","attempt":{attempt},"kind":"standard","durationFrames":1,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"{sha}","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}}"#
+        )
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = long_config(port);
+    let register = test_register();
+    let (obs, mut status_rx, _log_rx) =
+        Observability::channels(crate::status::SupervisorStatus::default());
+    obs.set_allow_real_jobs(true);
+
+    let obs2 = obs.clone();
+    let client =
+        tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+    let (mut ws, _) = accept_ws(&listener).await;
+    let _register = next_text(&mut ws).await;
+
+    // Attempt 1 assigned and rendering.
+    ws.send(Message::Text(Utf8Bytes::from(assign_with_attempt(
+        &job_id, &sha1, 1,
+    ))))
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        status_rx.wait_for(|s| s.current_job.as_ref().is_some_and(|j| j.id == job_id)),
+    )
+    .await
+    .expect("attempt 1 never started")
+    .expect("status channel closed");
+    // Consume attempt 1's jobAccepted so the stream is positioned for
+    // attempt 2's.
+    let accepted1: serde_json::Value = next_non_heartbeat(&mut ws).await;
+    assert_eq!(accepted1["type"], "jobAccepted");
+    assert_eq!(accepted1["attempt"], 1);
+
+    // Give the runner's interpreter time to install its TERM trap: if the
+    // cancel's TERM arrived first, attempt 1 would die instantly and the
+    // late-frame ordering below could not materialize.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Dispatch cancels J (records (J, Some(1)) as the awaited terminal)…
+    ws.send(Message::Text(Utf8Bytes::from(format!(
+        r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+    ))))
+    .await
+    .unwrap();
+    // …then re-assigns the SAME job id as attempt 2 (accepted: the canceled
+    // attempt-1 job is draining, not in flight).
+    ws.send(Message::Text(Utf8Bytes::from(assign_with_attempt(
+        &job_id, &sha2, 2,
+    ))))
+    .await
+    .unwrap();
+    let accepted: serde_json::Value = next_non_heartbeat(&mut ws).await;
+    assert_eq!(
+        accepted["type"], "jobAccepted",
+        "attempt 2 must be accepted"
+    );
+    assert_eq!(accepted["attempt"], 2);
+
+    // The grace KILL lands: attempt 1's late jobFailed arrives and is
+    // suppressed (it IS the cancel's expected outcome). When jobs_canceled
+    // ticks, the late frame has been processed by the guard.
+    // Fires when the grace KILL lands (~CANCEL_GRACE after the cancel): the
+    // suppressed jobFailed IS the late attempt-1 frame this test is about.
+    tokio::time::timeout(
+        Duration::from_secs(25),
+        status_rx.wait_for(|s| s.jobs_canceled == 1),
+    )
+    .await
+    .expect("attempt 1's terminal frame never processed")
+    .expect("status channel closed");
+
+    // THE CONTRACT: attempt 2 must still be in flight — a third jobAssign is
+    // rejected busy, not accepted onto an idle-looking node.
+    ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+        "job-guard-third",
+        &sha2,
+    ))))
+    .await
+    .unwrap();
+    let third: serde_json::Value = next_non_heartbeat(&mut ws).await;
+    assert_eq!(
+        third["type"], "jobRejected",
+        "a third jobAssign must be rejected busy while attempt 2 renders; got {third}"
+    );
+    assert_eq!(third["reason"], "busy");
+
+    ws.close(None).await.ok();
+    while let Some(Ok(_)) = ws.next().await {}
+    client.await.unwrap().expect("clean exit");
+    let _ = root;
+    let _ = (&payload1, &payload2);
+    let _ = std::fs::remove_dir_all(payload_dir_of(&sha1));
+    let _ = std::fs::remove_dir_all(payload_dir_of(&sha2));
+}
+
+/// Payload dir for a sha seeded by [`seed_fake_payload`] (cleanup helper).
+#[cfg(unix)]
+fn payload_dir_of(sha: &str) -> std::path::PathBuf {
+    test_worker_root().join("payloads").join(sha)
+}
