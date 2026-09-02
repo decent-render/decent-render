@@ -113,24 +113,57 @@ pub struct WorkDir {
 impl WorkDir {
     /// Create a fresh, unique working directory under the OS temp dir,
     /// e.g. `/tmp/job-spike-1-1719999999-0`.
+    ///
+    /// The directory is created EXCLUSIVELY and owner-only (0700 on unix).
+    /// `/tmp` is shared on Linux: a `create_dir_all` would happily adopt a
+    /// directory (or a symlink to one) another local user planted under a
+    /// guessable name, and the default umask would leave the tenant's bundle
+    /// and rendered output world-readable. Neither may happen; a name that
+    /// is already taken is skipped, never reused.
     pub fn new(prefix: &str) -> std::io::Result<Self> {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{pid}-{nanos}-{unique}",
-            pid = std::process::id()
-        ));
-        std::fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        const ATTEMPTS: u32 = 8;
+        for _ in 0..ATTEMPTS {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "{prefix}-{pid}-{nanos}-{unique}",
+                pid = std::process::id()
+            ));
+            match create_private_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "no free job workdir name under {} after {ATTEMPTS} attempts",
+                std::env::temp_dir().display()
+            ),
+        ))
     }
 
     /// The directory path. Valid until the guard is dropped.
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Create exactly `path` — no parents, no adoption of an existing entry — and
+/// on unix make it owner-only. `DirBuilder::create` fails with
+/// `AlreadyExists` when anything (directory, file, symlink) is already there.
+pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 impl Drop for WorkDir {
@@ -385,4 +418,72 @@ mod tests {
     fn set_readonly(_p: &Path) {}
     #[cfg(not(unix))]
     fn clear_readonly(_p: &Path) {}
+}
+
+#[cfg(test)]
+mod private_workdir_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_job_workdir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let wd = WorkDir::new("p74-mode").unwrap();
+        let mode = std::fs::metadata(wd.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "job workdir must be 0700, got {mode:o}");
+    }
+
+    #[test]
+    fn a_planted_entry_is_never_adopted() {
+        let base = std::env::temp_dir().join(format!(
+            "p74-planted-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        // An existing directory, and an existing FILE, both refuse.
+        let err = create_private_dir(&base).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        let file = base.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let err = create_private_dir(&file).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // Nothing inside `base` was touched.
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_is_never_followed() {
+        let base = std::env::temp_dir().join(format!(
+            "p74-symlink-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("victim");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = create_private_dir(&link).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn workdirs_still_come_out_distinct_and_are_purged_on_drop() {
+        let a = WorkDir::new("p74-distinct").unwrap();
+        let b = WorkDir::new("p74-distinct").unwrap();
+        assert_ne!(a.path(), b.path());
+        let pa = a.path().to_path_buf();
+        drop(a);
+        assert!(!pa.exists());
+    }
 }

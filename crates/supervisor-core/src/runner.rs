@@ -234,6 +234,14 @@ async fn ensure_artifact(
         .ok_or_else(|| anyhow!("{kind} dir has no parent"))?
         .to_path_buf();
     tokio::fs::create_dir_all(&parent).await?;
+    // The node's state root is owner-only: it holds every payload and
+    // browser this node renders with, and nothing but this user's supervisor
+    // has business reading or replacing them.
+    #[cfg(unix)]
+    if let Ok(root) = worker_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+    }
     let tmp = parent.join(format!(".{sha256}-download"));
     if tmp.exists() {
         tokio::fs::remove_dir_all(&tmp).await.ok();
