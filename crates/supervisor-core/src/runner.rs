@@ -1640,6 +1640,7 @@ env
         // runs first sets it, the other reuses it. Distinguish entries by
         // the claimed sha (unique per test).
         let root = unique_worker_root("dl");
+        let _root_cleanup = crate::tests_support::RemoveDirOnDrop(root.clone());
         set_worker_root_for_tests(root.clone());
         let tarball = make_payload_tarball(b"#!/bin/sh\necho runner\n");
         let claimed_sha = sha256_hex(b"not-the-tarball");
@@ -1672,6 +1673,7 @@ env
     #[tokio::test]
     async fn sha_match_downloads_are_cached() {
         let root = unique_worker_root("dl");
+        let _root_cleanup = crate::tests_support::RemoveDirOnDrop(root.clone());
         set_worker_root_for_tests(root.clone());
         let tarball = make_payload_tarball(b"#!/bin/sh\necho runner\n");
         let sha = sha256_hex(&tarball);

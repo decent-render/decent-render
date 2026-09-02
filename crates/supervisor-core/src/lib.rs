@@ -27,4 +27,8 @@ pub mod purge;
 pub mod runner;
 pub mod status;
 pub mod sweep;
+
+/// Test-only cleanup guards (BACKLOG N-24). Compiled only for tests.
+#[cfg(test)]
+pub(crate) mod tests_support;
 pub mod worker_token;

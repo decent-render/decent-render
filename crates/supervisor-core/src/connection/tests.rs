@@ -62,6 +62,7 @@ async fn an_http_401_at_connect_is_an_auth_failure_not_unreachable() {
 
 use super::*;
 use crate::protocol::{Capabilities, Platform, PROTOCOL_VERSION};
+use crate::tests_support::RemoveOnDrop;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::WebSocketStream;
@@ -72,12 +73,6 @@ use tokio_tungstenite::WebSocketStream;
 /// Deletes a test's scratch file when the test ends — pass or fail. Three
 /// group-kill tests wrote `<tmp>/<job>.gc-pid` and never removed it: 1,070
 /// stale files after a day of cargo runs (2026-09-02).
-struct RemoveOnDrop(std::path::PathBuf);
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 
 fn never_shutdown() -> oneshot::Receiver<()> {
     let (tx, rx) = oneshot::channel();
@@ -1514,10 +1509,13 @@ fn grandchild_script_evidence(marker: &str) -> std::path::PathBuf {
 /// only the group SIGKILL escalation can stop it. Dies on its own after
 /// 120s so a broken test cannot leak it forever.
 #[cfg(unix)]
-fn grandchild_script_immune() -> std::path::PathBuf {
+fn grandchild_script_immune(tag: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let started = std::env::temp_dir().join(format!("decent-gc-im-{}.started", std::process::id()));
-    let path = std::env::temp_dir().join(format!("decent-gc-im-{}.sh", std::process::id()));
+    // The tag makes the paths unique per caller: two tests must not share
+    // (and delete under each other) the same stand-in script/marker.
+    let started =
+        std::env::temp_dir().join(format!("decent-gc-im-{tag}-{}.started", std::process::id()));
+    let path = std::env::temp_dir().join(format!("decent-gc-im-{tag}-{}.sh", std::process::id()));
     let _ = std::fs::remove_file(&started);
     std::fs::write(
         &path,
@@ -1653,7 +1651,7 @@ async fn cancel_escalates_to_group_sigkill_when_term_is_ignored() {
     let pid = std::process::id();
     let sha = format!("test-group-escalate-{pid}");
     let job_id = format!("job-group-escalate-{pid}");
-    let gc_script = grandchild_script_immune();
+    let gc_script = grandchild_script_immune("escalate");
     // The immune stand-in touches this marker once its traps are installed.
     let started_marker = std::env::temp_dir().join(format!(
         "decent-gc-im-{pid}.started",
