@@ -19,6 +19,9 @@ and downloaded binary all agree.
 
 ### 2. Tag and publish
 
+0. `./scripts/check-release-consistency.sh` must print OK: the Cargo.toml
+   version has a dated CHANGELOG section (CI enforces this on main and on
+   the tag push; v0.0.10 shipped without one, which is why).
 1. Create an annotated tag: `git tag -a vX.Y.Z -m "decent vX.Y.Z"`.
 2. Push the release commit, then the single tag.
 3. Watch the `Release` cargo-dist workflow to completion.
@@ -47,14 +50,39 @@ decent --help
 decent status
 ```
 
-Finally update the Homebrew formula and verify `brew upgrade decent` on an
-Apple Silicon machine. The formula version, URL, and SHA-256 must match the
-GitHub Release.
-
 cargo-dist auto-generates and pushes `Formula/decent.rb` to the tap on tag
-(configured in `dist-workspace.toml` `[dist.homebrew]`). The deprecated
+(configured in `dist-workspace.toml` `[dist.homebrew]`). The formula version,
+URL, and SHA-256 must match the GitHub Release. The deprecated
 `Formula/decent-node.rb` (compatibility shim) is maintained by the
 `update-homebrew-shim.yml` workflow, which runs on release completion.
+
+### 4. The rehearsal — run it on real nodes, every release
+
+The first real run of v0.0.10 (2026-09-02) found three bugs that every
+unit test had passed: the update frame no node could parse (N-27),
+`decent upgrade` claiming success on a brew no-op (N-28), and a stale daemon
+reported as an available update (N-29). This sequence is what found them.
+Keep at least one node on the PREVIOUS version until step 3 is done.
+
+1. **Dispatch knows.** Within ~15 min of the tap change (or right after a
+   dispatch deploy):
+   ```sh
+   curl -s https://decent-render-dispatch.fly.dev/health/version
+   ```
+   must show `"supervisorLatest":"X.Y.Z"`.
+2. **A still-old node sees the banner.** On a node running the previous
+   version, `decent status` must print `⚠ X.Y.Z available — run
+   \`decent upgrade\``. If it says "up to date" or "unknown", read
+   `decent logs -n 50` for `unparseable frame from server` before doing
+   anything else — that is the frame contract breaking.
+3. **`decent upgrade` on that node.** It must print `Upgraded decent
+   A.B.C → X.Y.Z` (not "Already on"), restart the daemon, and then
+   `decent doctor` must be all OK — in particular the `version` line must
+   NOT say "daemon still running A.B.C".
+4. **One real render** on an upgraded node (a driffs job or the local e2e
+   rig in `scripts/e2e/`), then `decent status` shows `1 done`.
+5. Only now: upgrade the remaining nodes; drop any "(from X.Y.Z)" markers
+   in the farm-web quickstart.
 
 ### `HOMEBREW_TAP_TOKEN` — what it must be (learned the hard way, v0.0.9)
 

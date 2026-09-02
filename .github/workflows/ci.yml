@@ -7,6 +7,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -20,6 +21,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      # Release consistency (2026-09-02, v0.0.10 shipped without a CHANGELOG
+      # section): the Cargo.toml version must have a dated CHANGELOG section,
+      # and on a tag push the tag must equal it. Cannot live in release.yml —
+      # cargo-dist's custom plan jobs do not block `host`.
+      - run: ./scripts/check-release-consistency.sh
       - run: cargo fmt --all -- --check
       # PACKET 40 (audit / AGENTS.md invariant 6): gate the whole workspace
       # EXCEPT the Tauri crate. The old -p supervisor-core -p decent scope
