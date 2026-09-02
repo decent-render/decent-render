@@ -8,6 +8,55 @@ The format follows Keep a Changelog and semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`decent upgrade` claimed success on a no-op and restarted the daemon
+  for nothing.** It ran `brew upgrade decent` without refreshing the tap, so
+  on a node where brew's 24-hour auto-update had not fired it saw the old
+  formula, printed "Upgraded decent via Homebrew" and kicked the daemon
+  (which would have killed an in-flight render) while the binary stayed on
+  the old version. It now pulls the `decent-render/tap` checkout first,
+  compares the formula's version with the running one, and treats only a
+  CHANGED on-disk binary as success: "Already on X — nothing to upgrade"
+  (no restart) when current, and an error naming the channel version and
+  the installed one when brew delivered nothing.
+
+## [0.0.10] - 2026-09-02
+
+Operator tooling, a locked-down runner environment, and owner-only files.
+
+### Added
+
+- **`decent doctor`** — one-screen health check: token shape, expiry and
+  file modes, daemon, status freshness, dispatch reachability, free disk on
+  the worker root, version. Exits 1 if any check FAILED.
+- **`decent logs`** — the daemon log, last 50 lines by default (`-n`),
+  `-f` to follow.
+- `decent status` prints the log path and a `decent doctor` hint when
+  something needs attention; the TUI footer shows the update sentence.
+
+### Changed
+
+- **The render runner child starts from an allowlisted environment**
+  (`PATH`, `HOME`, `TMPDIR`, locale, TLS/proxy variables and the
+  `DECENT_`/`REMOTION_`/`CHROME_`/`PUPPETEER_` prefixes) instead of
+  inheriting the daemon's — a tenant bundle cannot read whatever else was
+  in the operator's session.
+- Job working directories are created exclusively with mode 0700; the
+  worker root and the daemon log are owner-only (`decent install` tightens
+  an existing 0644 log).
+- The daemon log file no longer contains ANSI escape codes.
+- The Tauri console defaults to the production `wss://` dispatch URL and
+  refuses malformed tokens and non-TLS URLs off localhost, using the same
+  checks as the CLI.
+
+### Fixed
+
+- `decent status` never said "up to date": it compared the snapshot's
+  connection state to the wrong word, so a healthy node printed "unknown
+  (daemon not connected)".
+
+
 ## [0.0.9] - 2026-08-26
 
 The first-run release: a fresh `brew install` now reaches the real farm,

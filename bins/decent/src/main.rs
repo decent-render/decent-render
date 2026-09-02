@@ -478,22 +478,115 @@ fn detect_ram_gb() -> u32 {
 /// Linux has no equivalent: the supported channel is the shell installer
 /// cargo-dist publishes with every release, which is idempotent and installs
 /// the latest version, so re-running it IS the upgrade.
-fn upgrade_binary() -> anyhow::Result<()> {
+/// What `decent upgrade` found after the package manager returned.
+#[derive(Debug, PartialEq, Eq)]
+enum UpgradeOutcome {
+    /// The on-disk binary is already the latest the channel offers.
+    AlreadyCurrent(String),
+    /// The on-disk binary changed from `from` to `to` — restart the daemon.
+    Upgraded { from: String, to: String },
+}
+
+/// `x.y.z` from the `decent --version` line (`decent 0.0.10`) or a
+/// `rust-0.0.10` supervisor version. None when there is no version in it.
+fn parse_version_word(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|w| w.trim_start_matches("rust-").trim_start_matches('v'))
+        .find(|w| {
+            let mut parts = w.split('.');
+            (0..3).all(|_| {
+                parts
+                    .next()
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            }) && parts.next().is_none()
+        })
+        .map(str::to_string)
+}
+
+/// The version a Homebrew formula file pins (`  version "0.0.10"`).
+fn parse_formula_version(formula: &str) -> Option<String> {
+    formula.lines().find_map(|l| {
+        let l = l.trim_start();
+        let rest = l.strip_prefix("version")?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        let v = rest.split('"').next()?;
+        parse_version_word(v)
+    })
+}
+
+/// N-28 (2026-09-02): the decision AFTER the package manager ran. `before`
+/// is the running binary's version, `after` what is on disk now, `latest`
+/// what the channel advertised (None when unknown). "Success" is a
+/// CHANGED binary — never the package manager's exit code: `brew upgrade`
+/// exits 0 on "already installed", and the old code printed "Upgraded"
+/// and kicked the daemon (killing any in-flight render) for nothing.
+fn upgrade_outcome(
+    before: &str,
+    after: Option<&str>,
+    latest: Option<&str>,
+) -> anyhow::Result<UpgradeOutcome> {
+    match after {
+        Some(after) if after != before => Ok(UpgradeOutcome::Upgraded {
+            from: before.to_string(),
+            to: after.to_string(),
+        }),
+        _ => match latest {
+            Some(latest) if latest != before => anyhow::bail!(
+                "The channel offers {latest} but the installed binary is still {before}. \
+                 Run `brew update && brew upgrade decent` and check `decent --version`."
+            ),
+            _ => Ok(UpgradeOutcome::AlreadyCurrent(before.to_string())),
+        },
+    }
+}
+
+/// Version of the binary the NEXT `decent` invocation will run. On macOS
+/// that is Homebrew's opt link (`brew --prefix decent`), which follows the
+/// keg swap; `current_exe` would resolve into the OLD keg, which brew
+/// deletes on cleanup. On Linux the installer overwrites in place, so the
+/// current executable path is the right one.
+fn installed_version() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let exe = {
+        let out = std::process::Command::new("brew")
+            .args(["--prefix", "decent"])
+            .output()
+            .ok()?;
+        std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()).join("bin/decent")
+    };
+    #[cfg(not(target_os = "macos"))]
+    let exe = std::env::current_exe().ok()?;
+    let out = std::process::Command::new(exe)
+        .arg("--version")
+        .output()
+        .ok()?;
+    parse_version_word(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn upgrade_binary() -> anyhow::Result<UpgradeOutcome> {
+    let before = env!("CARGO_PKG_VERSION").to_string();
     #[cfg(target_os = "macos")]
     {
+        // N-28: `brew upgrade` only sees a new formula after the tap is
+        // refreshed, and brew's auto-update is on a 24 h clock — on a node
+        // that had run brew recently, "decent upgrade" was a no-op that
+        // claimed success. Pull our tap (fast, ~1 s); fall back to a full
+        // `brew update` if the tap is not a git checkout for some reason.
+        let latest = refresh_homebrew_tap();
+        if latest.as_deref() == Some(before.as_str()) {
+            return Ok(UpgradeOutcome::AlreadyCurrent(before));
+        }
         match std::process::Command::new("brew")
             .args(["upgrade", "decent"])
             .status()
         {
-            Ok(s) if s.success() => {
-                println!("Upgraded decent via Homebrew.");
-                Ok(())
-            }
+            Ok(s) if s.success() => {}
             Ok(s) => anyhow::bail!("`brew upgrade decent` failed (exit {:?})", s.code()),
             Err(_) => anyhow::bail!(
                 "Could not run `brew` — is Homebrew installed? Upgrade manually and restart."
             ),
         }
+        upgrade_outcome(&before, installed_version().as_deref(), latest.as_deref())
     }
     #[cfg(target_os = "linux")]
     {
@@ -506,10 +599,7 @@ fn upgrade_binary() -> anyhow::Result<()> {
             .arg(format!("curl -LsSf {INSTALLER} | sh"))
             .status();
         match status {
-            Ok(s) if s.success() => {
-                println!("Upgraded decent via the release installer.");
-                Ok(())
-            }
+            Ok(s) if s.success() => {}
             Ok(s) => anyhow::bail!(
                 "The release installer failed (exit {:?}). Re-run it manually:\n  \
                  curl -LsSf {INSTALLER} | sh",
@@ -520,11 +610,41 @@ fn upgrade_binary() -> anyhow::Result<()> {
                  curl -LsSf {INSTALLER} | sh"
             ),
         }
+        // The installer always fetches `latest`; the channel version is
+        // whatever it wrote, so `after` doubles as `latest` here.
+        let after = installed_version();
+        upgrade_outcome(&before, after.as_deref(), after.as_deref())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         anyhow::bail!("`decent upgrade` is supported on macOS and Linux only.")
     }
+}
+
+/// Refresh the `decent-render/tap` checkout and return the version its
+/// formula now pins. None when the tap could not be read (the caller then
+/// runs `brew upgrade` blind and verifies the binary afterwards).
+#[cfg(target_os = "macos")]
+fn refresh_homebrew_tap() -> Option<String> {
+    let repo = std::process::Command::new("brew")
+        .args(["--repository", "decent-render/tap"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+    let pulled = std::process::Command::new("git")
+        .args(["-C", &repo, "pull", "--ff-only", "--quiet"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !pulled {
+        // Not a git checkout / offline: let brew do its full update.
+        let _ = std::process::Command::new("brew")
+            .args(["update", "--quiet"])
+            .status();
+    }
+    let formula = std::fs::read_to_string(format!("{repo}/Formula/decent.rb")).ok()?;
+    parse_formula_version(&formula)
 }
 
 /// Resolve the worker token: explicit `--token` / WORKER_TOKEN env wins,
@@ -977,7 +1097,19 @@ async fn main() -> anyhow::Result<()> {
         Command::Upgrade => {
             // 1. Swap the binary on disk. The running `upgrade` process keeps
             //    its old in-memory copy; the NEXT invocation uses the new one.
-            upgrade_binary()?;
+            //    `upgrade_binary` returns only when the on-disk version
+            //    actually CHANGED (N-28: it used to print "Upgraded" and
+            //    restart the daemon on a brew no-op); `AlreadyCurrent` means
+            //    nothing to do — and nothing to restart.
+            match upgrade_binary()? {
+                UpgradeOutcome::AlreadyCurrent(v) => {
+                    println!("Already on {v} — nothing to upgrade.");
+                    return Ok(());
+                }
+                UpgradeOutcome::Upgraded { from, to } => {
+                    println!("Upgraded decent {from} → {to}.");
+                }
+            }
             // 2. Restart the daemon so the supervisor picks up the new binary.
             match service::restart() {
                 Ok(true) => println!("Daemon restarted — new binary loaded."),
@@ -2294,5 +2426,81 @@ mod packet40_tests {
         }
         std::fs::remove_dir_all(&home).ok();
         result.unwrap();
+    }
+}
+
+// ── N-28: `decent upgrade` truthfulness ─────────────────────────────────────
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn parse_version_word_reads_the_cli_banner_and_supervisor_shapes() {
+        assert_eq!(
+            parse_version_word("decent 0.0.10\n").as_deref(),
+            Some("0.0.10")
+        );
+        assert_eq!(parse_version_word("rust-0.0.9").as_deref(), Some("0.0.9"));
+        assert_eq!(parse_version_word("v1.2.34").as_deref(), Some("1.2.34"));
+        assert_eq!(parse_version_word("decent dev"), None);
+        assert_eq!(parse_version_word("0.0"), None);
+        assert_eq!(parse_version_word(""), None);
+    }
+
+    #[test]
+    fn parse_formula_version_reads_the_tap_formula() {
+        let formula = "class Decent < Formula\n  desc \"x\"\n  version \"0.0.10\"\n  on_macos do\n";
+        assert_eq!(parse_formula_version(formula).as_deref(), Some("0.0.10"));
+        assert_eq!(parse_formula_version("class Decent < Formula\n"), None);
+        assert_eq!(parse_formula_version("  version \"garbage\"\n"), None);
+    }
+
+    #[test]
+    fn a_changed_binary_is_an_upgrade_and_restarts() {
+        assert_eq!(
+            upgrade_outcome("0.0.9", Some("0.0.10"), Some("0.0.10")).unwrap(),
+            UpgradeOutcome::Upgraded {
+                from: "0.0.9".into(),
+                to: "0.0.10".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unchanged_binary_with_a_newer_channel_is_an_error_never_success() {
+        // The 2026-09-02 MacBook Air case: tap stale in brew's cache,
+        // `brew upgrade` exit 0 "already installed", binary still 0.0.9.
+        let err = upgrade_outcome("0.0.9", Some("0.0.9"), Some("0.0.10")).unwrap_err();
+        assert!(err.to_string().contains("offers 0.0.10"), "{err}");
+        assert!(err.to_string().contains("still 0.0.9"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("brew update && brew upgrade decent"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_binary_that_matches_the_channel_is_already_current() {
+        assert_eq!(
+            upgrade_outcome("0.0.10", Some("0.0.10"), Some("0.0.10")).unwrap(),
+            UpgradeOutcome::AlreadyCurrent("0.0.10".into())
+        );
+    }
+
+    #[test]
+    fn unknown_after_and_unknown_channel_is_already_current_not_upgraded() {
+        // We could not read the binary or the channel: do not claim an
+        // upgrade happened, and do not restart a daemon for nothing.
+        assert_eq!(
+            upgrade_outcome("0.0.9", None, None).unwrap(),
+            UpgradeOutcome::AlreadyCurrent("0.0.9".into())
+        );
+    }
+
+    #[test]
+    fn unknown_after_with_a_newer_channel_is_an_error() {
+        assert!(upgrade_outcome("0.0.9", None, Some("0.0.10")).is_err());
     }
 }
