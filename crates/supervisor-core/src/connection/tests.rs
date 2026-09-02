@@ -70,10 +70,6 @@ use tokio_tungstenite::WebSocketStream;
 /// Create a shutdown receiver that never fires (tests use heartbeat_limit
 /// or server close for clean exit instead). mem::forget the sender so the
 /// oneshot never resolves to Err(Closed).
-/// Deletes a test's scratch file when the test ends — pass or fail. Three
-/// group-kill tests wrote `<tmp>/<job>.gc-pid` and never removed it: 1,070
-/// stale files after a day of cargo runs (2026-09-02).
-
 fn never_shutdown() -> oneshot::Receiver<()> {
     let (tx, rx) = oneshot::channel();
     std::mem::forget(tx);
@@ -1546,6 +1542,11 @@ async fn cancel_kills_the_runners_whole_process_group() {
     // Evidence traps: the grandchild records that TERM reached IT (not
     // just the runner), then exits so the tree can settle.
     let gc_script = grandchild_script_evidence(&marker.to_string_lossy());
+    // N-24: the evidence script and its .started/.term markers are removed
+    // when the test ends (Drop runs after the assertions below).
+    let _gc_cleanup = RemoveOnDrop(gc_script.clone());
+    let _started_cleanup = RemoveOnDrop(marker.with_extension("started"));
+    let _term_cleanup = RemoveOnDrop(marker.with_extension("term"));
     let pid_file = std::env::temp_dir().join(format!("{job_id}.gc-pid"));
     let _ = std::fs::remove_file(&pid_file);
     let _pid_file_cleanup = RemoveOnDrop(pid_file.clone());
@@ -1654,9 +1655,13 @@ async fn cancel_escalates_to_group_sigkill_when_term_is_ignored() {
     let gc_script = grandchild_script_immune("escalate");
     // The immune stand-in touches this marker once its traps are installed.
     let started_marker = std::env::temp_dir().join(format!(
-        "decent-gc-im-{pid}.started",
+        "decent-gc-im-escalate-{pid}.started",
         pid = std::process::id()
     ));
+    // N-24: the stand-in script and its marker are removed when this test
+    // ends (paths are tag-unique, so no sibling can depend on them).
+    let _gc_script_cleanup = RemoveOnDrop(gc_script.clone());
+    let _started_cleanup = RemoveOnDrop(started_marker.clone());
     let pid_file = std::env::temp_dir().join(format!("{job_id}.gc-pid"));
     let _ = std::fs::remove_file(&pid_file);
     let _pid_file_cleanup = RemoveOnDrop(pid_file.clone());
@@ -1775,6 +1780,9 @@ async fn cancel_kills_daemonized_browser_recorded_at_exec() {
     let browser_stand_in = std::env::temp_dir().join(format!("decent-chrome-si-{pid}.py"));
     let started = std::env::temp_dir().join(format!("decent-chrome-si-{pid}.started"));
     let _ = std::fs::remove_file(&started);
+    // N-24: the stand-in script and its marker are removed when the test ends.
+    let _si_cleanup = RemoveOnDrop(browser_stand_in.clone());
+    let _si_started_cleanup = RemoveOnDrop(started.clone());
     std::fs::write(
         &browser_stand_in,
         format!(
@@ -1968,6 +1976,9 @@ async fn ws_drop_mid_grace_still_kills_tree_and_purges() {
     let browser_stand_in = std::env::temp_dir().join(format!("decent-chrome-wsdrop-{pid}.py"));
     let started = std::env::temp_dir().join(format!("decent-chrome-wsdrop-{pid}.started"));
     let _ = std::fs::remove_file(&started);
+    // N-24: the stand-in script and its marker are removed when the test ends.
+    let _wsdrop_cleanup = RemoveOnDrop(browser_stand_in.clone());
+    let _wsdrop_started_cleanup = RemoveOnDrop(started.clone());
     std::fs::write(
         &browser_stand_in,
         format!(
@@ -2774,6 +2785,11 @@ async fn error_event_terminates_child_tree_before_purge() {
     let mark_term = marker.with_extension("term");
     let _ = std::fs::remove_file(&mark_term);
     let gc_script = grandchild_script_evidence(&marker.to_string_lossy());
+    // N-24: the evidence script and its .started/.term markers are removed
+    // when the test ends (Drop runs after the assertions below).
+    let _gc_cleanup = RemoveOnDrop(gc_script.clone());
+    let _started_cleanup = RemoveOnDrop(marker.with_extension("started"));
+    let _term_cleanup = RemoveOnDrop(marker.with_extension("term"));
     let pid_file = std::env::temp_dir().join(format!("{job_id}.gc-pid"));
     let _ = std::fs::remove_file(&pid_file);
     let _pid_file_cleanup = RemoveOnDrop(pid_file.clone());

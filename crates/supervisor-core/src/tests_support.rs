@@ -19,7 +19,9 @@ impl Drop for RemoveDirOnDrop {
 
 /// File guard: removes the file on drop (best-effort). Because Drop runs
 /// after the test's assertions, evidence markers can still be inspected
-/// during the test.
+/// during the test. (History: three group-kill tests wrote
+/// `<tmp>/<job>.gc-pid` and never removed it — 1,070 stale files after a
+/// day of cargo runs, 2026-09-02 — which is why this guard exists.)
 pub(crate) struct RemoveOnDrop(pub PathBuf);
 
 impl Drop for RemoveOnDrop {
