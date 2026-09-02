@@ -1,0 +1,33 @@
+# cargo-mutants config (PACKET 65 / BACKLOG C-13, Rust half — advisory).
+#
+# Scope: the supervisor's content-safety and money-adjacent core ONLY —
+# purge (customer content deletion), the runner kill path and pidfile
+# identity, artifact integrity (sha fetch/extract), the wire protocol
+# parser, and the cache LRU sweep. Everything else in the workspace is out.
+#
+# connection.rs is deliberately OUT: its tests wait out a 10 s cancel grace
+# and a 60 s heartbeat cadence, so a mutant that hangs there costs minutes
+# per case and the whole run stops being a locally-finishable advisory.
+# bins/decent and the Tauri app are out (UI/CLI plumbing, not safety core).
+#
+# This run is ADVISORY: never blocking, never automatic (see
+# .github/workflows/mutation-advisory.yml). Survivors are findings, not
+# fixes.
+examine_globs = [
+    "crates/supervisor-core/src/runner.rs",
+    "crates/supervisor-core/src/purge.rs",
+    "crates/supervisor-core/src/sweep.rs",
+    "crates/supervisor-core/src/cache.rs",
+    "crates/supervisor-core/src/protocol.rs",
+    "crates/supervisor-core/src/artifact_fetch.rs",
+]
+
+# Pure logging/tracing bodies and Display impls: a mutant there is a change
+# in log text only — the suite cannot and should not pin log wording.
+exclude_re = [
+    "^Display for ",
+    "^std::fmt::Display for ",
+    ".*log_lines_for.*",
+]
+
+timeout_multiplier = 3
