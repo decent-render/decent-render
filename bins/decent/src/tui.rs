@@ -105,10 +105,7 @@ fn run_loop(
     loop {
         // Drain any new log lines into the ring buffer (newest at the back).
         while let Ok(line) = log_rx.try_recv() {
-            if logs.len() >= LOG_RING {
-                logs.pop_front();
-            }
-            logs.push_back(line);
+            push_log(logs, line);
         }
 
         let status = status_rx.borrow().clone();
@@ -161,8 +158,11 @@ fn draw_title_bar(frame: &mut Frame, area: Rect, status: &SupervisorStatus) {
         .as_ref()
         .map(|i| i.supervisor_version.as_str())
         .unwrap_or("decent");
+    // A short marker only: the full sentence (same words as `decent status`)
+    // lives in the footer, which spans the whole width — here, after the
+    // dispatch URL, it was truncated on a 100-column terminal.
     let update = match &status.update_available {
-        Some(v) => format!("  ⚠ update available: {v}"),
+        Some(_) => "  ⚠ update available".to_string(),
         None => String::new(),
     };
     let line = Line::from(vec![
@@ -330,7 +330,7 @@ fn draw_logs(frame: &mut Frame, area: Rect, logs: &VecDeque<LogLine>) {
     // Bottom-pinned: show only the newest lines that fit the inner height, so
     // the tail stays in view as new lines arrive.
     let height = inner.height as usize;
-    let start = logs.len().saturating_sub(height);
+    let start = tail_start(logs.len(), height);
     let lines: Vec<Line> = logs
         .iter()
         .skip(start)
@@ -355,16 +355,44 @@ fn draw_footer(frame: &mut Frame, area: Rect, status: &SupervisorStatus) {
     } else {
         "   (smoke mode — not accepting jobs)"
     };
-    let text = format!(" q/Esc quit  ·  Ctrl-C quit{real}");
-    frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Left),
-        area,
+    // Same words as `decent status` (main.rs `update_line`): "up to date"
+    // only when Registered, "unknown (…)" otherwise, the upgrade nudge when
+    // dispatch named a newer version. Yellow only when there is something
+    // to do.
+    let update = crate::update_line(
+        status.update_available.as_deref(),
+        &format!("{:?}", status.connection),
     );
+    let update_color = if status.update_available.is_some() {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" q/Esc quit  ·  Ctrl-C quit{real}  ·  "),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(update, Style::default().fg(update_color)),
+    ]);
+    frame.render_widget(Paragraph::new(line).alignment(Alignment::Left), area);
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
+
+/// Append to the on-screen ring: at `LOG_RING` lines the OLDEST is dropped.
+fn push_log(logs: &mut VecDeque<LogLine>, line: LogLine) {
+    if logs.len() >= LOG_RING {
+        logs.pop_front();
+    }
+    logs.push_back(line);
+}
+
+/// First index to draw so that the newest `height` lines fill the panel
+/// bottom-up. Fewer lines than rows → start at 0.
+fn tail_start(len: usize, height: usize) -> usize {
+    len.saturating_sub(height)
+}
 
 fn kv(label: &str, value: impl std::fmt::Display, value_color: Color) -> Line<'static> {
     Line::from(vec![
@@ -432,4 +460,175 @@ fn fmt_time(ms: u64) -> String {
         (secs / 60) % 60,
         secs % 60
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use supervisor_core::status::JobStatus;
+
+    fn line(msg: &str) -> LogLine {
+        LogLine {
+            timestamp_ms: 0,
+            level: LogLevel::Info,
+            message: msg.to_string(),
+        }
+    }
+
+    #[test]
+    fn push_log_caps_the_ring_at_log_ring_and_drops_the_oldest() {
+        let mut logs = VecDeque::new();
+        for i in 0..LOG_RING + 3 {
+            push_log(&mut logs, line(&format!("line {i}")));
+        }
+        assert_eq!(logs.len(), LOG_RING);
+        assert_eq!(logs.front().unwrap().message, "line 3");
+        assert_eq!(
+            logs.back().unwrap().message,
+            format!("line {}", LOG_RING + 2)
+        );
+    }
+
+    #[test]
+    fn tail_start_pins_the_newest_lines() {
+        assert_eq!(tail_start(10, 4), 6);
+        assert_eq!(tail_start(3, 10), 0);
+        assert_eq!(tail_start(0, 0), 0);
+        assert_eq!(tail_start(7, 7), 0);
+    }
+
+    #[test]
+    fn fmt_time_wraps_at_24h_utc() {
+        assert_eq!(fmt_time(0), "00:00:00");
+        assert_eq!(fmt_time(86_399_000), "23:59:59");
+        assert_eq!(fmt_time(86_400_000), "00:00:00");
+        assert_eq!(fmt_time(3_661_500), "01:01:01");
+    }
+
+    #[test]
+    fn phase_text_and_level_tag_cover_every_variant() {
+        // Exhaustive by construction: a new variant fails to compile here.
+        for phase in [
+            JobPhase::Downloading,
+            JobPhase::Rendering,
+            JobPhase::Uploading,
+            JobPhase::Done,
+            JobPhase::Failed,
+            JobPhase::Canceled,
+        ] {
+            let text = match phase {
+                JobPhase::Downloading => "downloading",
+                JobPhase::Rendering => "rendering",
+                JobPhase::Uploading => "uploading",
+                JobPhase::Done => "done",
+                JobPhase::Failed => "failed",
+                JobPhase::Canceled => "canceled",
+            };
+            assert_eq!(phase_text(phase), text);
+        }
+        for level in [
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+        ] {
+            let (tag, _) = level_tag(level);
+            assert_eq!(
+                tag.trim().to_lowercase(),
+                format!("{level:?}").to_lowercase()
+            );
+        }
+    }
+
+    fn registered_idle() -> SupervisorStatus {
+        SupervisorStatus {
+            connection: ConnectionState::Registered,
+            dispatch_url: Some("wss://decent-render-dispatch.fly.dev/ws".into()),
+            allow_real_jobs: true,
+            ..SupervisorStatus::default()
+        }
+    }
+
+    fn screen(
+        width: u16,
+        height: u16,
+        status: &SupervisorStatus,
+        logs: &VecDeque<LogLine>,
+    ) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, status, logs)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn title_bar_update_text_matches_decent_status() {
+        let logs = VecDeque::new();
+        let registered = screen(100, 30, &registered_idle(), &logs);
+        assert!(registered.contains("up to date"), "{registered}");
+
+        let mut disconnected = registered_idle();
+        disconnected.connection = ConnectionState::Disconnected;
+        let text = screen(100, 30, &disconnected, &logs);
+        assert!(text.contains("unknown"), "{text}");
+        assert!(!text.contains("up to date"), "{text}");
+
+        let mut outdated = registered_idle();
+        outdated.update_available = Some("0.0.10".into());
+        let text = screen(100, 30, &outdated, &logs);
+        assert!(text.contains("0.0.10"), "{text}");
+        assert!(text.contains("decent upgrade"), "{text}");
+    }
+
+    #[test]
+    fn whole_screen_renders_idle_registered_with_logs() {
+        let mut logs = VecDeque::new();
+        push_log(&mut logs, line("payload cached"));
+        push_log(&mut logs, line("registered with dispatch"));
+        let text = screen(100, 30, &registered_idle(), &logs);
+        assert!(text.contains("Registered"), "{text}");
+        assert!(text.contains("idle — waiting for a job"), "{text}");
+        assert!(text.contains("payload cached"), "{text}");
+        assert!(text.contains("registered with dispatch"), "{text}");
+    }
+
+    #[test]
+    fn whole_screen_renders_a_job_mid_render() {
+        let mut status = registered_idle();
+        status.current_job = Some(JobStatus {
+            id: "job_abc123".into(),
+            tier: "community".into(),
+            progress: 0.42,
+            phase: JobPhase::Rendering,
+        });
+        let text = screen(100, 30, &status, &VecDeque::new());
+        assert!(text.contains("rendering"), "{text}");
+        assert!(text.contains("42%"), "{text}");
+        assert!(text.contains("job_abc123"), "{text}");
+    }
+
+    #[test]
+    fn a_tiny_terminal_does_not_panic() {
+        let mut status = registered_idle();
+        status.current_job = Some(JobStatus {
+            id: "job_tiny".into(),
+            tier: "company".into(),
+            progress: 0.5,
+            phase: JobPhase::Uploading,
+        });
+        let mut logs = VecDeque::new();
+        for i in 0..50 {
+            push_log(&mut logs, line(&format!("l{i}")));
+        }
+        let _ = screen(20, 8, &status, &logs);
+        let _ = screen(1, 1, &status, &logs);
+    }
 }
