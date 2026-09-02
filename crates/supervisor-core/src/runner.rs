@@ -1146,6 +1146,7 @@ junk
     #[cfg(unix)]
     #[test]
     fn a_recycled_pid_with_a_different_start_time_is_never_signalled() {
+        let _serial = crate::tests_support::PROCESS_TREE_TESTS.blocking_lock();
         let dir = scratch("recycled");
         let mut child = spawn_group_leader_sleeper();
         let pid = child.id();
@@ -1168,6 +1169,7 @@ junk
     #[cfg(unix)]
     #[test]
     fn a_pid_whose_start_time_matches_is_group_killed() {
+        let _serial = crate::tests_support::PROCESS_TREE_TESTS.blocking_lock();
         let dir = scratch("match");
         let mut child = spawn_group_leader_sleeper();
         let pid = child.id();
@@ -1186,6 +1188,7 @@ junk
     #[cfg(unix)]
     #[test]
     fn a_legacy_pid_only_line_still_kills_but_is_the_unverified_path() {
+        let _serial = crate::tests_support::PROCESS_TREE_TESTS.blocking_lock();
         let dir = scratch("legacy");
         let mut child = spawn_group_leader_sleeper();
         let pid = child.id();

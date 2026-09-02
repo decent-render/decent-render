@@ -432,6 +432,7 @@ mod tests {
     /// error, not a hang.
     #[tokio::test]
     async fn read_timeout_fails_a_server_that_accepts_and_never_writes() {
+        let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // Hold the accepted socket open forever: read nothing, write
@@ -480,6 +481,7 @@ mod tests {
     /// hanging on SYN retransmits.
     #[tokio::test]
     async fn connect_timeout_fails_a_black_hole_address() {
+        let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
         let client = artifact_client_with(Duration::from_millis(300), Duration::from_secs(5));
         let dest = scratch_dest("connect-timeout");
         let started = std::time::Instant::now();

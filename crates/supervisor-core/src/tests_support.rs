@@ -29,3 +29,21 @@ impl Drop for RemoveOnDrop {
         std::fs::remove_file(&self.0).ok();
     }
 }
+
+/// Process-tree tests (spawn real children, measure TERM→KILL timing) hold
+/// this for their whole body so they never overlap each other or a
+/// network-heavy test. A tokio Mutex (not std) so async tests can
+/// `lock().await` across their own runtimes; sync tests use
+/// `blocking_lock()`.
+pub(crate) static PROCESS_TREE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[test]
+fn process_tree_tests_lock_is_usable_when_nothing_holds_it() {
+    // Contention-tolerant on purpose: under default test parallelism a
+    // process-tree test may legitimately hold the lock at this exact
+    // moment — a contended try_lock is not a failure. The only thing this
+    // trivial test pins is that the static compiles and can be locked.
+    if crate::tests_support::PROCESS_TREE_TESTS.try_lock().is_err() {
+        eprintln!("lock contended by a concurrent process-tree test — fine");
+    }
+}

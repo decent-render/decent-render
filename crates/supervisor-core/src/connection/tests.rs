@@ -203,6 +203,7 @@ fn test_worker_root() -> std::path::PathBuf {
 #[cfg(unix)]
 #[tokio::test]
 async fn wall_clock_limit_kills_a_job_that_never_goes_silent() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let sha = format!("test-wallclock-{pid}");
     let job_id = format!("job-wallclock-{pid}");
@@ -309,6 +310,7 @@ done
 #[cfg(unix)]
 #[tokio::test]
 async fn workdir_disk_cap_kills_a_runaway_render() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let sha = format!("test-diskcap-{pid}");
     let job_id = format!("job-diskcap-{pid}");
@@ -641,6 +643,7 @@ echo '{"type":"done","outputSizeInBytes":1,"wallTimeMs":1}'
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn sleep_assertion_held_for_job_lifetime_only() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let baseline = crate::keepawake::active_guard_count_for_tests();
 
@@ -771,6 +774,7 @@ fn job_workdirs(job_id: &str) -> Vec<std::path::PathBuf> {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancel_then_render_abort_suppresses_job_failed_and_purges() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let sha = format!("test-cancel-suppress-{pid}");
     let job_id = format!("job-cancel-suppress-{pid}");
@@ -869,6 +873,7 @@ async fn cancel_then_render_abort_suppresses_job_failed_and_purges() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancel_after_runner_done_suppresses_job_complete() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let sha = format!("test-cancel-complete-{pid}");
     let job_id = format!("job-cancel-complete-{pid}");
@@ -963,6 +968,7 @@ async fn cancel_after_runner_done_suppresses_job_complete() {
 #[cfg(unix)]
 #[tokio::test]
 async fn genuine_failure_without_cancel_emits_job_failed() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let sha = format!("test-genuine-failure-{pid}");
     let job_id = format!("job-genuine-failure-{pid}");
@@ -1533,6 +1539,7 @@ fn grandchild_script_immune(tag: &str) -> std::path::PathBuf {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancel_kills_the_runners_whole_process_group() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let sha = format!("test-group-kill-{pid}");
     let job_id = format!("job-group-kill-{pid}");
@@ -1649,6 +1656,7 @@ async fn cancel_kills_the_runners_whole_process_group() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancel_escalates_to_group_sigkill_when_term_is_ignored() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let sha = format!("test-group-escalate-{pid}");
     let job_id = format!("job-group-escalate-{pid}");
@@ -1766,6 +1774,7 @@ async fn cancel_escalates_to_group_sigkill_when_term_is_ignored() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancel_kills_daemonized_browser_recorded_at_exec() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     use std::os::unix::fs::PermissionsExt;
     let pid = std::process::id();
     let sha = format!("test-daemon-browser-{pid}");
@@ -1964,6 +1973,7 @@ while true; do sleep 5; done
 #[cfg(unix)]
 #[tokio::test]
 async fn ws_drop_mid_grace_still_kills_tree_and_purges() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     use std::os::unix::fs::PermissionsExt;
     let pid = std::process::id();
     let sha = format!("test-wsdrop-{pid}");
@@ -2170,6 +2180,7 @@ while true; do sleep 5; done
 #[cfg(unix)]
 #[tokio::test]
 async fn upgrade_required_close_mid_grace_still_drains() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
@@ -2578,6 +2589,7 @@ async fn hard_socket_abort_reconnects_instead_of_exiting() {
 #[cfg(unix)]
 #[tokio::test]
 async fn send_failure_with_in_flight_job_still_drains_and_purges() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let sha = format!("test-sendfail-drain-{pid}");
     let job_id = format!("job-sendfail-drain-{pid}");
@@ -2675,6 +2687,7 @@ while true; do sleep 5; done
 #[cfg(unix)]
 #[tokio::test]
 async fn send_failure_mid_grace_rides_the_grace_to_sigkill() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let sha = format!("test-sendfail-grace-{pid}");
     let job_id = format!("job-sendfail-grace-{pid}");
@@ -2778,6 +2791,7 @@ while true; do sleep 5; done
 #[cfg(unix)]
 #[tokio::test]
 async fn error_event_terminates_child_tree_before_purge() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let sha = format!("test-error-kill-{pid}");
     let job_id = format!("job-error-kill-{pid}");
@@ -2946,6 +2960,7 @@ async fn next_non_heartbeat(ws: &mut WebSocketStream<TcpStream>) -> serde_json::
 #[cfg(unix)]
 #[tokio::test]
 async fn late_attempt1_terminal_frame_leaves_attempt2_in_flight() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
     let pid = std::process::id();
     let job_id = format!("job-attempt-guard-{pid}");
     let sha1 = format!("test-attempt1-{pid}");
