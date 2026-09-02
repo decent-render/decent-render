@@ -277,6 +277,36 @@ mod tests {
         clear_purge_failure(&blocked);
     }
 
+    /// PACKET 65 (C-13 mutation follow-up): record_purge_failure DEDUPLICATES
+    /// by path — records for two DIFFERENT paths must both survive. Catches
+    /// the mutant that inverts the find predicate (which silently overwrites
+    /// the first entry and drops a distinct workdir's failure from the
+    /// operator list).
+    #[test]
+    fn recording_two_distinct_paths_keeps_both_failures() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let a = std::env::temp_dir().join(format!("p65-purge-a-{}-{nanos}", std::process::id()));
+        let b = std::env::temp_dir().join(format!("p65-purge-b-{}-{nanos}", std::process::id()));
+        record_purge_failure(PurgeFailure {
+            path: a.clone(),
+            error: "first workdir".into(),
+            attempts: PURGE_ATTEMPTS,
+        });
+        record_purge_failure(PurgeFailure {
+            path: b.clone(),
+            error: "second workdir".into(),
+            attempts: PURGE_ATTEMPTS,
+        });
+        let outstanding = outstanding_purge_failures();
+        assert!(outstanding.iter().any(|f| f.path == a), "first failure must survive: {outstanding:?}");
+        assert!(outstanding.iter().any(|f| f.path == b), "second failure must survive: {outstanding:?}");
+        clear_purge_failure(&a);
+        clear_purge_failure(&b);
+    }
+
     /// PACKET 65 (C-13 mutation follow-up): a purge failure RECORDED for a
     /// path must be clearable once a later sweep reclaims it — the operator
     /// list must end up EMPTY, not stuck with a stale alarm. Catches the
