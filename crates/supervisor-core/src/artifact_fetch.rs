@@ -646,3 +646,27 @@ mod tests {
         assert!(dest.join("index.html").exists());
     }
 }
+
+/// N-13 rank C: pin the download/extraction limits to their documented
+/// values so a `*`→`+` slip (2 GiB → 5 bytes: every artifact refused; 30 min
+/// → 90 s: every big payload times out) cannot pass the suite.
+#[cfg(test)]
+mod const_pins {
+    use super::*;
+
+    #[test]
+    fn download_caps_are_two_and_four_gib() {
+        assert_eq!(ARTIFACT_MAX_BYTES, 2_147_483_648);
+        assert_eq!(ARTIFACT_MAX_EXTRACTED_BYTES, 4_294_967_296);
+    }
+
+    #[test]
+    fn timeouts_are_ten_seconds_connect_sixty_read_thirty_minutes_total() {
+        assert_eq!(ARTIFACT_CONNECT_TIMEOUT, std::time::Duration::from_secs(10));
+        assert_eq!(ARTIFACT_READ_TIMEOUT, std::time::Duration::from_secs(60));
+        assert_eq!(
+            ARTIFACT_TOTAL_TIMEOUT,
+            std::time::Duration::from_secs(1_800)
+        );
+    }
+}

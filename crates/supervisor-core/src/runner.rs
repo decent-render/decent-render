@@ -1722,3 +1722,29 @@ env
         assert_eq!(total, payload.len() as u64);
     }
 }
+
+/// N-13 rank C: the safety constants are pinned to the numbers the docs and
+/// the operator promises name. A `*`→`+` slip (cargo-mutants found every one
+/// of these survives untested) silently moves a ceiling by orders of
+/// magnitude — a 1 h job ceiling becoming 2 min kills every long render.
+#[cfg(test)]
+mod const_pins {
+    use super::*;
+
+    #[test]
+    fn job_wall_time_is_one_hour() {
+        assert_eq!(MAX_JOB_WALL_TIME, Duration::from_secs(3_600));
+    }
+
+    #[test]
+    fn workdir_cap_is_twenty_gib() {
+        assert_eq!(MAX_WORKDIR_BYTES, 21_474_836_480);
+    }
+
+    #[test]
+    fn silence_and_cancel_windows_are_as_documented() {
+        assert_eq!(SILENCE_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(CANCEL_GRACE, Duration::from_secs(10));
+        assert_eq!(WORKDIR_SAMPLE_INTERVAL, Duration::from_secs(2));
+    }
+}

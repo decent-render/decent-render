@@ -709,3 +709,16 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 }
+
+/// N-13 rank C: pin the cache caps (20 GiB ceiling, 1 GiB floor) so a slip
+/// in the constant arithmetic cannot turn into evictions on healthy nodes.
+#[cfg(test)]
+mod const_pins {
+    use super::*;
+
+    #[test]
+    fn cache_caps_are_twenty_gib_and_one_gib() {
+        assert_eq!(MAX_CACHE_BYTES, 21_474_836_480);
+        assert_eq!(MIN_CACHE_BYTES, 1_073_741_824);
+    }
+}
