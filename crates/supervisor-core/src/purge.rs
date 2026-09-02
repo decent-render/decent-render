@@ -277,6 +277,24 @@ mod tests {
         clear_purge_failure(&blocked);
     }
 
+    /// PACKET 65 (C-13 mutation follow-up): removing an ALREADY-GONE path is
+    /// SUCCESS (None) — the NotFound guard must keep a vanished workdir from
+    /// being retried and recorded as a purge failure (a false "this machine
+    /// still holds render content" alarm on the operator surface). Catches
+    /// the mutant that disables the NotFound match guard.
+    #[test]
+    fn removing_a_nonexistent_path_is_success_not_a_failure() {
+        let gone = std::env::temp_dir().join(format!(
+            "p65-purge-gone-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert_eq!(remove_dir_all_with_retry(&gone), None);
+    }
+
     /// PACKET 65 (C-13 mutation follow-up): record_purge_failure DEDUPLICATES
     /// by path — records for two DIFFERENT paths must both survive. Catches
     /// the mutant that inverts the find predicate (which silently overwrites
@@ -301,8 +319,14 @@ mod tests {
             attempts: PURGE_ATTEMPTS,
         });
         let outstanding = outstanding_purge_failures();
-        assert!(outstanding.iter().any(|f| f.path == a), "first failure must survive: {outstanding:?}");
-        assert!(outstanding.iter().any(|f| f.path == b), "second failure must survive: {outstanding:?}");
+        assert!(
+            outstanding.iter().any(|f| f.path == a),
+            "first failure must survive: {outstanding:?}"
+        );
+        assert!(
+            outstanding.iter().any(|f| f.path == b),
+            "second failure must survive: {outstanding:?}"
+        );
         clear_purge_failure(&a);
         clear_purge_failure(&b);
     }
