@@ -212,6 +212,32 @@ describe('App', () => {
 		});
 	});
 
+	// The token-shape gate (shared with `decent login`): when the backend
+	// refuses the paste, the operator sees WHY and no connection is attempted.
+	it('a refused token paste is shown to the operator and start_connection is never called', async () => {
+		const alertSpy = vi.spyOn(window, 'alert').mockImplementation(() => undefined);
+		const base = invokeMock.getMockImplementation()!;
+		invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+			if (cmd === 'save_token_cmd') throw 'not a worker token: expected three dot-separated parts, got 1';
+			return base(cmd, args);
+		});
+		render(<App />);
+		await waitFor(() => {
+			expect(screen.getByText('Start')).toBeInTheDocument();
+		});
+		await act(async () => {
+			fireEvent.change(screen.getByPlaceholderText('JWT worker token'), {target: {value: 'paste-your-token-here'}});
+		});
+		await act(async () => {
+			fireEvent.click(screen.getByText('Start'));
+		});
+		await waitFor(() => {
+			expect(alertSpy).toHaveBeenCalledWith('Failed to start: not a worker token: expected three dot-separated parts, got 1');
+		});
+		expect(invokeMock.mock.calls.some(([cmd]) => cmd === 'start_connection')).toBe(false);
+		alertSpy.mockRestore();
+	});
+
 	// C-8: the consent toggle is the operator's real-jobs opt-in, and Start
 	// must persist exactly what it shows. Without opting in, the IPC carries
 	// allowRealJobsDefault: false; after clicking the toggle, true — and the
