@@ -1,0 +1,35 @@
+name: Mutation testing (advisory)
+
+# PACKET 65 (C-13, Rust half) — NEVER blocking, NEVER automatic:
+# workflow_dispatch only. Runs cargo-mutants over the supervisor's
+# content-safety core (purge, kill path, pidfile identity, event parsing,
+# cache sweep — see .cargo/mutants.toml for the exact scope and why
+# connection.rs is out). The run step has `continue-on-error: true`, so the
+# worst outcome is a manual-run red plus an uploaded mutants.out report.
+# Survivors are FINDINGS for the receipt/backlog, not failures.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mutation-advisory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      # Same toolchain/cache pattern as ci.yml's rust job; the mutants run
+      # manages its own build dirs and only the safety-core crates are in
+      # scope, so no separate cache is wired for it.
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: cargo-mutants (advisory — can never fail the workflow)
+        continue-on-error: true
+        run: cargo mutants -p supervisor-core --jobs 2 --output mutants.out
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: mutants.out/
+          if-no-files-found: ignore
