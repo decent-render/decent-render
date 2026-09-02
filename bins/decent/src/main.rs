@@ -331,6 +331,10 @@ async fn await_termination() -> Option<&'static str> {
     tokio::signal::ctrl_c().await.ok().map(|()| "ctrl-c")
 }
 
+/// The dispatch URL `Start`/`Install`/`Tui` default to — and the host
+/// `decent doctor` probes for reachability (ws→http, path `/health`).
+const DEFAULT_DISPATCH_WS: &str = "wss://decent-render-dispatch.fly.dev/ws";
+
 #[derive(Parser)]
 #[command(
     name = "decent",
@@ -350,7 +354,7 @@ enum Command {
         #[arg(
             long,
             env = "DISPATCH_URL",
-            default_value = "wss://decent-render-dispatch.fly.dev/ws"
+            default_value = DEFAULT_DISPATCH_WS
         )]
         dispatch_url: String,
         /// Worker JWT. If omitted (and no WORKER_TOKEN env), reads the token
@@ -390,7 +394,7 @@ enum Command {
         #[arg(
             long,
             env = "DISPATCH_URL",
-            default_value = "wss://decent-render-dispatch.fly.dev/ws"
+            default_value = DEFAULT_DISPATCH_WS
         )]
         dispatch_url: String,
     },
@@ -399,6 +403,9 @@ enum Command {
     /// Show pairing + daemon status: is a token stored? is the daemon
     /// installed and running?
     Status,
+    /// Check this node: token, daemon, dispatch reachability, disk, version.
+    /// Prints one line per check and exits 1 if any check FAILED.
+    Doctor,
     /// Upgrade decent — Homebrew on macOS, the release installer on Linux —
     /// then restart the daemon so it runs the new binary. One-command update.
     Upgrade,
@@ -419,7 +426,7 @@ enum Command {
         #[arg(
             long,
             env = "DISPATCH_URL",
-            default_value = "wss://decent-render-dispatch.fly.dev/ws"
+            default_value = DEFAULT_DISPATCH_WS
         )]
         dispatch_url: String,
         /// Worker JWT. If omitted (and no WORKER_TOKEN env), reads the token
@@ -895,6 +902,10 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
+        Command::Doctor => {
+            let code = run_doctor().await;
+            std::process::exit(code);
+        }
         Command::Status => {
             let token = load_token();
             println!(
@@ -1147,6 +1158,469 @@ mod update_line_tests {
             let line = update_line(None, state);
             assert!(line.starts_with("unknown"), "{state}: {line}");
         }
+    }
+}
+
+// ── `decent doctor` (packet 67) ─────────────────────────────────────────────
+
+/// Severity of one doctor check. The doctor's exit code is 1 iff any check
+/// is [`Level::Fail`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Ok,
+    Warn,
+    Fail,
+}
+
+/// One doctor verdict: a short name, a severity, and a human detail.
+#[derive(Debug, Clone)]
+struct Check {
+    name: &'static str,
+    level: Level,
+    detail: String,
+}
+
+fn render_check(check: &Check) -> String {
+    match check.level {
+        Level::Ok => format!("OK  {}: {}", check.name, check.detail),
+        Level::Warn => format!("WARN {}: {}", check.name, check.detail),
+        Level::Fail => format!("FAIL {}: {}", check.name, check.detail),
+    }
+}
+
+/// 1 iff any check FAILED (warns are advisory and exit 0).
+fn exit_code(checks: &[Check]) -> i32 {
+    checks
+        .iter()
+        .map(|c| match c.level {
+            Level::Ok => 0,
+            Level::Warn => 0,
+            Level::Fail => 1,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+const SECS_PER_DAY: u64 = 86_400;
+/// Token-expiry warning horizon (mint a new one inside this window).
+const TOKEN_WARN_DAYS: u64 = 7;
+
+/// The pure token verdict: file mode 0600, config dir 0700, and the `exp`
+/// claim (decoded like `platform_from_token` — no signature check) against
+/// `now`. FAIL on a wrong mode, an expired token, or a missing/unreadable
+/// `exp`; WARN inside the 7-day window; OK otherwise. The caller appends the
+/// platform to the detail.
+fn token_check_from(mode_file: u32, mode_dir: u32, exp_secs: Option<u64>, now: u64) -> Check {
+    if mode_file != 0o600 {
+        return Check {
+            name: "token",
+            level: Level::Fail,
+            detail: format!(
+                "token file mode is {mode_file:o}, want 0600 (chmod 600 the token file)"
+            ),
+        };
+    }
+    if mode_dir != 0o700 {
+        return Check {
+            name: "token",
+            level: Level::Fail,
+            detail: format!(
+                "config dir mode is {mode_dir:o}, want 0700 (chmod 700 the config dir)"
+            ),
+        };
+    }
+    let Some(exp) = exp_secs else {
+        return Check {
+            name: "token",
+            level: Level::Fail,
+            detail: "exp claim missing or unreadable — token is expired or malformed".into(),
+        };
+    };
+    if exp <= now {
+        let days_ago = (now - exp) / SECS_PER_DAY;
+        return Check {
+            name: "token",
+            level: Level::Fail,
+            detail: format!("token expired {days_ago}d ago — run `decent login`"),
+        };
+    }
+    let days_left = (exp - now) / SECS_PER_DAY;
+    if days_left < TOKEN_WARN_DAYS {
+        Check {
+            name: "token",
+            level: Level::Warn,
+            detail: format!("expires in {days_left}d — mint a new one soon"),
+        }
+    } else {
+        Check {
+            name: "token",
+            level: Level::Ok,
+            detail: format!("expires in {days_left}d"),
+        }
+    }
+}
+
+/// The disk verdict: free bytes on the volume holding the worker root.
+/// FAIL below 5 GiB (renders cannot fit), WARN below 20 GiB (browser +
+/// payload caches are getting tight).
+fn disk_check_from(free_bytes: u64) -> Check {
+    let gib = format!("{:.1}", free_bytes as f64 / GIB as f64);
+    if free_bytes < 5 * GIB {
+        Check {
+            name: "disk",
+            level: Level::Fail,
+            detail: format!("{gib} GiB free on the worker root — renders cannot fit"),
+        }
+    } else if free_bytes < 20 * GIB {
+        Check {
+            name: "disk",
+            level: Level::Warn,
+            detail: format!("{gib} GiB free on the worker root — getting tight"),
+        }
+    } else {
+        Check {
+            name: "disk",
+            level: Level::Ok,
+            detail: format!("{gib} GiB free on the worker root"),
+        }
+    }
+}
+
+/// The version verdict: current crate version, with a WARN when the daemon
+/// snapshot carries an available upgrade.
+fn version_check_from(current: &str, update_available: Option<&str>) -> Check {
+    match update_available {
+        Some(newer) => Check {
+            name: "version",
+            level: Level::Warn,
+            detail: format!("{current} — {newer} available — run `decent upgrade`"),
+        },
+        None => Check {
+            name: "version",
+            level: Level::Ok,
+            detail: format!("{current} — up to date"),
+        },
+    }
+}
+
+/// File + parent-dir permission bits (unix). Non-unix: the wanted modes
+/// (there is no chmod there, so there is nothing to check).
+#[cfg(unix)]
+fn file_and_dir_modes(path: &std::path::Path) -> (u32, u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0)
+    };
+    let file = mode(path);
+    let dir = path.parent().map(mode).unwrap_or(0);
+    (file, dir)
+}
+
+#[cfg(not(unix))]
+fn file_and_dir_modes(_path: &Path) -> (u32, u32) {
+    (0o600, 0o700)
+}
+
+/// The `exp` claim seconds, decoded like `platform_from_token` — payload
+/// only, no signature check. None = unreadable/missing.
+fn token_exp_secs(token: &str) -> Option<u64> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let bytes = base64url_decode(payload_b64)?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    payload.get("exp")?.as_u64()
+}
+
+fn token_check() -> Check {
+    let path = match token_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return Check {
+                name: "token",
+                level: Level::Fail,
+                detail: format!("{e}; run `decent login`"),
+            }
+        }
+    };
+    if !path.exists() {
+        return Check {
+            name: "token",
+            level: Level::Fail,
+            detail: "no worker token — run `decent login`".into(),
+        };
+    }
+    let (mode_file, mode_dir) = file_and_dir_modes(&path);
+    let token = load_token();
+    let shape = validate_worker_token_shape(&token);
+    let exp_secs = if shape.is_ok() {
+        token_exp_secs(&token)
+    } else {
+        None
+    };
+    let mut check = token_check_from(mode_file, mode_dir, exp_secs, now_secs());
+    // Detail carries the platform (advisory, decoded without verification).
+    if let Ok(p) = platform_from_token(&token) {
+        check.detail.push_str(&format!(" — platform {p:?}"));
+    }
+    if let Err(e) = shape {
+        // A shape failure must FAIL even if an exp claim was decodable.
+        check.level = Level::Fail;
+        check.detail = format!("token malformed: {e}");
+    }
+    check
+}
+
+fn daemon_check() -> Check {
+    match service::state() {
+        DaemonState::Running => Check {
+            name: "daemon",
+            level: Level::Ok,
+            detail: "installed and running".into(),
+        },
+        DaemonState::Paused => Check {
+            name: "daemon",
+            level: Level::Warn,
+            detail: "installed but paused — run `decent resume`".into(),
+        },
+        DaemonState::NotInstalled => Check {
+            name: "daemon",
+            level: Level::Warn,
+            detail: "not installed — run `decent install`".into(),
+        },
+    }
+}
+
+fn status_file_check() -> Check {
+    match read_daemon_snapshot() {
+        Some(snap) if snap.is_fresh() => Check {
+            name: "status",
+            level: Level::Ok,
+            detail: format!("daemon reports: {}", snap.connection),
+        },
+        Some(snap) => {
+            let age_s = now_ms().saturating_sub(snap.updated_at_ms) / 1000;
+            Check {
+                name: "status",
+                level: Level::Warn,
+                detail: format!("status file is {age_s}s stale — daemon quiet or gone"),
+            }
+        }
+        None => Check {
+            name: "status",
+            level: Level::Warn,
+            detail: "no status file — the daemon has never reported".into(),
+        },
+    }
+}
+
+/// The dispatch health endpoint derived from Start's default dispatch URL:
+/// ws→https, wss→https, path `/health`.
+fn dispatch_health_url() -> String {
+    let http = DEFAULT_DISPATCH_WS
+        .replacen("wss://", "https://", 1)
+        .replacen("ws://", "http://", 1);
+    format!("{}/health", http.trim_end_matches('/'))
+}
+
+async fn dispatch_check() -> Check {
+    let url = dispatch_health_url();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("reqwest client with plain timeouts cannot fail to build");
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => Check {
+            name: "dispatch",
+            level: Level::Ok,
+            detail: format!("{url} reachable"),
+        },
+        Ok(resp) => Check {
+            name: "dispatch",
+            level: Level::Fail,
+            detail: format!("{url} answered {}", resp.status()),
+        },
+        Err(e) => Check {
+            name: "dispatch",
+            level: Level::Fail,
+            detail: format!("{url}: {e}"),
+        },
+    }
+}
+
+/// Free bytes for unprivileged users on the volume holding the worker root
+/// (statvfs: f_bavail × f_frsize).
+#[cfg(unix)]
+fn worker_root_free_bytes() -> anyhow::Result<u64> {
+    let root = supervisor_core::runner::worker_root()?;
+    let c = std::ffi::CString::new(root.as_os_str().to_str().unwrap_or(""))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut stat) };
+    if rc != 0 {
+        anyhow::bail!("statvfs failed on {}", root.display());
+    }
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn worker_root_free_bytes() -> anyhow::Result<u64> {
+    anyhow::bail!("disk check is not implemented on this platform")
+}
+
+fn disk_check() -> Check {
+    match worker_root_free_bytes() {
+        Ok(free) => disk_check_from(free),
+        Err(e) => Check {
+            name: "disk",
+            level: Level::Warn,
+            detail: format!("could not stat the worker root: {e}"),
+        },
+    }
+}
+
+fn version_check() -> Check {
+    let update = read_daemon_snapshot().and_then(|s| s.update_available);
+    version_check_from(env!("CARGO_PKG_VERSION"), update.as_deref())
+}
+
+async fn run_doctor() -> i32 {
+    let checks = vec![
+        token_check(),
+        daemon_check(),
+        status_file_check(),
+        dispatch_check().await,
+        disk_check(),
+        version_check(),
+    ];
+    for check in &checks {
+        println!("{}", render_check(check));
+    }
+    let failures = checks.iter().filter(|c| c.level == Level::Fail).count();
+    println!(
+        "doctor: {} checks, {} failed, {} warned",
+        checks.len(),
+        failures,
+        checks.iter().filter(|c| c.level == Level::Warn).count()
+    );
+    exit_code(&checks)
+}
+
+/// The epoch seconds `now` the doctor checks compare against. A fn (not a
+/// frozen value) so it is exactly the clock the production path reads.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+
+    fn check(level: Level, name: &'static str) -> Check {
+        Check {
+            name,
+            level,
+            detail: format!("{name} detail"),
+        }
+    }
+
+    #[test]
+    fn render_check_formats_each_level() {
+        assert_eq!(
+            render_check(&check(Level::Ok, "token")),
+            "OK  token: token detail"
+        );
+        assert_eq!(
+            render_check(&check(Level::Warn, "disk")),
+            "WARN disk: disk detail"
+        );
+        assert_eq!(
+            render_check(&check(Level::Fail, "dispatch")),
+            "FAIL dispatch: dispatch detail"
+        );
+    }
+
+    #[test]
+    fn exit_code_is_zero_with_only_ok_and_warn() {
+        assert_eq!(exit_code(&[]), 0);
+        assert_eq!(exit_code(&[check(Level::Ok, "a")]), 0);
+        assert_eq!(exit_code(&[check(Level::Warn, "a")]), 0);
+        assert_eq!(
+            exit_code(&[check(Level::Ok, "a"), check(Level::Warn, "b")]),
+            0
+        );
+    }
+
+    #[test]
+    fn exit_code_is_one_with_any_fail() {
+        assert_eq!(exit_code(&[check(Level::Fail, "a")]), 1);
+        assert_eq!(
+            exit_code(&[check(Level::Ok, "a"), check(Level::Fail, "b")]),
+            1
+        );
+    }
+
+    /// A token file with loose permissions is a FAIL that names the fix.
+    #[test]
+    fn token_check_fails_on_a_loose_file_mode() {
+        let now = 1_800_000_000;
+        let exp = now + 30 * SECS_PER_DAY;
+        let check = token_check_from(0o644, 0o700, Some(exp), now);
+        assert_eq!(check.level, Level::Fail);
+        assert!(check.detail.contains("0600"), "got: {}", check.detail);
+    }
+
+    /// An expired token is a FAIL; inside the 7-day window a WARN; well
+    /// inside it, OK.
+    #[test]
+    fn token_expiry_levels() {
+        let now = 1_800_000_000;
+        let expired = token_check_from(0o600, 0o700, Some(now - 1), now);
+        assert_eq!(expired.level, Level::Fail, "expired must FAIL");
+        assert!(expired.detail.contains("expired"));
+
+        let expiring = token_check_from(0o600, 0o700, Some(now + 3 * SECS_PER_DAY), now);
+        assert_eq!(expiring.level, Level::Warn, "3 days left must WARN");
+
+        let healthy = token_check_from(0o600, 0o700, Some(now + 30 * SECS_PER_DAY), now);
+        assert_eq!(healthy.level, Level::Ok, "30 days left must be OK");
+    }
+
+    /// A missing/unreadable `exp` claim FAILS (the token cannot be trusted).
+    #[test]
+    fn missing_exp_claim_fails() {
+        let now = 1_800_000_000;
+        let check = token_check_from(0o600, 0o700, None, now);
+        assert_eq!(check.level, Level::Fail);
+        assert!(check.detail.contains("exp"), "got: {}", check.detail);
+    }
+
+    /// Disk thresholds at the exact boundaries: 5 GiB exactly is a WARN
+    /// (only BELOW 5 GiB fails); 20 GiB exactly is OK.
+    #[test]
+    fn disk_thresholds_at_the_boundaries() {
+        let fail = disk_check_from(5 * GIB - 1);
+        assert_eq!(fail.level, Level::Fail);
+        let warn = disk_check_from(5 * GIB);
+        assert_eq!(warn.level, Level::Warn);
+        let warn2 = disk_check_from(20 * GIB - 1);
+        assert_eq!(warn2.level, Level::Warn);
+        let ok = disk_check_from(20 * GIB);
+        assert_eq!(ok.level, Level::Ok);
+    }
+
+    /// The version check warns when the daemon snapshot carries an upgrade
+    /// and stays OK otherwise.
+    #[test]
+    fn version_check_warns_on_an_available_upgrade() {
+        let warn = version_check_from("0.0.9", Some("0.1.0"));
+        assert_eq!(warn.level, Level::Warn);
+        assert!(warn.detail.contains("0.1.0"), "got: {}", warn.detail);
+        let ok = version_check_from("0.0.9", None);
+        assert_eq!(ok.level, Level::Ok);
     }
 }
 

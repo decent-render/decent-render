@@ -115,6 +115,10 @@ decent pause
 decent resume
 decent upgrade
 
+# One-screen health check: token shape/expiry + file modes, daemon, status
+# freshness, dispatch reachability, disk, version — exit 1 if anything FAILED.
+decent doctor
+
 # Or run the foreground terminal dashboard instead of the daemon.
 # (Both default to the production dispatch URL; override with --dispatch-url.)
 decent tui --allow-real-jobs
