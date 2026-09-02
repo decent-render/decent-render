@@ -83,6 +83,20 @@ pub(crate) async fn download_to_file_hashed(
     dest: &Path,
     kind: &str,
 ) -> anyhow::Result<String> {
+    download_to_file_hashed_capped(client, get_url, dest, kind, ARTIFACT_MAX_BYTES).await
+}
+
+/// [`download_to_file_hashed`] with the byte ceiling as a parameter, so the
+/// boundary (exactly-at-cap accepted, one chunk over rejected, lying
+/// Content-Length refused up front) can be proven with a few MiB instead of
+/// streaming 2 GiB through the suite (packet 66 follow-up).
+async fn download_to_file_hashed_capped(
+    client: &reqwest::Client,
+    get_url: &str,
+    dest: &Path,
+    kind: &str,
+    max_bytes: u64,
+) -> anyhow::Result<String> {
     let response = client
         .get(get_url)
         .timeout(ARTIFACT_TOTAL_TIMEOUT)
@@ -93,10 +107,10 @@ pub(crate) async fn download_to_file_hashed(
         .with_context(|| format!("{kind} download returned non-2xx"))?;
 
     if let Some(len) = response.content_length() {
-        if len > ARTIFACT_MAX_BYTES {
+        if len > max_bytes {
             return Err(anyhow!(
                 "{kind} content-length {len} exceeds the {} byte artifact ceiling",
-                ARTIFACT_MAX_BYTES
+                max_bytes
             ));
         }
     }
@@ -118,13 +132,13 @@ pub(crate) async fn download_to_file_hashed(
             None => break, // body complete
         };
         written += chunk.len() as u64;
-        if written > ARTIFACT_MAX_BYTES {
+        if written > max_bytes {
             // Remove the oversized temp file before failing — the caller
             // cannot be trusted to know how far we got.
             let _ = tokio::fs::remove_file(dest).await;
             return Err(anyhow!(
                 "{kind} download exceeded the {} byte artifact ceiling",
-                ARTIFACT_MAX_BYTES
+                max_bytes
             ));
         }
         hasher.update(&chunk);
@@ -334,6 +348,11 @@ mod tests {
     // TcpListener (hyper-free): it streams zeros with no content-length so
     // the STREAMED counter is what fires.
 
+    /// A small ceiling for the streaming boundary tests: the gate logic is
+    /// identical at any cap, and 4 MiB proves it without pushing 2 GiB
+    /// through the suite on every run.
+    const TEST_CAP: u64 = 4 * 1024 * 1024;
+
     /// One-shot fake artifact server: streams `total` bytes of zeros (in
     /// `chunk`-byte pieces) with NO content-length, unless `content_length`
     /// overrides the header (to test a lying pre-flight). Connection close
@@ -390,11 +409,12 @@ mod tests {
     /// body — "body read failed" — never on the ceiling wording).
     #[tokio::test]
     async fn content_length_exactly_at_cap_passes_the_preflight() {
-        let (url, server) = serve_zero_stream(0, 1024, Some(ARTIFACT_MAX_BYTES)).await;
+        let (url, server) = serve_zero_stream(0, 1024, Some(TEST_CAP)).await;
         let dest = scratch_dest("cl-exact");
-        let error = download_to_file_hashed(&artifact_client(), &url, &dest, "payloads")
-            .await
-            .expect_err("a truncated body must fail");
+        let error =
+            download_to_file_hashed_capped(&artifact_client(), &url, &dest, "payloads", TEST_CAP)
+                .await
+                .expect_err("a truncated body must fail");
         assert!(
             error.to_string().contains("body read failed"),
             "exactly-at-cap must pass the pre-flight and fail on truncation, got: {error}"
@@ -411,11 +431,12 @@ mod tests {
     /// PRE-FLIGHT, before any body bytes are read.
     #[tokio::test]
     async fn content_length_over_cap_is_rejected_by_the_preflight() {
-        let (url, server) = serve_zero_stream(0, 1024, Some(ARTIFACT_MAX_BYTES + 1)).await;
+        let (url, server) = serve_zero_stream(0, 1024, Some(TEST_CAP + 1)).await;
         let dest = scratch_dest("cl-over");
-        let error = download_to_file_hashed(&artifact_client(), &url, &dest, "payloads")
-            .await
-            .expect_err("over-cap content-length must fail");
+        let error =
+            download_to_file_hashed_capped(&artifact_client(), &url, &dest, "payloads", TEST_CAP)
+                .await
+                .expect_err("over-cap content-length must fail");
         assert!(
             error.to_string().contains("content-length"),
             "the pre-flight must reject it, got: {error}"
@@ -429,15 +450,16 @@ mod tests {
     #[tokio::test]
     async fn streamed_body_exactly_at_cap_is_accepted() {
         let chunk = 1024 * 1024;
-        let (url, server) = serve_zero_stream(ARTIFACT_MAX_BYTES, chunk, None).await;
+        let (url, server) = serve_zero_stream(TEST_CAP, chunk, None).await;
         let dest = scratch_dest("stream-exact");
-        let sha = download_to_file_hashed(&artifact_client(), &url, &dest, "payloads")
-            .await
-            .expect("exactly-at-cap must stream successfully");
-        // sha pins that ALL 2 GiB were hashed (sha256 of 2 GiB of zeros).
+        let sha =
+            download_to_file_hashed_capped(&artifact_client(), &url, &dest, "payloads", TEST_CAP)
+                .await
+                .expect("exactly-at-cap must stream successfully");
+        // sha pins that ALL TEST_CAP bytes were hashed (sha256 of that many zeros).
         let mut expected = Sha256::new();
         let zeros = vec![0u8; chunk];
-        for _ in 0..(ARTIFACT_MAX_BYTES / chunk as u64) {
+        for _ in 0..(TEST_CAP / chunk as u64) {
             expected.update(&zeros);
         }
         assert_eq!(sha, hex_lower(&expected.finalize()));
@@ -453,11 +475,12 @@ mod tests {
     #[tokio::test]
     async fn streamed_body_one_chunk_over_the_cap_is_rejected_and_temp_file_removed() {
         let chunk = 1024 * 1024;
-        let (url, server) = serve_zero_stream(ARTIFACT_MAX_BYTES + chunk as u64, chunk, None).await;
+        let (url, server) = serve_zero_stream(TEST_CAP + chunk as u64, chunk, None).await;
         let dest = scratch_dest("stream-over");
-        let error = download_to_file_hashed(&artifact_client(), &url, &dest, "payloads")
-            .await
-            .expect_err("an over-cap streamed body must fail");
+        let error =
+            download_to_file_hashed_capped(&artifact_client(), &url, &dest, "payloads", TEST_CAP)
+                .await
+                .expect_err("an over-cap streamed body must fail");
         assert!(error.to_string().contains("exceeded the"), "got: {error}");
         assert!(
             !dest.exists(),
