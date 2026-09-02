@@ -46,7 +46,9 @@ Public functions:
 - `getWorkerAvailability()` — which workers behind an `operator` are
   currently available.
 - `getVersions()`
-- `verifyWebhookSignature()`
+- `verifyWebhookSignature()` — HMAC check **and** a replay window: deliveries whose
+  `X-Decent-Timestamp` is more than `toleranceSeconds` (default 300) from now are
+  rejected before the signature is compared. Dedupe retries on `X-Decent-Delivery-Id`.
 - `listWebhooks()`, `createWebhook()`, `updateWebhook()`, `deleteWebhook()`
 
 `renderMediaOnFarm()` cancels what it abandons: if its `timeoutMs` (default

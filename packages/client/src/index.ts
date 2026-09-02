@@ -273,7 +273,31 @@ export async function bundleAndUpload(options: BundleAndUploadOptions): Promise<
   return {...metadata, alreadyRegistered: upload.alreadyRegistered};
 }
 
-export function verifyWebhookSignature(options: {body: string | Uint8Array; timestamp: string; signature: string; secret: string}): boolean {
+/** Default replay window for `verifyWebhookSignature`: five minutes either way. */
+export const WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300;
+
+/**
+ * Verify a farm webhook delivery: the `X-Decent-Timestamp` must be within
+ * `toleranceSeconds` of `now` (default 300 s / `Date.now()`), and the
+ * `X-Decent-Signature` must be the hex HMAC-SHA256 of `<timestamp>.<body>`
+ * under the endpoint secret. The timestamp is inside the signed bytes, so a
+ * replayed delivery cannot be re-dated; the window is what makes a captured
+ * delivery worthless after five minutes. Retries of one notification share an
+ * `X-Decent-Delivery-Id` — dedupe on that, not on the timestamp.
+ */
+export function verifyWebhookSignature(options: {
+  body: string | Uint8Array;
+  timestamp: string;
+  signature: string;
+  secret: string;
+  /** Seconds either side of `now` the timestamp may fall in. Default 300. */
+  toleranceSeconds?: number;
+  /** Unix seconds "now" — injectable for tests. Default `Date.now() / 1000`. */
+  now?: number;
+}): boolean {
+  const tolerance = options.toleranceSeconds ?? WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS;
+  const now = options.now ?? Date.now() / 1000;
+  const ts = /^\d{1,12}$/.test(options.timestamp) ? Number(options.timestamp) : Number.NaN;
   const body = typeof options.body === 'string' ? options.body : Buffer.from(options.body).toString('utf8');
   const expected = createHmac('sha256', options.secret).update(`${options.timestamp}.${body}`).digest('hex');
   const left = Buffer.from(expected, 'hex');

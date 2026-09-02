@@ -28,6 +28,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'renderMediaOnFarm',
   'updateWebhook',
   'verifyWebhookSignature',
+  'WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS',
 ].sort();
 
 describe('public export surface (D-15 / U-16)', () => {

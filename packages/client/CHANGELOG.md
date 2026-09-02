@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 — unreleased
+
+- **Behaviour:** `verifyWebhookSignature()` now enforces a replay window —
+  a delivery whose `X-Decent-Timestamp` is more than `toleranceSeconds`
+  (default 300) from `now` returns `false` before the HMAC is compared, and a
+  timestamp that is not a unix-seconds integer never verifies. Pass
+  `toleranceSeconds` to widen the window, `now` to pin the clock in tests.
+  New export `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS`. Test fixtures with a
+  fixed old timestamp must pass `now` (or a wide tolerance).
+
 ## 0.2.0 — 2026-09-02
 
 - **Breaking (types):** `creditsSettled` on complete-status responses and in

@@ -167,9 +167,39 @@ describe('farm client', () => {
     const body = '{"event":"render.complete"}';
     const secret = 'whsec_test';
     const timestamp = '1783850400';
+    const now = 1783850400;
     const signature = createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');
-    expect(verifyWebhookSignature({body, timestamp, signature, secret})).toBe(true);
-    expect(verifyWebhookSignature({body, timestamp, signature: `${signature.slice(0, -1)}0`, secret})).toBe(false);
+    expect(verifyWebhookSignature({body, timestamp, signature, secret, now})).toBe(true);
+    expect(verifyWebhookSignature({body, timestamp, signature: `${signature.slice(0, -1)}0`, secret, now})).toBe(false);
+  });
+
+  it('rejects a delivery outside the replay window, in either direction, and accepts the edge', () => {
+    const body = '{"event":"render.complete"}';
+    const secret = 'whsec_test';
+    const timestamp = '1783850400';
+    const signature = createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');
+    const ok = (now: number, toleranceSeconds?: number) =>
+      verifyWebhookSignature({body, timestamp, signature, secret, now, toleranceSeconds});
+    expect(ok(1783850400 + 300)).toBe(true);   // exactly at the edge
+    expect(ok(1783850400 - 300)).toBe(true);
+    expect(ok(1783850400 + 301)).toBe(false);  // stale
+    expect(ok(1783850400 - 301)).toBe(false);  // from the future
+    expect(ok(1783850400 + 3000, 3600)).toBe(true); // a wider window is the caller's call
+    // A timestamp that is not a unix-seconds integer never verifies, even with a correct HMAC.
+    const odd = 'not-a-number';
+    const oddSig = createHmac('sha256', secret).update(`${odd}.${body}`).digest('hex');
+    expect(verifyWebhookSignature({body, timestamp: odd, signature: oddSig, secret, now: 0})).toBe(false);
+  });
+
+  it('defaults to the wall clock: a delivery signed now verifies, one from an hour ago does not', () => {
+    const body = '{"event":"render.complete"}';
+    const secret = 'whsec_test';
+    const fresh = String(Math.floor(Date.now() / 1000));
+    const freshSig = createHmac('sha256', secret).update(`${fresh}.${body}`).digest('hex');
+    expect(verifyWebhookSignature({body, timestamp: fresh, signature: freshSig, secret})).toBe(true);
+    const old = String(Math.floor(Date.now() / 1000) - 3600);
+    const oldSig = createHmac('sha256', secret).update(`${old}.${body}`).digest('hex');
+    expect(verifyWebhookSignature({body, timestamp: old, signature: oldSig, secret})).toBe(false);
   });
 
   it('bundles, creates a tar.gz, uploads it, and finalizes registration', async () => {
