@@ -145,8 +145,9 @@ export default function App() {
 			workdirRoot: null,
 			allowRealJobsDefault: allowRealJobs,
 		});
-		invoke('save_token_cmd', {token});
 		try {
+			// Rejects a paste that cannot be a fleet token (same gate as `decent login`).
+			await invoke('save_token_cmd', {token});
 			await invoke('start_connection', {dispatchUrl, token});
 		} catch (e) {
 			alert(`Failed to start: ${e}`);

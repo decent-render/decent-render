@@ -23,6 +23,7 @@ use supervisor_core::dispatch_url::{validate_dispatch_url, DEFAULT_DISPATCH_WS};
 use supervisor_core::keepawake::{self, KeepAwakeState};
 use supervisor_core::protocol::{Platform, RegisterMessage, PROTOCOL_VERSION};
 use supervisor_core::status::{Observability, SupervisorStatus};
+use supervisor_core::worker_token::{base64url_decode, validate_worker_token_shape};
 
 const SUPERVISOR_VERSION: &str = concat!("rust-", env!("CARGO_PKG_VERSION"));
 
@@ -95,89 +96,41 @@ fn delete_token() -> anyhow::Result<()> {
 }
 
 /// Current epoch time in milliseconds (for status-snapshot freshness).
-/// PACKET 40 (audit-api-ux): a worker token is a JWT — three
-/// dot-separated base64url segments, each non-empty, header/payload
-/// decodable as JSON, and a payload carrying the claims this fleet mints
-/// (service / tenant / platform family). Placeholder strings ("paste-your-
-/// token-here", shell leftovers) and truncations fail with a message that
-/// names WHAT was wrong — never the token itself.
-pub(crate) fn validate_worker_token_shape(token: &str) -> anyhow::Result<()> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        anyhow::bail!(
-            "not a worker token: expected three dot-separated parts, got {} \
-             (a JWT looks like <header>.<payload>.<signature>)",
-            parts.len()
-        );
+/// The last `n` lines of `text`, in order. `n == 0` → nothing.
+fn tail_lines(text: &str, n: usize) -> Vec<&str> {
+    if n == 0 {
+        return Vec::new();
     }
-    if parts.iter().any(|p| p.is_empty()) {
-        anyhow::bail!("not a worker token: one of the three parts is empty (truncated paste?)");
-    }
-    if token.len() < 40 {
-        anyhow::bail!(
-            "not a worker token: {} characters is too short for any JWT this fleet issues",
-            token.len()
-        );
-    }
-    if !token
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_' || b == b'=')
-    {
-        anyhow::bail!(
-            "not a worker token: contains characters outside base64url + dots \
-             (whitespace, quotes, or a paste artifact)"
-        );
-    }
-    // Header + payload must be real base64url JSON.
-    let decode = |s: &str| {
-        base64url_decode(s).ok_or_else(|| anyhow::anyhow!("a segment is not valid base64url"))
-    };
-    let header = decode(parts[0])?;
-    let payload = decode(parts[1])?;
-    serde_json::from_slice::<serde_json::Value>(&header)
-        .map_err(|_| anyhow::anyhow!("token header is not JSON (wrong paste?)"))?;
-    let payload: serde_json::Value = serde_json::from_slice(&payload)
-        .map_err(|_| anyhow::anyhow!("token payload is not JSON (wrong paste?)"))?;
-    // Fleet tokens carry worker identity claims; a JWT without ANY of them
-    // is some other system's token pasted by mistake.
-    let has_claim = [
-        "service",
-        "tenant",
-        "workerId",
-        "worker_id",
-        "platform",
-        "deviceId",
-    ]
-    .iter()
-    .any(|k| payload.get(*k).is_some());
-    if !has_claim {
-        anyhow::bail!(
-            "this JWT carries no worker claims (service/tenant/workerId) — \
-             it is probably a token for a different system"
-        );
-    }
-    Ok(())
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].to_vec()
 }
 
-/// Minimal base64url decode (no padding requirement) for shape validation.
-fn base64url_decode(s: &str) -> Option<Vec<u8>> {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits = 0u32;
-    for &b in s.as_bytes() {
-        if b == b'=' {
-            break;
+/// Print whatever the daemon appends after `offset`, until Ctrl-C. A file
+/// that shrinks (log rotated/truncated) is re-read from the start.
+async fn follow_log(path: &std::path::Path, mut offset: u64) -> anyhow::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
         }
-        let v = ALPHABET.iter().position(|&a| a == b)? as u32;
-        buf = (buf << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
+        let Ok(mut file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < offset {
+            offset = 0;
         }
+        if len == offset {
+            continue;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        print!("{buf}");
+        offset = len;
     }
-    Some(out)
 }
 
 fn now_ms() -> u64 {
@@ -376,6 +329,15 @@ enum Command {
     /// Check this node: token, daemon, dispatch reachability, disk, version.
     /// Prints one line per check and exits 1 if any check FAILED.
     Doctor,
+    /// Show the daemon's log (the file `decent install` pointed launchd/systemd at).
+    Logs {
+        /// Number of lines from the end to print.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+        /// Keep printing as the daemon appends (Ctrl-C to stop).
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Upgrade decent — Homebrew on macOS, the release installer on Linux —
     /// then restart the daemon so it runs the new binary. One-command update.
     Upgrade,
@@ -876,6 +838,28 @@ async fn main() -> anyhow::Result<()> {
             let code = run_doctor().await;
             std::process::exit(code);
         }
+        Command::Logs { lines, follow } => {
+            let path = service::default_log_path(&token_path()?)?;
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!(
+                        "no log at {} — the daemon has not written one yet (run `decent install`, then `decent status`)",
+                        path.display()
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            eprintln!("── {} ──", path.display());
+            for line in tail_lines(&text, lines) {
+                println!("{line}");
+            }
+            if follow {
+                follow_log(&path, text.len() as u64).await?;
+            }
+            Ok(())
+        }
         Command::Status => {
             let token = load_token();
             println!(
@@ -1098,6 +1082,20 @@ fn update_line(update_available: Option<&str>, connection: &str) -> String {
         Some(v) => format!("⚠ {v} available — run `decent upgrade`"),
         None if connection == "Registered" => "up to date".to_string(),
         None => "unknown (daemon not registered with dispatch)".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tail_lines_tests {
+    use super::tail_lines;
+
+    #[test]
+    fn last_n_in_order_fewer_than_n_all_zero_none() {
+        let text = "a\nb\nc\nd\n";
+        assert_eq!(tail_lines(text, 2), vec!["c", "d"]);
+        assert_eq!(tail_lines(text, 10), vec!["a", "b", "c", "d"]);
+        assert_eq!(tail_lines(text, 0), Vec::<&str>::new());
+        assert_eq!(tail_lines("", 3), Vec::<&str>::new());
     }
 }
 

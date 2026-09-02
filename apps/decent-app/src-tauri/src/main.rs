@@ -180,9 +180,15 @@ fn get_token() -> String {
     load_token()
 }
 
+/// Same shape gate as `decent login`: a placeholder, a truncated paste or a
+/// JWT from some other system is refused with a message that names what was
+/// wrong — the keychain never receives it.
 #[tauri::command]
-fn save_token_cmd(token: String) {
-    save_token(&token);
+fn save_token_cmd(token: String) -> Result<(), String> {
+    let token = token.trim();
+    supervisor_core::worker_token::validate_worker_token_shape(token).map_err(|e| e.to_string())?;
+    save_token(token);
+    Ok(())
 }
 
 #[tauri::command]
@@ -210,6 +216,8 @@ async fn start_connection(
     // Same gate as the CLI: a ws:// URL to a remote host would ship the
     // worker token in cleartext. Refused before the token is even saved.
     supervisor_core::dispatch_url::validate_dispatch_url(&dispatch_url)
+        .map_err(|e| e.to_string())?;
+    supervisor_core::worker_token::validate_worker_token_shape(token.trim())
         .map_err(|e| e.to_string())?;
     let mut conn_guard = state.conn.lock().await;
     if conn_guard.is_some() {

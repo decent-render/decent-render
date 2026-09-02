@@ -119,6 +119,9 @@ decent upgrade
 # freshness, dispatch reachability, disk, version — exit 1 if anything FAILED.
 decent doctor
 
+# The daemon's log: last 50 lines (-n to change), -f to follow.
+decent logs -n 100 -f
+
 # Or run the foreground terminal dashboard instead of the daemon.
 # (Both default to the production dispatch URL; override with --dispatch-url.)
 decent tui --allow-real-jobs

@@ -27,3 +27,4 @@ pub mod purge;
 pub mod runner;
 pub mod status;
 pub mod sweep;
+pub mod worker_token;
