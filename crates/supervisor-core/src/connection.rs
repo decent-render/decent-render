@@ -13,6 +13,9 @@
 //!
 //! There is no `ServerMessageHandler` trait — the observation mechanism is
 //! the [`Observability`] bundle alone. One mechanism, not two.
+//!
+//! The crate's tests for everything in this file live in the child module
+//! `connection/tests.rs` (declared below as `#[cfg(test)] mod tests;`).
 
 use std::time::{Duration, SystemTime};
 
