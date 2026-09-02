@@ -298,6 +298,7 @@ export function verifyWebhookSignature(options: {
   const tolerance = options.toleranceSeconds ?? WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS;
   const now = options.now ?? Date.now() / 1000;
   const ts = /^\d{1,12}$/.test(options.timestamp) ? Number(options.timestamp) : Number.NaN;
+  if (!Number.isFinite(ts) || Math.abs(now - ts) > tolerance) return false;
   const body = typeof options.body === 'string' ? options.body : Buffer.from(options.body).toString('utf8');
   const expected = createHmac('sha256', options.secret).update(`${options.timestamp}.${body}`).digest('hex');
   const left = Buffer.from(expected, 'hex');
