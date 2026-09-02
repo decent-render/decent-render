@@ -113,6 +113,12 @@ fn ensure_private_log_file(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The closing line of `decent status` when something above was not the
+/// happy path — the doctor is where the detail lives. `None` on a healthy node.
+fn status_hint(attention: bool) -> Option<&'static str> {
+    attention.then_some("run `decent doctor` for the full check (token modes, log, dispatch, disk)")
+}
+
 /// The last `n` lines of `text`, in order. `n == 0` → nothing.
 fn tail_lines(text: &str, n: usize) -> Vec<&str> {
     if n == 0 {
@@ -885,6 +891,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Status => {
             let token = load_token();
+            // Anything below that is not the happy path flips this, and the
+            // last line then points at `decent doctor` (the full check).
+            let mut attention = token.is_empty();
             println!(
                 "token stored : {}",
                 if token.is_empty() {
@@ -894,6 +903,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             );
             let daemon = service::state();
+            attention |= daemon != DaemonState::Running;
             let daemon_state = match daemon {
                 DaemonState::NotInstalled => "not installed — run `decent install`",
                 DaemonState::Running => "running",
@@ -938,6 +948,7 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 Some(_) => {
+                    attention = true;
                     println!("connection  : stale (no recent snapshot — daemon may have stopped)");
                     // PACKET 40 (audit 18): the snapshot exists but is stale —
                     // whatever it says about updates is out of date. Never
@@ -945,6 +956,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("update      : unknown (snapshot is stale)");
                 }
                 None => {
+                    attention = true;
                     if daemon == DaemonState::Running {
                         println!("connection  : (no live snapshot — daemon starting, or an older binary)");
                     }
@@ -952,6 +964,12 @@ async fn main() -> anyhow::Result<()> {
                     // NOTHING about update state. Say so instead of "up to date".
                     println!("update      : unknown (no recent snapshot)");
                 }
+            }
+            if let Ok(log) = token_path().and_then(|t| service::default_log_path(&t)) {
+                println!("log         : {}  (`decent logs -f`)", log.display());
+            }
+            if let Some(hint) = status_hint(attention) {
+                println!("hint        : {hint}");
             }
             Ok(())
         }
@@ -1147,6 +1165,17 @@ mod log_file_tests {
             "existing content is never truncated"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod status_hint_tests {
+    use super::status_hint;
+
+    #[test]
+    fn hint_only_when_something_needs_attention() {
+        assert!(status_hint(false).is_none());
+        assert!(status_hint(true).unwrap().contains("decent doctor"));
     }
 }
 
