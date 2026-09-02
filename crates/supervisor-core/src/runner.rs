@@ -902,6 +902,16 @@ async fn run_job_inner(
     })
 }
 
+/// The belt-and-braces signal guard (see `terminate_child`): pid 0 is never
+/// a valid target (`killpg(0, …)` means "the caller's own group" — the
+/// supervisor and the operator's shell) and the supervisor's own pid must
+/// never be signalled even if a refactor hands terminate a pid it did not
+/// spawn. Pure so it is unit-testable (packet 66: the `&&` here survived a
+/// full mutants run as an inline expression).
+fn is_safe_signal_target(pid: u32, me: u32) -> bool {
+    pid != 0 && pid != me
+}
+
 /// Signal the runner's process group and wait out the grace period, then
 /// kill any browser the exec wrapper recorded (Defect A backstop).
 ///
@@ -937,7 +947,7 @@ async fn terminate_child(child: &mut Child, browser_pidfile: Option<&Path>) {
             // Belt-and-braces: pid 0 is never a valid target for us, and the
             // supervisor's own pid must never be signalled, even if a future
             // refactor hands terminate a pid it did not spawn.
-            let safe = pid != 0 && pid != std::process::id();
+            let safe = is_safe_signal_target(pid, std::process::id());
             if safe {
                 let rc = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) };
                 tracing::info!(pid, rc, "TERM sent to process group");
@@ -954,7 +964,7 @@ async fn terminate_child(child: &mut Child, browser_pidfile: Option<&Path>) {
         Err(_) => {
             #[cfg(unix)]
             if let Some(pid) = child.id() {
-                let safe = pid != 0 && pid != std::process::id();
+                let safe = is_safe_signal_target(pid, std::process::id());
                 if safe {
                     let _ = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
                 }
@@ -1134,6 +1144,27 @@ junk
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PACKET 66 (N-13 #11-#12): the safe-signal predicate is pinned — pid 0
+    /// ("the caller's own group" under killpg) and the supervisor's own pid
+    /// are never signalled; any other pid is. Kills the `&&` → `||` mutants:
+    /// the OR reads "safe" for pid 0 and for our own pid.
+    #[test]
+    fn safe_signal_target_rejects_zero_and_self_accepts_others() {
+        let me = std::process::id();
+        assert!(
+            !is_safe_signal_target(0, me),
+            "pid 0 is never a valid target"
+        );
+        assert!(
+            !is_safe_signal_target(me, me),
+            "our own pid is never a valid target"
+        );
+        assert!(
+            is_safe_signal_target(4_194_304, me),
+            "an unrelated pid is a valid target"
+        );
+    }
 
     /// C-3 / audit U-12: the runner↔supervisor stdout contract is pinned by
     /// the SAME fixture file the TS side (runner-core's conformance test)
