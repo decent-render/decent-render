@@ -572,6 +572,64 @@ pub fn cache_keys_for(assign: &JobAssignMessage) -> Vec<String> {
     keys
 }
 
+/// Variables the runner child may inherit. Everything else is DROPPED.
+///
+/// The supervisor's environment is the operator's shell, and it routinely
+/// carries fleet credentials (`WORKER_TOKEN=… decent start`) and cloud
+/// secrets (AWS_*/GITHUB_TOKEN/NPM_TOKEN/…) that no render — and no Chrome
+/// under a render — has any business reading. Allow by exact name or by
+/// prefix; deny everything else (an allowlist, deliberately NOT a denylist:
+/// an unknown secret variable must not get a permanent entry on some list).
+pub(crate) fn child_env(parent: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
+    const EXACT: &[&str] = &[
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LANGUAGE",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TZ",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "LD_LIBRARY_PATH",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NODE_EXTRA_CA_CERTS",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ];
+    const PREFIXES: &[&str] = &[
+        "LC_",
+        "XDG_",
+        "FONTCONFIG_",
+        "DECENT_",
+        "REMOTION_",
+        "CHROME_",
+        "PUPPETEER_",
+    ];
+    parent
+        .filter(|(k, _)| EXACT.contains(&k.as_str()) || PREFIXES.iter().any(|p| k.starts_with(p)))
+        .collect()
+}
+
+/// Clear whatever the supervisor inherited and install the allowlisted
+/// environment (see [`child_env`]). Caller-set variables (e.g.
+/// DECENT_BROWSER_EXECUTABLE) are applied AFTER this so they still win.
+fn apply_child_env(command: &mut Command, parent: impl Iterator<Item = (String, String)>) {
+    command.env_clear();
+    for (k, v) in child_env(parent) {
+        command.env(k, v);
+    }
+}
+
 pub async fn run_job(
     assign: JobAssignMessage,
     mut cancel_rx: oneshot::Receiver<()>,
@@ -655,6 +713,12 @@ async fn run_job_inner(
         .context("install browser exec wrapper")?
         .map(|(_wrapper, pidfile)| pidfile);
     let mut command = Command::new(&runner);
+    // PACKET 67: the child inherits an ALLOWLISTED environment, never the
+    // supervisor's shell — `WORKER_TOKEN=… decent start` hands the fleet
+    // credential to every render otherwise. `env_clear` first, then the
+    // allowlist; DECENT_BROWSER_EXECUTABLE below is applied after this and
+    // therefore still wins.
+    apply_child_env(&mut command, std::env::vars());
     // The wire carries a sha and a URL; the local filesystem path is this
     // node's business alone, so it is handed over out-of-band rather than
     // being spliced into the jobAssign frame the runner parses.
@@ -1144,6 +1208,105 @@ junk
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── PACKET 67: the runner child's allowlisted environment ─────────────
+
+    #[test]
+    fn child_env_drops_everything_not_allowlisted() {
+        let parent = [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/op"),
+            ("WORKER_TOKEN", "fleet-credential"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
+            ("GITHUB_TOKEN", "gh-token"),
+            ("LC_ALL", "en_US.UTF-8"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("DECENT_FOO", "x"),
+        ];
+        let child = child_env(parent.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let mut names: Vec<&str> = child.iter().map(|(k, _)| k.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["DECENT_FOO", "HOME", "LC_ALL", "PATH", "XDG_RUNTIME_DIR"],
+            "exactly the allowlisted names survive: {child:?}"
+        );
+    }
+
+    /// The REAL env-building code path (the same `apply_child_env` the spawn
+    /// calls) must leave the runner script an environment WITHOUT the
+    /// operator's secrets and WITH the basics. The parent iterator is passed
+    /// explicitly (no `std::env::set_var` — this binary runs tests in
+    /// parallel and no other runner.rs test reads env).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_runner_does_not_see_the_supervisors_secrets() {
+        let dir = std::env::temp_dir().join(format!(
+            "p67-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("runner-script.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh
+env
+",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dir_str = dir.display().to_string();
+        let parent: [(&str, &str); 3] = [
+            ("PATH", "/usr/bin:/bin"),
+            ("WORKER_TOKEN", "leak"),
+            ("HOME", dir_str.as_str()),
+        ];
+        let mut command = Command::new(&script);
+        apply_child_env(
+            &mut command,
+            parent
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let out = command.output().await.expect("spawn the runner script");
+        assert!(out.status.success(), "script failed: {out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            !stdout.contains("WORKER_TOKEN"),
+            "the fleet credential leaked into the runner env: {stdout}"
+        );
+        assert!(!stdout.contains("leak"), "secret value leaked: {stdout}");
+        assert!(stdout.contains("PATH="), "the basics must still be there");
+        // And a variable the parent iterator did NOT carry must be GONE —
+        // this is what catches a deleted `env_clear()`: without it the child
+        // inherits the whole test-process environment. Pick the first env
+        // key that fails the allowlist (there is always one) and require its
+        // absence from the child.
+        let allowlisted: std::collections::HashSet<String> = child_env(std::env::vars())
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let intruder = std::env::vars()
+            .map(|(k, _)| k)
+            .find(|k| !allowlisted.contains(k) && k.as_str() != "WORKER_TOKEN")
+            .expect("the test process has a non-allowlisted env var to probe with");
+        assert!(
+            !intruder.is_empty(),
+            "no non-allowlisted env var found to probe with"
+        );
+        assert!(
+            !stdout.contains(&intruder),
+            "the child inherited non-allowlisted {intruder} — env_clear is missing"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// PACKET 66 (N-13 #11-#12): the safe-signal predicate is pinned — pid 0
     /// ("the caller's own group" under killpg) and the supervisor's own pid
