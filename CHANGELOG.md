@@ -8,6 +8,10 @@ The format follows Keep a Changelog and semantic versioning.
 
 ## [Unreleased]
 
+## [0.0.11] - 2026-09-02
+
+The two things the first real 0.0.10 rollout found in `decent upgrade`.
+
 ### Fixed
 
 - **`decent upgrade` claimed success on a no-op and restarted the daemon
