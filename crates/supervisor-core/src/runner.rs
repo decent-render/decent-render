@@ -162,7 +162,7 @@ static WORKER_ROOT_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock:
 /// means `rm -rf` globs pointed at the real cache, and one slightly wrong glob
 /// deletes a real payload. Redirecting the root removes the hazard entirely
 /// rather than managing it.
-pub(crate) fn worker_root() -> anyhow::Result<PathBuf> {
+pub fn worker_root() -> anyhow::Result<PathBuf> {
     if let Some(root) = WORKER_ROOT_OVERRIDE.get() {
         return Ok(root.clone());
     }

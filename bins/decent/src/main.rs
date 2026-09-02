@@ -1320,7 +1320,7 @@ fn file_and_dir_modes(path: &std::path::Path) -> (u32, u32) {
 }
 
 #[cfg(not(unix))]
-fn file_and_dir_modes(_path: &Path) -> (u32, u32) {
+fn file_and_dir_modes(_path: &std::path::Path) -> (u32, u32) {
     (0o600, 0o700)
 }
 
@@ -1418,10 +1418,21 @@ fn status_file_check() -> Check {
 /// The dispatch health endpoint derived from Start's default dispatch URL:
 /// ws→https, wss→https, path `/health`.
 fn dispatch_health_url() -> String {
-    let http = DEFAULT_DISPATCH_WS
-        .replacen("wss://", "https://", 1)
-        .replacen("ws://", "http://", 1);
-    format!("{}/health", http.trim_end_matches('/'))
+    // The dispatch URL is a WebSocket URL (`wss://host/ws`); the health
+    // endpoint lives on the ORIGIN (`https://host/health`) — appending
+    // `/health` to the socket path would probe a route that does not exist
+    // (found by the first doctor smoke run).
+    let parsed = url::Url::parse(DEFAULT_DISPATCH_WS).expect("the default dispatch URL is valid");
+    let scheme = match parsed.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        other => other,
+    };
+    format!(
+        "{}://{}/health",
+        scheme,
+        parsed.host_str().unwrap_or("<unknown>")
+    )
 }
 
 async fn dispatch_check() -> Check {
@@ -1453,13 +1464,24 @@ async fn dispatch_check() -> Check {
 /// (statvfs: f_bavail × f_frsize).
 #[cfg(unix)]
 fn worker_root_free_bytes() -> anyhow::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
     let root = supervisor_core::runner::worker_root()?;
-    let c = std::ffi::CString::new(root.as_os_str().to_str().unwrap_or(""))?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut stat) };
-    if rc != 0 {
-        anyhow::bail!("statvfs failed on {}", root.display());
-    }
+    // The worker root may not EXIST yet (a fresh HOME): statvfs requires an
+    // existing path, so walk up to the nearest existing ancestor — the free
+    // bytes of the volume are what the operator cares about.
+    let mut probe: &std::path::Path = root.as_path();
+    let stat = loop {
+        let c = std::ffi::CString::new(probe.as_os_str().as_bytes())
+            .map_err(|_| anyhow::anyhow!("worker root path is not valid C: {}", probe.display()))?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0 {
+            break st;
+        }
+        match probe.parent() {
+            Some(parent) if parent != probe => probe = parent,
+            _ => anyhow::bail!("statvfs failed for {} and every ancestor", root.display()),
+        }
+    };
     Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
