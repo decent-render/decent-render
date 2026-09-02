@@ -91,6 +91,12 @@ pub(crate) fn parse_workdir_bytes_override(raw: Option<&str>) -> u64 {
 #[derive(Debug)]
 pub struct InFlightJob {
     pub job_id: String,
+    /// The assignment lease this in-flight job belongs to (C-4). Terminal
+    /// frames are guarded by (job_id, attempt): dispatch requeues a failed
+    /// or refunded job as attempt+1 of the same job id, so matching by job
+    /// id alone would let a late attempt-N frame clear an in-flight
+    /// attempt-N+1 render.
+    pub attempt: Option<u32>,
     pub cancel: Option<oneshot::Sender<()>>,
     /// The cache keys (kind:sha) this job is using — its payload, browser
     /// and bundle shas. Consumed by the post-termination cache sweep so a

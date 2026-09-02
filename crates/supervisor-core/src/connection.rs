@@ -194,6 +194,28 @@ enum Disconnect {
 /// until the render tree is dead and the workdir purged.
 ///
 /// `run()` (below) calls this in a loop when `config.reconnect` is set.
+/// C-4 (audit T-15): does this terminal frame belong to the in-flight job?
+/// Both the job id AND the attempt must match — dispatch requeues a failed
+/// or refunded job as attempt+1 of the SAME job id, so a terminal frame for
+/// attempt N (a draining teardown from an earlier cancel, or any late
+/// frame) must never clear an in-flight attempt N+1: that would drop the
+/// JoinHandle un-awaited (the strand packet 5 exists to prevent), show the
+/// node idle while a render runs, and remove the busy rejection that
+/// protects it. Attempt equality is `Option<u32>` equality: a frame WITHOUT
+/// an attempt matches only an in-flight job WITHOUT an attempt.
+fn frame_is_for(
+    in_flight: Option<(&str, Option<u32>)>,
+    job_id: &str,
+    attempt: Option<u32>,
+) -> bool {
+    match in_flight {
+        Some((in_flight_id, in_flight_attempt)) => {
+            in_flight_id == job_id && in_flight_attempt == attempt
+        }
+        None => false,
+    }
+}
+
 async fn run_session(
     config: &ConnectionConfig,
     request: &tokio_tungstenite::tungstenite::handshake::client::Request,
@@ -437,11 +459,14 @@ async fn run_session(
     let mut heartbeats_sent = 0u32;
     let (worker_tx, mut worker_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerMessage>();
     let mut in_flight: Option<InFlightJob> = None;
-    // Job id of the last dispatch-initiated cancel whose terminal frame has
-    // not been observed yet. Recorded at cancel receipt — BEFORE the runner is
-    // killed — so the render abort that follows is never mistaken for a
-    // genuine failure. Cleared when that job's terminal frame arrives.
-    let mut canceled_job: Option<String> = None;
+    // Job id + attempt of the last dispatch-initiated cancel whose terminal
+    // frame has not been observed yet. Recorded at cancel receipt — BEFORE
+    // the runner is killed — so the render abort that follows is never
+    // mistaken for a genuine failure. Cleared when that job's terminal frame
+    // arrives. The attempt comes from the in-flight record being torn down:
+    // `CancelMessage` carries no attempt on the wire, and a cancel can only
+    // apply to the job actually in flight.
+    let mut canceled_job: Option<(String, Option<u32>)> = None;
 
     // PACKET 5: a dispatch-canceled job whose terminate is still running.
     // The Cancel arm hands the job here instead of dropping its task handle —
@@ -576,9 +601,13 @@ async fn run_session(
                 }
             }
             Some(msg) = worker_rx.recv() => {
-                let terminal_job_id = match &msg {
-                    WorkerMessage::JobComplete(c) => Some(c.job_id.clone()),
-                    WorkerMessage::JobFailed(f) => Some(f.job_id.clone()),
+                // C-4: terminal frames carry (job_id, attempt); the attempt
+                // rides along so the guard below can match the pair.
+                let terminal = match &msg {
+                    WorkerMessage::JobComplete(c) => {
+                        Some((c.job_id.as_str(), c.attempt))
+                    }
+                    WorkerMessage::JobFailed(f) => Some((f.job_id.as_str(), f.attempt)),
                     _ => None,
                 };
                 // A terminal frame for a job dispatch already canceled is the
@@ -597,12 +626,24 @@ async fn run_session(
                 //
                 // The workdir purge happened in the runner regardless.
                 let suppress_after_cancel = match &msg {
-                    WorkerMessage::JobFailed(f) => canceled_job.as_deref() == Some(f.job_id.as_str()),
-                    WorkerMessage::JobComplete(c) => canceled_job.as_deref() == Some(c.job_id.as_str()),
+                    WorkerMessage::JobFailed(f) => frame_is_for(
+                        canceled_job.as_ref().map(|(id, attempt)| (id.as_str(), *attempt)),
+                        f.job_id.as_str(),
+                        f.attempt,
+                    ),
+                    WorkerMessage::JobComplete(c) => frame_is_for(
+                        canceled_job.as_ref().map(|(id, attempt)| (id.as_str(), *attempt)),
+                        c.job_id.as_str(),
+                        c.attempt,
+                    ),
                     _ => false,
                 };
-                if let Some(id) = terminal_job_id.as_deref() {
-                    if in_flight.as_ref().map(|j| j.job_id.as_str()) == Some(id) {
+                if let Some((id, attempt)) = terminal {
+                    if frame_is_for(
+                        in_flight.as_ref().map(|j| (j.job_id.as_str(), j.attempt)),
+                        id,
+                        attempt,
+                    ) {
                         // Cache sweep (2.9): the job's artifacts were just
                         // used — protect them, evict older LRU entries down
                         // to the cap. Runs here, at termination, never on a
@@ -641,7 +682,17 @@ async fn run_session(
                         }
                         in_flight = None;
                     }
-                    if canceled_job.as_deref() == Some(id) {
+                    if canceled_job
+                        .as_ref()
+                        .map(|(canceled_id, canceled_attempt)| {
+                            frame_is_for(
+                                Some((canceled_id.as_str(), *canceled_attempt)),
+                                id,
+                                attempt,
+                            )
+                        })
+                        .unwrap_or(false)
+                    {
                         canceled_job = None;
                     }
                 }
@@ -761,6 +812,7 @@ async fn run_session(
                                         // PACKET 5: keep the JoinHandle — every exit path awaits it.
                                         in_flight = Some(InFlightJob {
                                             job_id: job_id_owned,
+                                            attempt: assign_snapshot.attempt,
                                             cancel: Some(cancel_tx),
                                             cache_keys: crate::runner::cache_keys_for(&assign_snapshot),
                                             handle,
@@ -771,11 +823,14 @@ async fn run_session(
                                             == Some(cancel.job_id.as_str()) =>
                                     {
                                         if let Some(mut job) = in_flight.take() {
-                                            // Mark the job canceled BEFORE killing the
-                                            // render, so the abort that follows can
-                                            // never race past the marker and surface
-                                            // as a genuine jobFailed.
-                                            canceled_job = Some(job.job_id.clone());
+                                            // C-4: record the pair (job, attempt)
+                                            // being torn down — `CancelMessage`
+                                            // carries no attempt on the wire, so
+                                            // the attempt comes from the in-flight
+                                            // record; only THAT attempt's terminal
+                                            // frame is the cancel's expected outcome.
+                                            canceled_job =
+                                                Some((job.job_id.clone(), job.attempt));
                                             obs.update_status(|s| {
                                                 if let Some(j) = &mut s.current_job {
                                                     j.phase = JobPhase::Canceled;

@@ -2860,3 +2860,26 @@ async fn error_event_terminates_child_tree_before_purge() {
     client.await.unwrap().expect("clean exit");
     std::fs::remove_dir_all(&payload_dir).ok();
 }
+
+// ── C-4 (audit T-15): the terminal-frame guard matches (job_id, attempt) ───
+
+#[test]
+fn frame_is_for_matches_id_and_attempt_pairs() {
+    // Same id + same attempt → the frame is for the in-flight job.
+    assert!(frame_is_for(Some(("job", Some(1))), "job", Some(1)));
+    // Same id, attempt 1 vs 2 → dispatch requeues a failed/refunded job as
+    // attempt+1 of the SAME id; a frame for the earlier attempt must NOT
+    // match the in-flight attempt.
+    assert!(!frame_is_for(Some(("job", Some(2))), "job", Some(1)));
+    assert!(!frame_is_for(Some(("job", Some(1))), "job", Some(2)));
+    // Attempt equality is Option equality: a frame WITHOUT an attempt
+    // matches only an in-flight job WITHOUT an attempt.
+    assert!(!frame_is_for(Some(("job", None)), "job", Some(1)));
+    assert!(!frame_is_for(Some(("job", Some(1))), "job", None));
+    assert!(frame_is_for(Some(("job", None)), "job", None));
+    // Different id → never.
+    assert!(!frame_is_for(Some(("other", Some(1))), "job", Some(1)));
+    // No in-flight job → nothing matches (the guard cannot fire vacuously).
+    assert!(!frame_is_for(None, "job", Some(1)));
+    assert!(!frame_is_for(None, "job", None));
+}
