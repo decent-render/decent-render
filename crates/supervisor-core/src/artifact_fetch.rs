@@ -16,6 +16,7 @@
 use anyhow::{anyhow, Context};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 /// Connect timeout for artifact fetches.
@@ -65,9 +66,16 @@ pub(crate) const ARTIFACT_MAX_EXTRACTED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// One client per supervisor process (connection reuse); per-request
 /// `.timeout()` layers the total bound on top.
 pub(crate) fn artifact_client() -> reqwest::Client {
+    artifact_client_with(ARTIFACT_CONNECT_TIMEOUT, ARTIFACT_READ_TIMEOUT)
+}
+
+/// [`artifact_client`] with INJECTED timeouts: the behaviour tests prove the
+/// connect/read bounds with tiny values (the production constants would take
+/// minutes to fire). Same builder, same options — only the durations differ.
+pub(crate) fn artifact_client_with(connect: Duration, read: Duration) -> reqwest::Client {
     reqwest::Client::builder()
-        .connect_timeout(ARTIFACT_CONNECT_TIMEOUT)
-        .read_timeout(ARTIFACT_READ_TIMEOUT)
+        .connect_timeout(connect)
+        .read_timeout(read)
         .build()
         .expect("reqwest client with plain timeouts cannot fail to build")
 }
@@ -402,6 +410,102 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    // ── PACKET 74 (N-13 old rank B): the timeouts proven BY BEHAVIOUR ────
+    //
+    // The packet-37 constants are only paper until something observes a
+    // server that violates them. These tests use tiny injected timeouts
+    // (never the production constants) against pathological servers:
+    //
+    // - a server that accepts the connection and NEVER writes (read timeout
+    //   must abort the transfer),
+    // - a black-hole address that never completes the TCP handshake
+    //   (connect timeout must abort it).
+    //
+    // Each mutant — dropping `.read_timeout` / `.connect_timeout` from the
+    // builder — turns the fast inner error into the OUTER wall-clock
+    // timeout, which the elapsed-time assertion catches.
+
+    /// Server accepts and goes silent: the per-read timeout must abort the
+    /// transfer (well inside the outer wall-clock bound) with a timeout
+    /// error, not a hang.
+    #[tokio::test]
+    async fn read_timeout_fails_a_server_that_accepts_and_never_writes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Hold the accepted socket open forever: read nothing, write
+        // nothing, never drop it inside this task.
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                let _keep_open = socket;
+                futures_util::future::pending::<()>().await;
+            }
+        });
+
+        let client = artifact_client_with(Duration::from_secs(5), Duration::from_millis(200));
+        let dest = scratch_dest("read-timeout");
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            download_to_file_hashed_capped(
+                &client,
+                &format!("http://{addr}/x"),
+                &dest,
+                "payloads",
+                1024,
+            )
+            .await
+        })
+        .await;
+        let elapsed = started.elapsed();
+
+        // The INNER result must be the error — an outer Err means the whole
+        // call hung past the wall-clock bound (the mutant signature).
+        let inner = outcome.expect("the call itself must not hit the outer timeout");
+        let error = inner.expect_err("a silent server must fail the download");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "read timeout fired late: {elapsed:?}"
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("timed out") || rendered.contains("timeout"),
+            "the error should be a timeout, got: {rendered}"
+        );
+        let _ = tokio::fs::remove_file(&dest).await;
+    }
+
+    /// A black-hole address (RFC 1918, no route): the CONNECT timeout must
+    /// abort the dial (well inside the outer wall-clock bound) instead of
+    /// hanging on SYN retransmits.
+    #[tokio::test]
+    async fn connect_timeout_fails_a_black_hole_address() {
+        let client = artifact_client_with(Duration::from_millis(300), Duration::from_secs(5));
+        let dest = scratch_dest("connect-timeout");
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+            download_to_file_hashed_capped(
+                &client,
+                "http://10.255.255.1:9/x",
+                &dest,
+                "payloads",
+                1024,
+            )
+            .await
+        })
+        .await;
+        let elapsed = started.elapsed();
+
+        let inner = outcome.expect("the call itself must not hit the outer timeout");
+        assert!(
+            inner.is_err(),
+            "a black-hole address must fail the dial: {inner:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "connect timeout fired late: {elapsed:?}"
+        );
+        let _ = tokio::fs::remove_file(&dest).await;
     }
 
     /// Exactly-at-cap content-length passes the pre-flight: the gate is
