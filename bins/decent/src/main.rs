@@ -188,6 +188,9 @@ struct DaemonSnapshot {
     jobs_failed: u64,
     jobs_canceled: u64,
     update_available: Option<String>,
+    /// N-29: the version the running daemon was built as. `None` for a
+    /// daemon older than 0.0.11 (the line did not exist).
+    supervisor_version: Option<String>,
     updated_at_ms: u64,
 }
 
@@ -247,6 +250,9 @@ fn read_daemon_snapshot_from(path: &std::path::Path) -> Option<DaemonSnapshot> {
         } else {
             Some(upd.to_string())
         },
+        supervisor_version: Some(val("supervisor_version"))
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
         updated_at_ms: val("updated_at_ms").parse().ok()?,
     })
 }
@@ -854,6 +860,11 @@ async fn main() -> anyhow::Result<()> {
                                 "update_available",
                                 s.update_available.as_deref().unwrap_or(""),
                             );
+                            // N-29: the version of the binary THIS daemon is
+                            // running. `brew upgrade` swaps the file on disk
+                            // without restarting the process; doctor/status/
+                            // upgrade compare this against the installed one.
+                            line("supervisor_version", env!("CARGO_PKG_VERSION"));
                             line("updated_at_ms", &now_ms().to_string());
                         }
                         let _ = {
@@ -1064,10 +1075,16 @@ async fn main() -> anyhow::Result<()> {
                         "jobs        : {} done · {} failed · {} canceled",
                         s.jobs_completed, s.jobs_failed, s.jobs_canceled
                     );
-                    println!(
-                        "update      : {}",
-                        update_line(s.update_available.as_deref(), &s.connection)
+                    let update = status_update_line(
+                        s.update_available.as_deref(),
+                        &s.connection,
+                        env!("CARGO_PKG_VERSION"),
+                        s.supervisor_version.as_deref(),
                     );
+                    if update.starts_with('⚠') {
+                        attention = true;
+                    }
+                    println!("update      : {update}");
                 }
                 Some(_) => {
                     attention = true;
@@ -1105,8 +1122,27 @@ async fn main() -> anyhow::Result<()> {
             //    nothing to do — and nothing to restart.
             match upgrade_binary()? {
                 UpgradeOutcome::AlreadyCurrent(v) => {
-                    println!("Already on {v} — nothing to upgrade.");
-                    return Ok(());
+                    // N-29: brew may have swapped the binary out-of-band
+                    // (`brew upgrade` on its own) while the old daemon kept
+                    // running. Then the restart IS the upgrade.
+                    let snap = read_daemon_snapshot();
+                    let state = daemon_binary_state(
+                        &v,
+                        snap.as_ref().and_then(|s| s.supervisor_version.as_deref()),
+                        snap.as_ref().and_then(|s| s.update_available.as_deref()),
+                    );
+                    match state {
+                        DaemonBinary::Stale { running } => {
+                            println!(
+                                "Already on {v}, but the daemon is still running {} — restarting it.",
+                                running.as_deref().unwrap_or("an older binary")
+                            );
+                        }
+                        _ => {
+                            println!("Already on {v} — nothing to upgrade.");
+                            return Ok(());
+                        }
+                    }
                 }
                 UpgradeOutcome::Upgraded { from, to } => {
                     println!("Upgraded decent {from} → {to}.");
@@ -1258,6 +1294,59 @@ fn update_line(update_available: Option<&str>, connection: &str) -> String {
         None if connection == "Registered" => "up to date".to_string(),
         None => "unknown (daemon not registered with dispatch)".to_string(),
     }
+}
+
+/// N-29: is the running daemon the binary that is installed on disk?
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonBinary {
+    /// The daemon reports the installed version.
+    Current,
+    /// The daemon runs an older binary (`running` = its version when it
+    /// reported one; `None` for a pre-0.0.11 daemon, inferred from the
+    /// fact that dispatch offered it exactly the version now installed).
+    Stale { running: Option<String> },
+    /// No evidence either way (old daemon, no update frame).
+    Unknown,
+}
+
+/// 2026-09-02, MacBook Air: `brew upgrade decent` (not `decent upgrade`)
+/// swapped the binary to 0.0.10 and the 0.0.9 daemon kept running with
+/// "0.0.10 available" in its snapshot; the new `decent doctor` echoed
+/// "0.0.10 — 0.0.10 available — run `decent upgrade`", which was both
+/// wrong and useless (upgrade had nothing to install). The daemon, not the
+/// binary, was the thing out of date.
+fn daemon_binary_state(
+    installed: &str,
+    snapshot_version: Option<&str>,
+    update_available: Option<&str>,
+) -> DaemonBinary {
+    match snapshot_version {
+        Some(v) if v == installed => DaemonBinary::Current,
+        Some(v) => DaemonBinary::Stale {
+            running: Some(v.to_string()),
+        },
+        None if update_available == Some(installed) => DaemonBinary::Stale { running: None },
+        None => DaemonBinary::Unknown,
+    }
+}
+
+/// The `decent status` update line, daemon-aware: a stale daemon is a
+/// restart problem, not an upgrade problem, and says so.
+fn status_update_line(
+    update_available: Option<&str>,
+    connection: &str,
+    installed: &str,
+    snapshot_version: Option<&str>,
+) -> String {
+    match daemon_binary_state(installed, snapshot_version, update_available) {
+        DaemonBinary::Stale { running } => stale_daemon_sentence(installed, running.as_deref()),
+        _ => update_line(update_available, connection),
+    }
+}
+
+fn stale_daemon_sentence(installed: &str, running: Option<&str>) -> String {
+    let running = running.unwrap_or("an older binary");
+    format!("⚠ {installed} installed — daemon still running {running} — run `decent install` to restart it")
 }
 
 #[cfg(test)]
@@ -1485,7 +1574,20 @@ fn disk_check_from(free_bytes: u64) -> Check {
 
 /// The version verdict: current crate version, with a WARN when the daemon
 /// snapshot carries an available upgrade.
-fn version_check_from(current: &str, update_available: Option<&str>) -> Check {
+fn version_check_from(
+    current: &str,
+    update_available: Option<&str>,
+    daemon_version: Option<&str>,
+) -> Check {
+    if let DaemonBinary::Stale { running } =
+        daemon_binary_state(current, daemon_version, update_available)
+    {
+        return Check {
+            name: "version",
+            level: Level::Warn,
+            detail: stale_daemon_sentence(current, running.as_deref()),
+        };
+    }
     match update_available {
         Some(newer) => Check {
             name: "version",
@@ -1698,8 +1800,14 @@ fn disk_check() -> Check {
 }
 
 fn version_check() -> Check {
-    let update = read_daemon_snapshot().and_then(|s| s.update_available);
-    version_check_from(env!("CARGO_PKG_VERSION"), update.as_deref())
+    let snap = read_daemon_snapshot();
+    let update = snap.as_ref().and_then(|s| s.update_available.clone());
+    let running = snap.as_ref().and_then(|s| s.supervisor_version.clone());
+    version_check_from(
+        env!("CARGO_PKG_VERSION"),
+        update.as_deref(),
+        running.as_deref(),
+    )
 }
 
 /// The pure log verdict: a missing log is a WARN (nothing written yet), a
@@ -1878,11 +1986,29 @@ mod doctor_tests {
     /// and stays OK otherwise.
     #[test]
     fn version_check_warns_on_an_available_upgrade() {
-        let warn = version_check_from("0.0.9", Some("0.1.0"));
+        let warn = version_check_from("0.0.9", Some("0.1.0"), None);
         assert_eq!(warn.level, Level::Warn);
         assert!(warn.detail.contains("0.1.0"), "got: {}", warn.detail);
-        let ok = version_check_from("0.0.9", None);
+        let ok = version_check_from("0.0.9", None, None);
         assert_eq!(ok.level, Level::Ok);
+        let ok = version_check_from("0.0.10", None, Some("0.0.10"));
+        assert_eq!(ok.level, Level::Ok);
+    }
+
+    /// N-29: the Air case — binary swapped by brew, daemon still old.
+    #[test]
+    fn version_check_names_a_stale_daemon_instead_of_echoing_the_update() {
+        // pre-0.0.11 daemon: no version line, but dispatch offered it
+        // exactly what is now installed
+        let w = version_check_from("0.0.10", Some("0.0.10"), None);
+        assert_eq!(w.level, Level::Warn);
+        assert!(w.detail.contains("daemon still running"), "{}", w.detail);
+        assert!(w.detail.contains("decent install"), "{}", w.detail);
+        assert!(!w.detail.contains("decent upgrade"), "{}", w.detail);
+        // 0.0.11+ daemon: says its version outright
+        let w = version_check_from("0.0.11", None, Some("0.0.10"));
+        assert_eq!(w.level, Level::Warn);
+        assert!(w.detail.contains("running 0.0.10"), "{}", w.detail);
     }
 }
 
@@ -2177,6 +2303,7 @@ mod helper_unit_tests {
             jobs_failed: 0,
             jobs_canceled: 0,
             update_available: None,
+            supervisor_version: None,
             updated_at_ms: now.saturating_sub(age_ms),
         };
         let window = FRESH_WINDOW_MS;
@@ -2504,5 +2631,101 @@ mod upgrade_tests {
     #[test]
     fn unknown_after_with_a_newer_channel_is_an_error() {
         assert!(upgrade_outcome("0.0.9", None, Some("0.0.10")).is_err());
+    }
+
+    // ── N-29: stale daemon after an out-of-band brew upgrade ────────────
+
+    #[test]
+    fn daemon_binary_state_reads_the_version_line_when_present() {
+        assert_eq!(
+            daemon_binary_state("0.0.11", Some("0.0.11"), None),
+            DaemonBinary::Current
+        );
+        assert_eq!(
+            daemon_binary_state("0.0.11", Some("0.0.10"), None),
+            DaemonBinary::Stale {
+                running: Some("0.0.10".into())
+            }
+        );
+        // a version line wins over whatever update frame the daemon saw
+        assert_eq!(
+            daemon_binary_state("0.0.11", Some("0.0.11"), Some("0.0.11")),
+            DaemonBinary::Current
+        );
+    }
+
+    #[test]
+    fn daemon_binary_state_infers_staleness_for_a_pre_0_0_11_daemon() {
+        // the Air: 0.0.9 daemon told "0.0.10 available", binary now 0.0.10
+        assert_eq!(
+            daemon_binary_state("0.0.10", None, Some("0.0.10")),
+            DaemonBinary::Stale { running: None }
+        );
+        // a genuinely newer version on offer is NOT staleness
+        assert_eq!(
+            daemon_binary_state("0.0.9", None, Some("0.0.10")),
+            DaemonBinary::Unknown
+        );
+        assert_eq!(
+            daemon_binary_state("0.0.9", None, None),
+            DaemonBinary::Unknown
+        );
+    }
+
+    #[test]
+    fn status_update_line_turns_a_stale_daemon_into_a_restart_instruction() {
+        let line = status_update_line(Some("0.0.10"), "Registered", "0.0.10", None);
+        assert!(line.starts_with('⚠'), "{line}");
+        assert!(
+            line.contains("daemon still running an older binary"),
+            "{line}"
+        );
+        assert!(line.contains("`decent install`"), "{line}");
+        assert!(!line.contains("decent upgrade"), "{line}");
+        let line = status_update_line(None, "Registered", "0.0.11", Some("0.0.10"));
+        assert!(line.contains("still running 0.0.10"), "{line}");
+        // unchanged wording when the daemon is current
+        assert_eq!(
+            status_update_line(None, "Registered", "0.0.11", Some("0.0.11")),
+            "up to date"
+        );
+        assert!(
+            status_update_line(Some("0.0.12"), "Registered", "0.0.11", Some("0.0.11"))
+                .contains("0.0.12 available")
+        );
+    }
+
+    #[test]
+    fn snapshot_reader_takes_the_version_line_and_tolerates_its_absence() {
+        let dir = std::env::temp_dir().join(format!("n29-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("daemon-status");
+        std::fs::write(
+            &path,
+            "connection=Registered\nsupervisor_version=0.0.11\nupdated_at_ms=5\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_daemon_snapshot_from(&path)
+                .unwrap()
+                .supervisor_version
+                .as_deref(),
+            Some("0.0.11")
+        );
+        std::fs::write(&path, "connection=Registered\nupdated_at_ms=5\n").unwrap();
+        assert_eq!(
+            read_daemon_snapshot_from(&path).unwrap().supervisor_version,
+            None
+        );
+        std::fs::write(
+            &path,
+            "connection=Registered\nsupervisor_version=\nupdated_at_ms=5\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_daemon_snapshot_from(&path).unwrap().supervisor_version,
+            None
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

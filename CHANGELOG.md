@@ -20,6 +20,17 @@ The format follows Keep a Changelog and semantic versioning.
   CHANGED on-disk binary as success: "Already on X — nothing to upgrade"
   (no restart) when current, and an error naming the channel version and
   the installed one when brew delivered nothing.
+- **A daemon left running an older binary was reported as "update
+  available".** After `brew upgrade decent` on its own (which swaps the
+  file but restarts nothing), `decent doctor` said "0.0.10 — 0.0.10
+  available — run `decent upgrade`" and `decent status` agreed, while
+  `decent upgrade` had nothing to install. The daemon now writes its own
+  version into the status snapshot; doctor, status and upgrade compare it
+  with the installed binary and say "daemon still running 0.0.10 — run
+  `decent install` to restart it" (for a daemon older than 0.0.11 the
+  same is inferred when dispatch offered it exactly the version now
+  installed). `decent upgrade` restarts such a daemon instead of
+  reporting "nothing to upgrade".
 
 ## [0.0.10] - 2026-09-02
 
