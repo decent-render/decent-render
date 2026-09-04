@@ -1601,7 +1601,28 @@ fn daemon_binary_state(
             running: Some(v.to_string()),
         },
         None if update_available == Some(installed) => DaemonBinary::Stale { running: None },
+        // 2026-09-04, MacBook Air during the 0.0.12 canary: the daemon was a
+        // pre-0.0.11 binary (no version line) and dispatch offered it the
+        // STABLE pin (0.0.11), not the installed 0.0.12 — so the rule above
+        // missed and `decent upgrade` said "nothing to upgrade". A daemon
+        // that reports no version is by definition older than 0.0.11; if the
+        // installed binary is 0.0.11 or newer, the daemon cannot be it.
+        None if reports_version(installed) => DaemonBinary::Stale { running: None },
         None => DaemonBinary::Unknown,
+    }
+}
+
+/// Every daemon from 0.0.11 on writes its version into the snapshot, so a
+/// missing version line plus an installed binary at or past 0.0.11 proves
+/// the daemon is stale.
+fn reports_version(installed: &str) -> bool {
+    let mut parts = installed
+        .trim_start_matches('v')
+        .split('.')
+        .map(|x| x.parse::<u32>().ok());
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Some(a)), Some(Some(b)), Some(Some(c))) => (a, b, c) >= (0, 0, 11),
+        _ => false,
     }
 }
 
@@ -2930,6 +2951,24 @@ mod upgrade_tests {
     }
 
     // ── N-29: stale daemon after an out-of-band brew upgrade ────────────
+
+    #[test]
+    fn pre_0_0_11_daemon_is_stale_once_installed_reports_versions() {
+        // canary window: dispatch offers the stable pin, not the installed tap latest
+        assert_eq!(
+            daemon_binary_state("0.0.12", None, Some("0.0.11")),
+            DaemonBinary::Stale { running: None }
+        );
+        assert_eq!(
+            daemon_binary_state("0.0.12", None, None),
+            DaemonBinary::Stale { running: None }
+        );
+        // an old installed binary with an old daemon: still no evidence
+        assert_eq!(
+            daemon_binary_state("0.0.10", None, None),
+            DaemonBinary::Unknown
+        );
+    }
 
     #[test]
     fn daemon_binary_state_reads_the_version_line_when_present() {

@@ -8,6 +8,15 @@ The format follows Keep a Changelog and semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- `decent upgrade` / `decent status` now treat a daemon that reports no
+  version (pre-0.0.11) as stale whenever the installed binary is 0.0.11 or
+  newer, and restart it. Previously the stale check only fired when dispatch
+  offered exactly the installed version, which is false during a canary
+  window (stable nodes are offered the stable pin), so `brew upgrade` +
+  `decent upgrade` on the Air left the 0.0.10 daemon running.
+
 ## [0.0.12] - 2026-09-04
 
 ### Added
