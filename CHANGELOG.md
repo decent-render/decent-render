@@ -8,6 +8,24 @@ The format follows Keep a Changelog and semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in unattended node upgrades.** `decent auto-upgrade on|off|status`
+  controls a 0600 machine-local opt-in (default off). An installed daemon acts
+  on `updateAvailable` only after 15 continuously idle minutes; the connection
+  core closes the socket at the idle boundary before Homebrew/the Linux
+  installer runs, preventing an assignment race and never canceling a render
+  for maintenance. Attempts are durably recorded, failures are suppressed for
+  24 hours, and package-manager subprocesses have a 10-minute process-group
+  timeout rather than leaving a node disconnected forever.
+
+### Changed
+
+- The public `supervisor-core::connection::run()` API remains compatible;
+  process owners that need lifecycle reasons can use `run_until_exit()`.
+- `decent status` reports the live auto-upgrade opt-in and last unattended
+  attempt.
+
 ## [0.0.11] - 2026-09-02
 
 The two things the first real 0.0.10 rollout found in `decent upgrade`.

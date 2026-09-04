@@ -88,6 +88,9 @@ pub struct SupervisorStatus {
     pub jobs_purge_pending: u32,
     pub last_error: Option<String>,
     pub allow_real_jobs: bool,
+    /// Operator opt-in for unattended supervisor upgrades. This is a live
+    /// process-local gate, like `allow_real_jobs`; the CLI owns persistence.
+    pub auto_upgrade_enabled: bool,
     /// Latest supervisor version reported by dispatch via `updateAvailable`,
     /// when one is available. `None` = up to date (or not yet notified).
     pub update_available: Option<String>,
@@ -106,6 +109,7 @@ impl Default for SupervisorStatus {
             jobs_purge_pending: 0,
             last_error: None,
             allow_real_jobs: false,
+            auto_upgrade_enabled: false,
             update_available: None,
         }
     }
@@ -171,6 +175,7 @@ pub struct Observability {
     pub status_tx: Option<watch::Sender<SupervisorStatus>>,
     pub log_tx: Option<broadcast::Sender<LogLine>>,
     pub allow_flag: Arc<AtomicBool>,
+    pub auto_upgrade_flag: Arc<AtomicBool>,
 }
 
 impl Default for Observability {
@@ -179,6 +184,7 @@ impl Default for Observability {
             status_tx: None,
             log_tx: None,
             allow_flag: Arc::new(AtomicBool::new(false)),
+            auto_upgrade_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -199,6 +205,7 @@ impl Observability {
             status_tx: Some(status_tx),
             log_tx: Some(log_tx.clone()),
             allow_flag: Arc::new(AtomicBool::new(false)),
+            auto_upgrade_flag: Arc::new(AtomicBool::new(false)),
         };
         (obs, status_rx, log_rx)
     }
@@ -235,6 +242,17 @@ impl Observability {
         self.allow_flag.store(value, Ordering::Relaxed);
         self.update_status(|s| s.allow_real_jobs = value);
     }
+
+    /// Read the live unattended-upgrade opt-in.
+    pub fn auto_upgrade_enabled(&self) -> bool {
+        self.auto_upgrade_flag.load(Ordering::Relaxed)
+    }
+
+    /// Set the unattended-upgrade opt-in + reflect it in status.
+    pub fn set_auto_upgrade_enabled(&self, value: bool) {
+        self.auto_upgrade_flag.store(value, Ordering::Relaxed);
+        self.update_status(|s| s.auto_upgrade_enabled = value);
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +263,15 @@ mod tests {
     fn default_obs_refuses_jobs() {
         let obs = Observability::default();
         assert!(!obs.allows_real_jobs());
+    }
+
+    #[test]
+    fn toggle_auto_upgrade_flag() {
+        let (obs, status_rx, _log_rx) = Observability::channels(SupervisorStatus::default());
+        assert!(!obs.auto_upgrade_enabled());
+        obs.set_auto_upgrade_enabled(true);
+        assert!(obs.auto_upgrade_enabled());
+        assert!(status_rx.borrow().auto_upgrade_enabled);
     }
 
     #[test]

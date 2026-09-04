@@ -115,6 +115,11 @@ decent pause
 decent resume
 decent upgrade
 
+# Optional unattended upgrades (default remains off).
+decent auto-upgrade on
+decent auto-upgrade status
+decent auto-upgrade off
+
 # One-screen health check: token shape/expiry + file modes, daemon, status
 # freshness, dispatch reachability, disk, version — exit 1 if anything FAILED.
 decent doctor
@@ -158,12 +163,21 @@ operator explicitly opts in — both on the CLI (`--allow-real-jobs`) and in the
 app (UI toggle). The app cannot bypass the purge rule; it observes and
 controls, the core enforces workdir deletion structurally (`WorkDir::Drop`).
 
-**Updates are manual by design.** The node never self-updates (a bad release
-must not brick an unattended machine); `decent upgrade` refreshes the tap
-and runs `brew upgrade decent` on macOS, or the installer on Linux, and
-restarts the daemon only when the on-disk binary actually changed. The wire has an `updateAvailable` frame the CLI already renders as a
-banner, but the dispatch service does not send it yet — release notification
-is tracked as open work on the platform side.
+**Unattended updates are explicit opt-in and job-safe.** Manual
+`decent upgrade` remains the default. `decent auto-upgrade on` lets an
+*installed daemon* act on dispatch's `updateAvailable` notification only after
+15 continuously idle minutes. The connection loop closes the socket at an
+idle boundary before the package manager runs, so a new assignment cannot race
+into the swap and an in-flight render is never canceled for an upgrade. Failed
+or interrupted attempts are persisted and suppressed for 24 hours rather than
+crash-looping. `decent auto-upgrade off` is the default and takes effect in a
+running daemon within three seconds.
+
+Both paths use the same bounded, verified install channel: Homebrew on macOS,
+the cargo-dist installer on Linux. Dispatch tells the node *that* an update
+exists; it never sends executable bytes. See
+[`docs/adr/0001-opt-in-node-auto-upgrade.md`](docs/adr/0001-opt-in-node-auto-upgrade.md)
+for the safety model, remaining rollout work, and verification record.
 
 ## Development
 

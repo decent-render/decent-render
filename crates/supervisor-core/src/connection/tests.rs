@@ -120,6 +120,80 @@ fn fast_config(port: u16) -> ConnectionConfig {
     }
 }
 
+#[test]
+fn auto_upgrade_gate_requires_enabled_continuous_idle() {
+    let quiet = Duration::from_secs(10);
+    let start = Instant::now();
+    let mut gate = AutoUpgradeGate::new(Some(AutoUpgradePolicy {
+        quiet_period: quiet,
+        suppressed_version: None,
+        suppressed_for: None,
+    }));
+    gate.announce("rust-0.0.12".into());
+
+    gate.observe(true, true, start);
+    assert_eq!(gate.ready(start + quiet - Duration::from_millis(1)), None);
+    // Busy at the boundary resets the whole quiet window.
+    gate.observe(true, false, start + quiet);
+    assert_eq!(gate.ready(start + quiet), None);
+    gate.observe(true, true, start + quiet);
+    assert_eq!(
+        gate.ready(start + quiet + quiet),
+        Some("rust-0.0.12".into())
+    );
+
+    // Turning the live opt-in off resets eligibility too.
+    gate.observe(false, true, start + quiet + quiet);
+    assert_eq!(gate.ready(start + quiet + quiet), None);
+}
+
+#[test]
+fn repeated_notice_does_not_defer_and_recent_failure_suppresses_target() {
+    let quiet = Duration::from_secs(10);
+    let start = Instant::now();
+    let mut gate = AutoUpgradeGate::new(Some(AutoUpgradePolicy {
+        quiet_period: quiet,
+        suppressed_version: None,
+        suppressed_for: None,
+    }));
+    gate.announce("rust-0.0.12".into());
+    gate.observe(true, true, start);
+    gate.announce("rust-0.0.12".into());
+    gate.observe(true, true, start + quiet);
+    assert_eq!(gate.ready(start + quiet), Some("rust-0.0.12".into()));
+
+    let mut suppressed = AutoUpgradeGate::new_at(
+        Some(AutoUpgradePolicy {
+            quiet_period: Duration::ZERO,
+            suppressed_version: Some("rust-0.0.12".into()),
+            suppressed_for: Some(Duration::from_secs(10)),
+        }),
+        start,
+    );
+    suppressed.announce("rust-0.0.12".into());
+    suppressed.observe(true, true, start);
+    assert_eq!(suppressed.ready(start), None);
+    // Suppression expires in the same long-running connection; a daemon
+    // restart is not required to get the next daily attempt.
+    suppressed.observe(true, true, start + Duration::from_secs(10));
+    assert_eq!(
+        suppressed.ready(start + Duration::from_secs(10)),
+        Some("rust-0.0.12".into())
+    );
+    // A later target is eligible even during the old target's suppression.
+    let mut later = AutoUpgradeGate::new_at(
+        Some(AutoUpgradePolicy {
+            quiet_period: Duration::ZERO,
+            suppressed_version: Some("rust-0.0.12".into()),
+            suppressed_for: Some(Duration::from_secs(10)),
+        }),
+        start,
+    );
+    later.announce("rust-0.0.13".into());
+    later.observe(true, true, start);
+    assert_eq!(later.ready(start), Some("rust-0.0.13".into()));
+}
+
 /// What the server saw during the handshake.
 #[derive(Default, Clone)]
 struct Handshake {
@@ -1096,6 +1170,57 @@ async fn registers_heartbeats_and_closes_cleanly() {
 
     // heartbeat_limit = 2 → client closes.
     client.await.unwrap().expect("clean exit");
+}
+
+#[tokio::test]
+async fn update_notice_hands_back_only_after_idle_quiet_and_closes_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut config = long_config(port);
+    config.auto_upgrade = Some(AutoUpgradePolicy {
+        quiet_period: Duration::from_millis(40),
+        suppressed_version: None,
+        suppressed_for: None,
+    });
+    let register = test_register();
+    let (obs, _status_rx, _log_rx) = Observability::channels(Default::default());
+    obs.set_auto_upgrade_enabled(true);
+
+    let client =
+        tokio::spawn(
+            async move { run_until_exit(&config, &register, &obs, never_shutdown()).await },
+        );
+    let (mut ws, _) = accept_ws(&listener).await;
+    let _register = next_text(&mut ws).await;
+    ws.send(Message::Text(
+        r#"{"type":"updateAvailable","tenant":"driffs","supervisorVersion":"rust-0.0.12","payloadVersion":"none"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut saw_close = false;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(frame) = ws.next().await {
+            if matches!(frame.unwrap(), Message::Close(_)) {
+                saw_close = true;
+                break;
+            }
+        }
+    })
+    .await
+    .expect("idle auto-upgrade must close promptly");
+    assert!(
+        saw_close,
+        "client must close before handing off the upgrade"
+    );
+
+    let exit = client.await.unwrap().unwrap();
+    assert_eq!(
+        exit,
+        ConnectionExit::AutoUpgrade {
+            version: "rust-0.0.12".into()
+        }
+    );
 }
 
 #[tokio::test]

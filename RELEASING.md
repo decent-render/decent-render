@@ -91,6 +91,14 @@ Keep at least one node on the PREVIOUS version until step 3 is done.
 5. Only now: upgrade the remaining nodes; drop any "(from X.Y.Z)" markers
    in the farm-web quickstart.
 
+For releases containing auto-upgrade, manual rehearsal remains mandatory and
+comes first. Pin dispatch stable to the previous version, target the physically
+reachable Air as the sole canary, then enable it with `decent auto-upgrade on`.
+The *following* release is the first honest unattended witness: observe its
+idle-safe disconnect, package-manager result, new-version registration, and
+`/internal/supervisor-rollout` resolution before promoting stable. Never use an
+unreachable community machine as the first witness.
+
 ### `HOMEBREW_TAP_TOKEN` — what it must be (learned the hard way, v0.0.9)
 
 The `publish-homebrew-formula` job pushes to `decent-render/homebrew-tap`,

@@ -17,7 +17,7 @@
 //! The crate's tests for everything in this file live in the child module
 //! `connection/tests.rs` (declared below as `#[cfg(test)] mod tests;`).
 
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context};
 use futures_util::{SinkExt, StreamExt};
@@ -31,6 +31,21 @@ use crate::protocol::{
 };
 use crate::runner::{run_job, InFlightJob};
 use crate::status::{ConnectionState, JobPhase, JobStatus, LogLine, Observability};
+
+/// Policy for handing an available supervisor update back to the process
+/// owner at a structurally idle point. The core only closes the connection;
+/// package-manager and service-manager work stays outside supervisor-core.
+#[derive(Debug, Clone)]
+pub struct AutoUpgradePolicy {
+    pub quiet_period: Duration,
+    /// A target whose last unattended attempt failed recently. Dispatch may
+    /// repeat the notification on every reconnect; suppressing it here avoids
+    /// a package-manager/restart loop while still surfacing the banner.
+    pub suppressed_version: Option<String>,
+    /// Remaining suppression duration at process-loop construction. The gate
+    /// keeps the target and automatically re-enables it when this expires.
+    pub suppressed_for: Option<Duration>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
@@ -70,6 +85,8 @@ pub struct ConnectionConfig {
     /// Doubles as the healthy-session threshold: a session that stayed
     /// connected this long resets the curve.
     pub reconnect_backoff_max: Duration,
+    /// None preserves the historical/manual-only behaviour byte for byte.
+    pub auto_upgrade: Option<AutoUpgradePolicy>,
 }
 
 impl ConnectionConfig {
@@ -85,6 +102,7 @@ impl ConnectionConfig {
             reconnect: true,
             reconnect_backoff_base: Duration::from_secs(1),
             reconnect_backoff_max: Duration::from_secs(60),
+            auto_upgrade: None,
         }
     }
 
@@ -168,6 +186,23 @@ fn rejection_status(e: &tokio_tungstenite::tungstenite::Error) -> reqwest::Statu
 /// is followed by a fresh connect, with the same backoff the
 /// initial-connect loop uses, until shutdown, heartbeat-limit, or an
 /// upgrade-required close ends the run.
+/// Why the process-level connection loop stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionExit {
+    Shutdown,
+    HeartbeatLimit,
+    UpgradeRequired,
+    /// A nonterminal socket close when reconnect was explicitly disabled
+    /// (principally focused tests and embedders owning their own retry loop).
+    Disconnected,
+    /// The socket is closed and no job or teardown is in flight. The caller
+    /// may now run its trusted package-manager upgrade without an assignment
+    /// racing into the swap window.
+    AutoUpgrade {
+        version: String,
+    },
+}
+
 #[derive(Debug)]
 enum Disconnect {
     /// SIGTERM/SIGINT or TUI quit — run() returns Ok.
@@ -177,6 +212,9 @@ enum Disconnect {
     /// dispatch raised its minimum protocol version; retrying is
     /// pointless until the operator upgrades. run() returns Ok.
     UpgradeRequired,
+    /// An available update remained continuously idle for the configured
+    /// quiet period. The socket has been closed without canceling a job.
+    AutoUpgrade(String),
     /// Socket died without a close handshake (TLS abort, RST, EOF
     /// mid-frame) — the fly-deploy shape. Reconnect.
     Abnormal,
@@ -185,6 +223,71 @@ enum Disconnect {
     /// an operator restarting dispatch should not silently take
     /// every foreground node down either.
     Clean,
+}
+
+/// Pure state machine for the quiet-idle handoff. `run_session` owns it in
+/// the same event loop that owns `in_flight`, so an assignment cannot slip
+/// between an external "looks idle" check and the socket close.
+#[derive(Debug)]
+struct AutoUpgradeGate {
+    policy: Option<AutoUpgradePolicy>,
+    target: Option<String>,
+    idle_since: Option<Instant>,
+    suppressed_until: Option<Instant>,
+}
+
+impl AutoUpgradeGate {
+    fn new(policy: Option<AutoUpgradePolicy>) -> Self {
+        Self::new_at(policy, Instant::now())
+    }
+
+    fn new_at(policy: Option<AutoUpgradePolicy>, now: Instant) -> Self {
+        let suppressed_until = policy
+            .as_ref()
+            .and_then(|p| p.suppressed_for)
+            .and_then(|duration| now.checked_add(duration));
+        Self {
+            policy,
+            target: None,
+            idle_since: None,
+            suppressed_until,
+        }
+    }
+
+    fn announce(&mut self, version: String) {
+        // Dispatch may repeat the same notice. Only a NEW target resets the
+        // accumulated idle window; repetition must not defer forever.
+        if self.target.as_deref() != Some(version.as_str()) {
+            self.target = Some(version);
+            self.idle_since = None;
+        }
+    }
+
+    fn mark_busy(&mut self) {
+        self.idle_since = None;
+    }
+
+    fn observe(&mut self, enabled: bool, idle: bool, now: Instant) {
+        let target_suppressed = self
+            .policy
+            .as_ref()
+            .and_then(|p| p.suppressed_version.as_deref())
+            == self.target.as_deref()
+            && self.suppressed_until.is_some_and(|until| now < until);
+        if self.policy.is_none() || self.target.is_none() || target_suppressed || !enabled || !idle
+        {
+            self.idle_since = None;
+            return;
+        }
+        self.idle_since.get_or_insert(now);
+    }
+
+    fn ready(&self, now: Instant) -> Option<String> {
+        let policy = self.policy.as_ref()?;
+        let since = self.idle_since?;
+        (now.saturating_duration_since(since) >= policy.quiet_period)
+            .then(|| self.target.clone())?
+    }
 }
 
 /// C-4 (audit T-15): does this terminal frame belong to the in-flight job?
@@ -237,6 +340,7 @@ async fn run_session(
             &register.supervisor_version,
         ));
         s.allow_real_jobs = obs.allows_real_jobs();
+        s.auto_upgrade_enabled = obs.auto_upgrade_enabled();
         s.last_error = None;
         // Optimistic: assume up to date until dispatch says otherwise. Cleared
         // on every connect so a freshly-upgraded node stops showing a stale
@@ -456,6 +560,12 @@ async fn run_session(
         tokio::time::Instant::now() + config.heartbeat_interval,
         config.heartbeat_interval,
     );
+    // Short polling cadence, long eligibility window. The gate itself uses
+    // the configured quiet period; 250ms merely bounds handoff latency and
+    // keeps tests fast without adding another cross-task control channel.
+    let mut auto_upgrade_tick = tokio::time::interval(Duration::from_millis(250));
+    auto_upgrade_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut auto_upgrade_gate = AutoUpgradeGate::new(config.auto_upgrade.clone());
     let mut heartbeats_sent = 0u32;
     let (worker_tx, mut worker_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerMessage>();
     let mut in_flight: Option<InFlightJob> = None;
@@ -526,6 +636,11 @@ async fn run_session(
         let current_job_count =
             u32::from(in_flight.is_some()) + u32::try_from(draining.len()).unwrap_or(u32::MAX);
         tokio::select! {
+            // If the quiet-period timer and a jobAssign arrive together, close
+            // first. No acceptance was sent, so dispatch simply retains/requeues
+            // the job; choosing the frame first would start work at the exact
+            // maintenance boundary.
+            biased;
             // Graceful shutdown: cancel in-flight job, close socket, exit.
             _ = &mut *shutdown => {
                 tracing::info!("shutdown signal received — closing connection");
@@ -547,6 +662,25 @@ async fn run_session(
                 // then finish killing what we started before returning.
                 drain_in_flight_jobs(&mut in_flight, &mut draining).await;
                 return Ok(Disconnect::Shutdown);
+            }
+            _ = auto_upgrade_tick.tick(), if config.auto_upgrade.is_some() => {
+                let idle = in_flight.is_none()
+                    && draining.iter().all(|job| job.handle.is_finished());
+                let now = Instant::now();
+                auto_upgrade_gate.observe(obs.auto_upgrade_enabled(), idle, now);
+                if let Some(version) = auto_upgrade_gate.ready(now) {
+                    tracing::info!(%version, "auto-upgrade quiet period reached — closing idle connection");
+                    obs.log(LogLine::info(format!(
+                        "Auto-upgrade to {version}: idle window reached — disconnecting safely"
+                    )));
+                    sink.send(Message::Close(None)).await.ok();
+                    obs.update_status(|s| s.connection = ConnectionState::Disconnected);
+                    // `idle` proved no live job; completed cancel teardowns may
+                    // still have owned handles in the Vec, so join them before
+                    // handing package-manager work to the caller.
+                    drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                    return Ok(Disconnect::AutoUpgrade(version));
+                }
             }
             _ = heartbeat.tick() => {
                 // PACKET 37 (audit 4): surface un-purged workdirs to the
@@ -764,6 +898,11 @@ async fn run_session(
                                             }));
                                             continue;
                                         }
+                                        // Reset synchronously in the same event-loop arm.
+                                        // A very short job can start and finish between the
+                                        // 250ms maintenance ticks; polling alone would miss it
+                                        // and falsely count the interval as continuously idle.
+                                        auto_upgrade_gate.mark_busy();
                                         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
                                         let job_id_owned = assign.job_id.clone();
                                         let tier = format!("{:?}", assign.kind).to_lowercase();
@@ -899,10 +1038,11 @@ async fn run_session(
                                     }
                                     ServerMessage::Cancel(_) => {}
                                     ServerMessage::UpdateAvailable(u) => {
+                                        let version = u.supervisor_version.clone();
                                         obs.update_status(|s| {
-                                            s.update_available =
-                                                Some(u.supervisor_version.clone());
+                                            s.update_available = Some(version.clone());
                                         });
+                                        auto_upgrade_gate.announce(version);
                                     }
                                     _ => {}
                                 }
@@ -1092,8 +1232,22 @@ pub async fn run(
     config: &ConnectionConfig,
     register: &RegisterMessage,
     obs: &Observability,
-    mut shutdown: oneshot::Receiver<()>,
+    shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
+    run_until_exit(config, register, obs, shutdown)
+        .await
+        .map(|_| ())
+}
+
+/// Variant of [`run`] for process owners that need to act on a terminal
+/// lifecycle handoff (currently the installed CLI daemon's auto-upgrader).
+/// Existing embedders keep the historical `run() -> Result<()>` API.
+pub async fn run_until_exit(
+    config: &ConnectionConfig,
+    register: &RegisterMessage,
+    obs: &Observability,
+    mut shutdown: oneshot::Receiver<()>,
+) -> anyhow::Result<ConnectionExit> {
     let request = config.handshake_request()?;
 
     // Initialize status snapshot with identity + dispatch URL.
@@ -1109,6 +1263,7 @@ pub async fn run(
             &register.supervisor_version,
         ));
         s.allow_real_jobs = obs.allows_real_jobs();
+        s.auto_upgrade_enabled = obs.auto_upgrade_enabled();
         s.last_error = None;
         // Optimistic: assume up to date until dispatch says otherwise. Cleared
         // on every connect so a freshly-upgraded node stops showing a stale
@@ -1142,14 +1297,15 @@ pub async fn run(
         )
         .await
         {
-            Ok(Disconnect::Shutdown)
-            | Ok(Disconnect::HeartbeatLimit)
-            | Ok(Disconnect::UpgradeRequired) => {
-                return Ok(());
+            Ok(Disconnect::Shutdown) => return Ok(ConnectionExit::Shutdown),
+            Ok(Disconnect::HeartbeatLimit) => return Ok(ConnectionExit::HeartbeatLimit),
+            Ok(Disconnect::UpgradeRequired) => return Ok(ConnectionExit::UpgradeRequired),
+            Ok(Disconnect::AutoUpgrade(version)) => {
+                return Ok(ConnectionExit::AutoUpgrade { version });
             }
             Ok(disconnect @ (Disconnect::Abnormal | Disconnect::Clean)) => {
                 if !config.reconnect {
-                    return Ok(());
+                    return Ok(ConnectionExit::Disconnected);
                 }
                 // A session that held ≥ the cap-window was healthy: start
                 // a fresh exponential cycle. A short one keeps climbing.
@@ -1168,7 +1324,7 @@ pub async fn run(
                     _ = &mut shutdown => {
                         tracing::info!("shutdown signal during reconnect backoff — exiting");
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
-                        return Ok(());
+                        return Ok(ConnectionExit::Shutdown);
                     }
                     _ = tokio::time::sleep(retry_delay) => {}
                 }

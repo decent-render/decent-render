@@ -12,13 +12,14 @@
 //! The only difference: the CLI passes `Observability::default()` (tracing
 //! only), the app passes one with status/log channels attached.
 
+mod auto_upgrade;
 mod service;
 mod tui;
 
 use clap::{Parser, Subcommand};
 use service::{DaemonState, ServiceSpec};
 use supervisor_core::capabilities::detect_capabilities;
-use supervisor_core::connection::{self, ConnectionConfig};
+use supervisor_core::connection::{self, AutoUpgradePolicy, ConnectionConfig, ConnectionExit};
 use supervisor_core::dispatch_url::{validate_dispatch_url, DEFAULT_DISPATCH_WS};
 use supervisor_core::keepawake::{self, KeepAwakeState};
 use supervisor_core::protocol::{Platform, RegisterMessage, PROTOCOL_VERSION};
@@ -26,6 +27,7 @@ use supervisor_core::status::{Observability, SupervisorStatus};
 use supervisor_core::worker_token::{base64url_decode, validate_worker_token_shape};
 
 const SUPERVISOR_VERSION: &str = concat!("rust-", env!("CARGO_PKG_VERSION"));
+const AUTO_UPGRADE_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// Token storage: a 0600 file at ~/.config/decent/worker-token.
 /// Migrates from the old ~/.config/decent-node/ path if the new path doesn't
@@ -65,6 +67,13 @@ fn token_path() -> anyhow::Result<std::path::PathBuf> {
     }
 
     Ok(new_path)
+}
+
+fn config_dir() -> anyhow::Result<std::path::PathBuf> {
+    token_path()?
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("token file has no parent config directory"))
 }
 
 fn load_token() -> String {
@@ -187,6 +196,7 @@ struct DaemonSnapshot {
     jobs_completed: u64,
     jobs_failed: u64,
     jobs_canceled: u64,
+    auto_upgrade_enabled: bool,
     update_available: Option<String>,
     /// N-29: the version the running daemon was built as. `None` for a
     /// daemon older than 0.0.11 (the line did not exist).
@@ -245,6 +255,7 @@ fn read_daemon_snapshot_from(path: &std::path::Path) -> Option<DaemonSnapshot> {
         jobs_completed: val("jobs_completed").parse().unwrap_or(0),
         jobs_failed: val("jobs_failed").parse().unwrap_or(0),
         jobs_canceled: val("jobs_canceled").parse().unwrap_or(0),
+        auto_upgrade_enabled: val("auto_upgrade_enabled").parse().unwrap_or(false),
         update_available: if upd.is_empty() {
             None
         } else {
@@ -370,6 +381,12 @@ enum Command {
     /// Upgrade decent — Homebrew on macOS, the release installer on Linux —
     /// then restart the daemon so it runs the new binary. One-command update.
     Upgrade,
+    /// Configure unattended upgrades. Off by default; when enabled, an
+    /// installed daemon upgrades only after a continuously idle quiet period.
+    AutoUpgrade {
+        #[command(subcommand)]
+        action: AutoUpgradeCommand,
+    },
     /// Stop the daemon: the node disconnects from dispatch and stops
     /// rendering, but stays installed. Use `resume` to start it again.
     /// Note that a paused daemon comes back after a reboot on both platforms —
@@ -399,6 +416,16 @@ enum Command {
         #[arg(long, env = "ALLOW_REAL_JOBS", default_value_t = false)]
         allow_real_jobs: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum AutoUpgradeCommand {
+    /// Enable unattended upgrades for the installed daemon.
+    On,
+    /// Disable unattended upgrades (does not cancel one already running).
+    Off,
+    /// Show the opt-in and the last unattended attempt.
+    Status,
 }
 
 /// Best-effort hardware probe: sysctl on macOS, /proc on Linux, stub elsewhere.
@@ -509,6 +536,16 @@ fn parse_version_word(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn version_triplet(text: &str) -> Option<[u64; 3]> {
+    let version = parse_version_word(text)?;
+    let mut parts = version.split('.').map(str::parse::<u64>);
+    Some([
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    ])
+}
+
 /// The version a Homebrew formula file pins (`  version "0.0.10"`).
 /// Read on macOS only; the Linux path asks the installed binary instead.
 #[cfg(any(target_os = "macos", test))]
@@ -571,6 +608,48 @@ fn installed_version() -> Option<String> {
     parse_version_word(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Run a package-manager subprocess in its own process group with a hard
+/// wall-clock bound. An unattended node must not remain disconnected forever
+/// on a stuck brew lock, curl, or installer. Killing the group catches helper
+/// processes too; killing only the shell would leave the transaction running.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_bounded(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+    label: &str,
+) -> anyhow::Result<std::process::ExitStatus> {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let pgid = -(child.id() as libc::pid_t);
+            // SAFETY: the child was spawned into a process group whose id is
+            // its pid. Negative kill targets that group, never this process.
+            unsafe {
+                libc::kill(pgid, libc::SIGTERM);
+            }
+            let grace = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < grace {
+                if child.try_wait()?.is_some() {
+                    anyhow::bail!("{label} timed out after {}s", timeout.as_secs());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            unsafe {
+                libc::kill(pgid, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            anyhow::bail!("{label} timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn upgrade_binary() -> anyhow::Result<UpgradeOutcome> {
     let before = env!("CARGO_PKG_VERSION").to_string();
     #[cfg(target_os = "macos")]
@@ -584,14 +663,17 @@ fn upgrade_binary() -> anyhow::Result<UpgradeOutcome> {
         if latest.as_deref() == Some(before.as_str()) {
             return Ok(UpgradeOutcome::AlreadyCurrent(before));
         }
-        match std::process::Command::new("brew")
-            .args(["upgrade", "decent"])
-            .status()
-        {
+        let mut brew = std::process::Command::new("brew");
+        brew.args(["upgrade", "decent"]);
+        match run_bounded(
+            &mut brew,
+            std::time::Duration::from_secs(10 * 60),
+            "brew upgrade decent",
+        ) {
             Ok(s) if s.success() => {}
             Ok(s) => anyhow::bail!("`brew upgrade decent` failed (exit {:?})", s.code()),
-            Err(_) => anyhow::bail!(
-                "Could not run `brew` — is Homebrew installed? Upgrade manually and restart."
+            Err(e) => anyhow::bail!(
+                "Could not complete `brew upgrade decent` ({e:#}). Upgrade manually and restart."
             ),
         }
         upgrade_outcome(&before, installed_version().as_deref(), latest.as_deref())
@@ -602,10 +684,15 @@ fn upgrade_binary() -> anyhow::Result<UpgradeOutcome> {
             "https://github.com/decent-render/decent-render/releases/latest/download/decent-installer.sh";
         // Piped straight to sh, exactly as the documented install line does —
         // this is the same script from the same release, not a second channel.
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("curl -LsSf {INSTALLER} | sh"))
-            .status();
+        let mut installer = std::process::Command::new("sh");
+        installer.arg("-c").arg(format!(
+            "curl --connect-timeout 10 --max-time 300 -LsSf {INSTALLER} | sh"
+        ));
+        let status = run_bounded(
+            &mut installer,
+            std::time::Duration::from_secs(10 * 60),
+            "decent release installer",
+        );
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => anyhow::bail!(
@@ -614,7 +701,7 @@ fn upgrade_binary() -> anyhow::Result<UpgradeOutcome> {
                 s.code()
             ),
             Err(e) => anyhow::bail!(
-                "Could not run the installer ({e}). Is `curl` installed? Re-run manually:\n  \
+                "Could not complete the installer ({e}). Is `curl` installed? Re-run manually:\n  \
                  curl -LsSf {INSTALLER} | sh"
             ),
         }
@@ -640,16 +727,24 @@ fn refresh_homebrew_tap() -> Option<String> {
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
-    let pulled = std::process::Command::new("git")
-        .args(["-C", &repo, "pull", "--ff-only", "--quiet"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let mut pull = std::process::Command::new("git");
+    pull.args(["-C", &repo, "pull", "--ff-only", "--quiet"]);
+    let pulled = run_bounded(
+        &mut pull,
+        std::time::Duration::from_secs(2 * 60),
+        "Homebrew tap refresh",
+    )
+    .map(|s| s.success())
+    .unwrap_or(false);
     if !pulled {
         // Not a git checkout / offline: let brew do its full update.
-        let _ = std::process::Command::new("brew")
-            .args(["update", "--quiet"])
-            .status();
+        let mut update = std::process::Command::new("brew");
+        update.args(["update", "--quiet"]);
+        let _ = run_bounded(
+            &mut update,
+            std::time::Duration::from_secs(10 * 60),
+            "brew update",
+        );
     }
     let formula = std::fs::read_to_string(format!("{repo}/Formula/decent.rb")).ok()?;
     parse_formula_version(&formula)
@@ -797,15 +892,28 @@ async fn main() -> anyhow::Result<()> {
                 ram_gb = register.ram_gb,
                 "starting decent {SUPERVISOR_VERSION}"
             );
-            let config = ConnectionConfig {
-                heartbeat_limit,
-                allow_real_jobs,
-                ..ConnectionConfig::new(dispatch_url, token)
-            };
-            // CLI uses real status channels so a background task can persist
-            // `updateAvailable` for `decent status` to surface.
+            let config_dir = config_dir()?;
+            // Unattended upgrades belong to an installed service. A foreground
+            // `decent start` has no manager guaranteed to relaunch it after the
+            // binary swap, so it keeps the manual-only behaviour even if the
+            // machine-wide flag exists.
+            let service_managed =
+                heartbeat_limit.is_none() && service::state() == DaemonState::Running;
+            // CLI uses real status channels so background tasks can persist
+            // state and notice an opt-in toggled by another CLI invocation.
             let (obs, _status_rx, _log_rx) = Observability::channels(SupervisorStatus::default());
             obs.set_allow_real_jobs(allow_real_jobs);
+            obs.set_auto_upgrade_enabled(service_managed && auto_upgrade::is_enabled(&config_dir));
+            if service_managed {
+                let obs_flag = obs.clone();
+                let flag_dir = config_dir.clone();
+                tokio::spawn(async move {
+                    loop {
+                        obs_flag.set_auto_upgrade_enabled(auto_upgrade::is_enabled(&flag_dir));
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    }
+                });
+            }
             // Persist a status snapshot the separate `status` command reads, so an
             // operator can see the daemon's live connection/job state without the
             // TUI. (Supersedes the old update-available-only file.) The file going
@@ -856,6 +964,7 @@ async fn main() -> anyhow::Result<()> {
                             line("jobs_failed", &s.jobs_failed.to_string());
                             line("jobs_canceled", &s.jobs_canceled.to_string());
                             line("allow_real_jobs", &s.allow_real_jobs.to_string());
+                            line("auto_upgrade_enabled", &s.auto_upgrade_enabled.to_string());
                             line(
                                 "update_available",
                                 s.update_available.as_deref().unwrap_or(""),
@@ -882,25 +991,114 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
-            // SIGTERM/SIGINT must reach the graceful path, or the purge rule is
-            // not a guarantee: Rust does NOT run `Drop` on signal death, so a
-            // machine shutdown (launchd SIGTERMs the agent) would kill the
-            // process with the job workdir — user content — still on disk.
-            // Operators who power the node down nightly hit that every day.
-            //
-            // Firing `shutdown_tx` makes connection::run cancel the in-flight
-            // job (SIGTERM the runner → WorkDir::drop purges), send a Close
-            // frame so dispatch requeues promptly, and return.
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            tokio::spawn(async move {
-                if let Some(signal) = await_termination().await {
-                    tracing::info!(%signal, "termination signal — shutting down gracefully");
-                    let _ = shutdown_tx.send(());
+            // Each failed/no-op unattended attempt reconnects in the same
+            // process with that target suppressed. A successful swap exits;
+            // KeepAlive/Restart=always then loads the new on-disk binary.
+            loop {
+                let suppression = auto_upgrade::suppression(&config_dir, now_ms());
+                let config = ConnectionConfig {
+                    heartbeat_limit,
+                    allow_real_jobs,
+                    auto_upgrade: service_managed.then(|| AutoUpgradePolicy {
+                        quiet_period: AUTO_UPGRADE_QUIET_PERIOD,
+                        suppressed_version: suppression.as_ref().map(|(v, _)| v.clone()),
+                        suppressed_for: suppression.map(|(_, remaining)| remaining),
+                    }),
+                    ..ConnectionConfig::new(dispatch_url.clone(), token.clone())
+                };
+
+                // Keep signal handling in this task instead of a detached
+                // waiter: after a failed auto-upgrade this loop reconnects and
+                // needs a fresh live signal receiver.
+                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                let running = connection::run_until_exit(&config, &register, &obs, shutdown_rx);
+                tokio::pin!(running);
+                let exit = tokio::select! {
+                    result = &mut running => result?,
+                    signal = await_termination() => {
+                        if let Some(signal) = signal {
+                            tracing::info!(%signal, "termination signal — shutting down gracefully");
+                        }
+                        let _ = shutdown_tx.send(());
+                        running.await?
+                    }
+                };
+
+                let ConnectionExit::AutoUpgrade { version } = exit else {
+                    tracing::info!(?exit, "decent exited cleanly");
+                    return Ok(());
+                };
+
+                // The flag is live and may have been turned off while the
+                // quiet timer was expiring. Re-check after the core has closed
+                // the socket, before touching the package manager.
+                if !obs.auto_upgrade_enabled() {
+                    tracing::info!(%version, "auto-upgrade disabled at handoff — reconnecting");
+                    continue;
                 }
-            });
-            connection::run(&config, &register, &obs, shutdown_rx).await?;
-            tracing::info!("decent exited cleanly");
-            Ok(())
+
+                tracing::info!(%version, "starting unattended upgrade while disconnected and idle");
+                let apply_dir = config_dir.clone();
+                let apply_target = version.clone();
+                let upgrade_task = tokio::task::spawn_blocking(move || {
+                    auto_upgrade::apply(
+                        &apply_dir,
+                        &apply_target,
+                        env!("CARGO_PKG_VERSION"),
+                        now_ms(),
+                        upgrade_binary,
+                    )
+                });
+                tokio::pin!(upgrade_task);
+                let mut terminate_after_upgrade = false;
+                let applied = tokio::select! {
+                    result = &mut upgrade_task => result?,
+                    signal = await_termination() => {
+                        // Tokio has consumed TERM, so remember the operator's
+                        // stop intent. The service manager may still enforce
+                        // its 30s hard stop; wait as long as it permits, record
+                        // the bounded package-manager result, then NEVER
+                        // reconnect from the failure/no-op arms below.
+                        terminate_after_upgrade = signal.is_some();
+                        tracing::warn!(?signal, "termination requested during auto-upgrade — deferring exit until package-manager returns or the service manager hard-stops it");
+                        upgrade_task.await?
+                    }
+                };
+
+                let applied = match applied {
+                    Ok(result) => result,
+                    Err(e) => {
+                        tracing::error!(%version, error = %e, "auto-upgrade apply path failed before a safe package-manager result — reconnecting");
+                        if terminate_after_upgrade {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
+                match applied {
+                    auto_upgrade::ApplyDisposition::Restart {
+                        from,
+                        to,
+                        record_error,
+                    } => {
+                        if let Some(error) = record_error {
+                            tracing::error!(%error, "binary upgraded but result record could not be written");
+                        }
+                        tracing::info!(%from, %to, "unattended upgrade complete — exiting for service-manager restart");
+                        return Ok(());
+                    }
+                    auto_upgrade::ApplyDisposition::Reconnect { outcome, detail } => {
+                        if outcome.needs_attention() {
+                            tracing::error!(%version, outcome = outcome.label(), error = %detail, "unattended upgrade not applied — target suppressed for 24h");
+                        } else {
+                            tracing::warn!(%version, outcome = outcome.label(), %detail, "unattended upgrade not applied — target suppressed for 24h");
+                        }
+                        if terminate_after_upgrade {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
 
         Command::Login { app_url, token } => {
@@ -1085,6 +1283,14 @@ async fn main() -> anyhow::Result<()> {
                         attention = true;
                     }
                     println!("update      : {update}");
+                    println!(
+                        "auto-upgrade: {}",
+                        if s.auto_upgrade_enabled {
+                            "enabled · idle-only · 15 min quiet period"
+                        } else {
+                            "disabled"
+                        }
+                    );
                 }
                 Some(_) => {
                     attention = true;
@@ -1093,6 +1299,14 @@ async fn main() -> anyhow::Result<()> {
                     // whatever it says about updates is out of date. Never
                     // assert "up to date" without live data behind it.
                     println!("update      : unknown (snapshot is stale)");
+                    println!(
+                        "auto-upgrade: {} (configured; daemon state unknown)",
+                        if auto_upgrade::is_enabled(&config_dir()?) {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
                 }
                 None => {
                     attention = true;
@@ -1102,7 +1316,25 @@ async fn main() -> anyhow::Result<()> {
                     // PACKET 40 (audit 18): no snapshot at all — the CLI knows
                     // NOTHING about update state. Say so instead of "up to date".
                     println!("update      : unknown (no recent snapshot)");
+                    println!(
+                        "auto-upgrade: {}",
+                        if auto_upgrade::is_enabled(&config_dir()?) {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
                 }
+            }
+            if let Some(attempt) = auto_upgrade::read_attempt(&config_dir()?) {
+                attention |= attempt.outcome.needs_attention();
+                let detail = attempt.detail.lines().next().unwrap_or("");
+                println!(
+                    "auto-attempt: {} · {} · {}",
+                    attempt.target_version,
+                    attempt.outcome.label(),
+                    detail
+                );
             }
             if let Ok(log) = token_path().and_then(|t| service::default_log_path(&t)) {
                 println!("log         : {}  (`decent logs -f`)", log.display());
@@ -1157,6 +1389,49 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => {
                     println!("Could not restart the daemon automatically ({e:#}). Run:");
                     println!("  {}", service::manual_restart_hint());
+                }
+            }
+            Ok(())
+        }
+
+        Command::AutoUpgrade { action } => {
+            let dir = config_dir()?;
+            match action {
+                AutoUpgradeCommand::On => {
+                    auto_upgrade::set_enabled(&dir, true)?;
+                    println!(
+                        "Auto-upgrade enabled (opt-in stored at {}).",
+                        auto_upgrade::flag_path(&dir).display()
+                    );
+                    if service::state() == DaemonState::Running {
+                        println!("The daemon will notice within 3 seconds; upgrades run only after 15 continuously idle minutes.");
+                    } else {
+                        println!("It will take effect when the installed daemon is running; foreground `decent start` remains manual-only.");
+                    }
+                }
+                AutoUpgradeCommand::Off => {
+                    auto_upgrade::set_enabled(&dir, false)?;
+                    println!("Auto-upgrade disabled. The daemon will notice within 3 seconds.");
+                    println!("An upgrade whose package-manager transaction already started is not canceled.");
+                }
+                AutoUpgradeCommand::Status => {
+                    println!(
+                        "auto-upgrade : {}",
+                        if auto_upgrade::is_enabled(&dir) {
+                            "enabled"
+                        } else {
+                            "disabled (default)"
+                        }
+                    );
+                    match auto_upgrade::read_attempt(&dir) {
+                        Some(a) => println!(
+                            "last attempt : {} · {} · {}",
+                            a.target_version,
+                            a.outcome.label(),
+                            a.detail.lines().next().unwrap_or("")
+                        ),
+                        None => println!("last attempt : none"),
+                    }
                 }
             }
             Ok(())
@@ -2302,6 +2577,7 @@ mod helper_unit_tests {
             jobs_completed: 0,
             jobs_failed: 0,
             jobs_canceled: 0,
+            auto_upgrade_enabled: false,
             update_available: None,
             supervisor_version: None,
             updated_at_ms: now.saturating_sub(age_ms),
@@ -2342,6 +2618,7 @@ mod daemon_status_tests {
             "jobs_failed=1",
             "jobs_canceled=2",
             "allow_real_jobs=true",
+            "auto_upgrade_enabled=true",
             "update_available=",
         ]
         .join("\n")
@@ -2390,6 +2667,7 @@ mod daemon_status_tests {
         assert_eq!(snap.jobs_completed, 3);
         assert_eq!(snap.jobs_failed, 1);
         assert_eq!(snap.jobs_canceled, 2);
+        assert!(snap.auto_upgrade_enabled);
         let (id, phase, progress) = snap.current_job.expect("current job present");
         assert_eq!(id, "job-p3-proof");
         assert_eq!(phase, "Rendering");
@@ -2564,6 +2842,22 @@ mod packet40_tests {
 mod upgrade_tests {
     use super::*;
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn bounded_command_kills_a_stuck_process_group() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+        let err = run_bounded(
+            &mut command,
+            std::time::Duration::from_millis(100),
+            "test command",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(7));
+    }
+
     #[test]
     fn parse_version_word_reads_the_cli_banner_and_supervisor_shapes() {
         assert_eq!(
@@ -2575,6 +2869,8 @@ mod upgrade_tests {
         assert_eq!(parse_version_word("decent dev"), None);
         assert_eq!(parse_version_word("0.0"), None);
         assert_eq!(parse_version_word(""), None);
+        assert_eq!(version_triplet("rust-10.20.30"), Some([10, 20, 30]));
+        assert_eq!(version_triplet("0.0.12garbage"), None);
     }
 
     #[test]
