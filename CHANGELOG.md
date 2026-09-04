@@ -8,6 +8,8 @@ The format follows Keep a Changelog and semantic versioning.
 
 ## [Unreleased]
 
+## [0.0.12] - 2026-09-04
+
 ### Added
 
 - **Opt-in unattended node upgrades.** `decent auto-upgrade on|off|status`
