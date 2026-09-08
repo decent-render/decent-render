@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **F2 verify fix (F-3)**: the two forwarding hops the accrued measurements
+  ride are now PINNED, not just their schemas. Dropping `elapsedMs`/
+  `framesSoFar` from the runner's stdout line (or halving them in the
+  supervisor's `jobProgress` construction) previously left every test and
+  clippy green while dispatch priced accrued NULL fleet-wide. New pins:
+  `stdout-discipline.test.ts` drives the real `runRunner` in a subprocess
+  and asserts the emitted progress frames carry both fields with the exact
+  values; `progress_to_wire` (extracted from the read loop) is unit-pinned
+  on the Rust side, values asserted untouched on the serialized frame.
+
 - **Accrued-cost protocol (F2)**: the `progress` stdout event now carries
   `elapsedMs` (ms since render start) and `framesSoFar`
   (floor(progress × durationInFrames)) alongside `progress`, on the EXISTING

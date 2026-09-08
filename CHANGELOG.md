@@ -10,6 +10,13 @@ The format follows Keep a Changelog and semantic versioning.
 
 ### Fixed
 
+- **F2 verify fix (F-3)**: the supervisor's forwarding of the accrued-cost
+  raw measurements (`elapsedMs`/`framesSoFar`) from the runner's stdout
+  `progress` event onto the wire `jobProgress` frame is now pinned by a
+  test (values asserted untouched on the serialized frame). Previously
+  halving or dropping them there left every test and clippy green while
+  dispatch priced accrued NULL fleet-wide.
+
 - `decent upgrade` / `decent status` now treat a daemon that reports no
   version (pre-0.0.11) as stale whenever the installed binary is 0.0.11 or
   newer, and restart it. Previously the stale check only fired when dispatch

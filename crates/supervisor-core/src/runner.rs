@@ -594,6 +594,33 @@ pub fn cache_keys_for(assign: &JobAssignMessage) -> Vec<String> {
     keys
 }
 
+/// F2 ACCRUED-COST PROTOCOL (verify finding F-3): map a parsed runner stdout
+/// progress event onto the wire `jobProgress` frame. Extracted from the
+/// read loop so the FORWARDING of the raw measurements (elapsedMs /
+/// framesSoFar) is a pinned unit instead of an inline struct literal no test
+/// can reach — the schemas and fixtures were already pinned, but halving
+/// (R-G′) or dropping (R-I) the values in the construction left all 149
+/// tests and clippy green while dispatch priced accrued NULL fleet-wide.
+/// The measurements must ride UNTOUCHED; pricing is dispatch's private
+/// concern. Pin: `progress_forwarding_carries_measurements_untouched`.
+fn progress_to_wire(
+    tenant: &str,
+    job_id: &str,
+    attempt: Option<u32>,
+    progress: f64,
+    elapsed_ms: Option<u64>,
+    frames_so_far: Option<u64>,
+) -> WorkerMessage {
+    WorkerMessage::JobProgress(JobProgressMessage {
+        tenant: tenant.to_string(),
+        job_id: job_id.to_string(),
+        attempt,
+        progress,
+        elapsed_ms,
+        frames_so_far,
+    })
+}
+
 /// Variables the runner child may inherit. Everything else is DROPPED.
 ///
 /// The supervisor's environment is the operator's shell, and it routinely
@@ -929,14 +956,14 @@ async fn run_job_inner(
                         tracing::trace!(job_id = %assign.job_id, "runner heartbeat");
                     }
                     RunnerEvent::Progress { progress, elapsed_ms, frames_so_far } => {
-                        let _ = tx.send(WorkerMessage::JobProgress(JobProgressMessage {
-                            tenant: assign.tenant.clone(),
-                            job_id: assign.job_id.clone(),
-                            attempt: assign.attempt,
+                        let _ = tx.send(progress_to_wire(
+                            &assign.tenant,
+                            &assign.job_id,
+                            assign.attempt,
                             progress,
                             elapsed_ms,
                             frames_so_far,
-                        }));
+                        ));
                     }
                     RunnerEvent::Done { output_size_in_bytes, wall_time_ms, metrics } => {
                         tracing::info!(job_id = %assign.job_id, output_size_in_bytes, wall_time_ms, "runner done");
@@ -1242,6 +1269,40 @@ junk
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── F2 (verify F-3): the progress forwarding hop is pinned ──────────
+
+    /// R-G′ (halve the measurements in the supervisor's construction) and
+    /// R-I (drop them) both passed CI before this pin: the schemas and
+    /// fixtures caught shape drift, nothing caught VALUE drift or absence in
+    /// the only place the measurements cross from RunnerEvent to the wire.
+    #[test]
+    fn progress_forwarding_carries_measurements_untouched() {
+        let msg = progress_to_wire("driffs", "job-1", Some(2), 0.5, Some(8453), Some(105));
+        let WorkerMessage::JobProgress(frame) = msg else {
+            panic!("progress_to_wire must build a JobProgress frame");
+        };
+        assert_eq!(frame.tenant, "driffs");
+        assert_eq!(frame.job_id, "job-1");
+        assert_eq!(frame.attempt, Some(2));
+        assert!((frame.progress - 0.5).abs() < f64::EPSILON);
+        // EXACTLY the values the runner reported — not halves, not drops.
+        assert_eq!(frame.elapsed_ms, Some(8453));
+        assert_eq!(frame.frames_so_far, Some(105));
+        // And the SERIALIZED wire frame carries exactly those integers —
+        // this is the bytes dispatch's inbound validation parses.
+        let json = serde_json::to_value(WorkerMessage::JobProgress(frame))
+            .expect("JobProgress must serialize");
+        assert_eq!(json["type"], "jobProgress");
+        assert_eq!(json["elapsedMs"], 8453);
+        assert_eq!(json["framesSoFar"], 105);
+
+        // Old-runner tolerance: both absent → keys are NOT on the wire.
+        let old = progress_to_wire("driffs", "job-2", None, 0.25, None, None);
+        let old_json = serde_json::to_value(old).expect("must serialize");
+        assert!(old_json.get("elapsedMs").is_none());
+        assert!(old_json.get("framesSoFar").is_none());
+    }
 
     // ── PACKET 67: the runner child's allowlisted environment ─────────────
 

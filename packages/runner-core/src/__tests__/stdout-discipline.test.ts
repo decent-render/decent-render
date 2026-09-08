@@ -100,6 +100,45 @@ describe('stdout/stderr protocol discipline', () => {
 	});
 
 	/**
+	 * F-3 PIN (verify): the forwarding hop is pinned, not just the schema.
+	 * Dropping elapsedMs/framesSoFar from the stdout line in runRunner
+	 * (the R-I mutation) left all 102 runner-core tests green while every
+	 * real node reported nothing and dispatch priced accrued NULL fleet-wide.
+	 * This drives the REAL runRunner in a subprocess (same harness as above)
+	 * and asserts the emitted progress frames carry the raw measurements
+	 * with the exact values dispatch's pricing consumes.
+	 */
+	it('F-3 pin: emitted progress frames carry elapsedMs and framesSoFar with the right values', () => {
+		const bundle = makeBundleArchive();
+		const scratch = mkdtempSync(path.join(tmpdir(), 'runner-core-fixture-'));
+		const bundlePath = path.join(scratch, 'bundle.tar.gz');
+		const uploadReceipt = path.join(scratch, 'upload.json');
+		writeFileSync(bundlePath, bundle.bytes);
+
+		const result = runHarness('harness-render.ts', JSON.stringify(jobAssign({bundleSha256: bundle.sha256})), {
+			FIXTURE_BUNDLE_PATH: bundlePath,
+			FIXTURE_UPLOAD_RECEIPT: uploadReceipt,
+		});
+
+		expect(result.status).toBe(0);
+		const frames = parseFrames(result.stdout.split('\n').filter((line) => line.startsWith('{')).join('\n'));
+		const progress = frames.filter((f) => f.type === 'progress');
+		expect(progress.map((f) => f.progress)).toEqual([0.1, 0.3, 0.6, 1]);
+		// durationInFrames is 24 (the fixture composition): framesSoFar is
+		// floor(progress × 24) — the exact derivation dispatch prices.
+		expect(progress.map((f) => f.framesSoFar)).toEqual([2, 7, 14, 24]);
+		// elapsedMs is the same wall clock renderJob started: a non-negative
+		// integer that never runs backwards across the render.
+		for (const frame of progress) {
+			expect(Number.isInteger(frame.elapsedMs)).toBe(true);
+			expect(frame.elapsedMs as number).toBeGreaterThanOrEqual(0);
+		}
+		for (let i = 1; i < progress.length; i++) {
+			expect(progress[i]!.elapsedMs as number).toBeGreaterThanOrEqual(progress[i - 1]!.elapsedMs as number);
+		}
+	});
+
+	/**
 	 * KNOWN GAP, characterized rather than fixed — this is the behavior of the
 	 * payloads already published to operators, and this move is behavior-
 	 * preserving by mandate.
