@@ -26,10 +26,10 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
 use crate::protocol::{
-    HeartbeatMessage, JobAcceptedMessage, JobRejectedMessage, RegisterMessage, RejectReason,
-    ServerMessage, WorkerMessage,
+    HeartbeatMessage, JobAcceptedMessage, JobCanceledAckMessage, JobRejectedMessage,
+    RegisterMessage, RejectReason, ServerMessage, WorkerMessage,
 };
-use crate::runner::{run_job, InFlightJob};
+use crate::runner::{run_job, InFlightJob, JobOutcome};
 use crate::status::{ConnectionState, JobPhase, JobStatus, LogLine, Observability};
 
 /// Policy for handing an available supervisor update back to the process
@@ -225,6 +225,66 @@ enum Disconnect {
     Clean,
 }
 
+/// F4 CANCEL-ACK: the dispatch-initiated cancel currently being torn down.
+/// Recorded at cancel-frame RECEIPT (the zero point of `teardown_ms`),
+/// cleared when that job's terminal frame arrives. The ack itself is sent
+/// only AFTER the job task (teardown + purge) is joined — never here.
+#[derive(Debug, Clone)]
+struct CanceledJob {
+    tenant: String,
+    job_id: String,
+    /// The lease attempt being torn down (C-4): `CancelMessage` carries no
+    /// attempt on the wire, so it comes from the in-flight record.
+    attempt: Option<u32>,
+    received_at: Instant,
+}
+
+impl CanceledJob {
+    /// The (job, attempt) pair the suppression guard matches against.
+    fn pair(&self) -> (&str, Option<u32>) {
+        (self.job_id.as_str(), self.attempt)
+    }
+}
+
+/// F4 CANCEL-ACK: build the acknowledgement frame for a teardown that just
+/// completed. `teardown_ms` = cancel receipt → process-tree dead + purge done
+/// (the witness measurement). A lease assigned without an attempt is acked
+/// as attempt 1 — exactly what dispatch's `assignmentAttempt` assumes for
+/// attempt-less leases.
+fn cancel_ack_for(canceled: &CanceledJob) -> WorkerMessage {
+    WorkerMessage::JobCanceledAck(JobCanceledAckMessage {
+        tenant: canceled.tenant.clone(),
+        job_id: canceled.job_id.clone(),
+        attempt: canceled.attempt.unwrap_or(1),
+        teardown_ms: Some(
+            Instant::now()
+                .duration_since(canceled.received_at)
+                .as_millis() as u64,
+        ),
+    })
+}
+
+/// F4 CANCEL-ACK (at-least-once): queue an ack that could not be sent on a
+/// live socket. Flushed after the next session's register frame; dispatch's
+/// idempotent `(jobId, attempt)` predicate absorbs any duplicate. Bounded:
+/// every entry requires a real prior jobAssign + cancel, so legitimate
+/// traffic stays far below the cap — this only guards pathological peers.
+fn queue_pending_cancel_ack(pending: &mut Vec<JobCanceledAckMessage>, canceled: &CanceledJob) {
+    const MAX_PENDING_CANCEL_ACKS: usize = 32;
+    if pending.len() >= MAX_PENDING_CANCEL_ACKS {
+        tracing::warn!(
+            job_id = %canceled.job_id,
+            pending = pending.len(),
+            "pending cancel-ack queue over cap — dropping this ack (the heartbeat job-count backstop covers the residue)"
+        );
+        return;
+    }
+    pending.push(match cancel_ack_for(canceled) {
+        WorkerMessage::JobCanceledAck(ack) => ack,
+        _ => unreachable!("cancel_ack_for builds a JobCanceledAck"),
+    });
+}
+
 /// Pure state machine for the quiet-idle handoff. `run_session` owns it in
 /// the same event loop that owns `in_flight`, so an assignment cannot slip
 /// between an external "looks idle" check and the socket close.
@@ -326,6 +386,7 @@ async fn run_session(
     obs: &Observability,
     shutdown: &mut oneshot::Receiver<()>,
     protected_keys: &mut Vec<String>,
+    pending_cancel_acks: &mut Vec<JobCanceledAckMessage>,
 ) -> anyhow::Result<Disconnect> {
     // Initialize status snapshot with identity + dispatch URL.
     obs.update_status(|s| {
@@ -555,6 +616,26 @@ async fn run_session(
         register.chip, register.platform
     )));
 
+    // F4 CANCEL-ACK (at-least-once flush): acks queued while the socket was
+    // dead — a teardown that completed mid-disconnect, whose suppressed
+    // terminal frame nobody read — go out right after the next live
+    // register. WS is ordered, so dispatch sees them after this node
+    // re-registered; the idempotent (jobId, attempt) predicate absorbs the
+    // rare duplicate (a send that succeeded at the socket layer but was
+    // lost to a dispatch crash mid-handling is backstopped by the heartbeat
+    // job count, not re-sent forever).
+    while let Some(ack) = pending_cancel_acks.first().cloned() {
+        tracing::info!(job_id = %ack.job_id, attempt = ack.attempt, "flushing queued jobCanceledAck after register");
+        if sink
+            .send(Message::Text(send(WorkerMessage::JobCanceledAck(ack))))
+            .await
+            .is_err()
+        {
+            break; // socket died again mid-flush — retry on the next session
+        }
+        pending_cancel_acks.remove(0);
+    }
+
     // First heartbeat one full interval after register, then periodic.
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + config.heartbeat_interval,
@@ -569,14 +650,15 @@ async fn run_session(
     let mut heartbeats_sent = 0u32;
     let (worker_tx, mut worker_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerMessage>();
     let mut in_flight: Option<InFlightJob> = None;
-    // Job id + attempt of the last dispatch-initiated cancel whose terminal
-    // frame has not been observed yet. Recorded at cancel receipt — BEFORE
-    // the runner is killed — so the render abort that follows is never
-    // mistaken for a genuine failure. Cleared when that job's terminal frame
-    // arrives. The attempt comes from the in-flight record being torn down:
-    // `CancelMessage` carries no attempt on the wire, and a cancel can only
-    // apply to the job actually in flight.
-    let mut canceled_job: Option<(String, Option<u32>)> = None;
+    // F4: the dispatch-canceled job being torn down (tenant + pair + the
+    // teardownMs zero point), replacing the old (String, Option<u32>) slot.
+    // Same clearing semantics as before — see CanceledJob.
+    let mut canceled_job: Option<CanceledJob> = None;
+    // F4: the terminal-frame-suppressed cancel whose suppression branch is
+    // currently executing — `canceled_job` is cleared BEFORE that branch
+    // runs (the guard consumed it), so the record is handed over here for
+    // the ack emission to read.
+    let mut just_canceled: Option<CanceledJob> = None;
 
     // PACKET 5: a dispatch-canceled job whose terminate is still running.
     // The Cancel arm hands the job here instead of dropping its task handle —
@@ -612,18 +694,56 @@ async fn run_session(
     async fn drain_in_flight_jobs(
         in_flight: &mut Option<InFlightJob>,
         draining: &mut Vec<InFlightJob>,
+        pending_cancel_acks: &mut Vec<JobCanceledAckMessage>,
     ) {
         if let Some(mut job) = in_flight.take() {
             let _ = job.cancel.take().map(|tx| tx.send(()));
             // The job already had its chance to report; the socket is gone.
-            let _ = job.handle.await;
+            // F4: capture the ack context before the await moves the handle.
+            let acked_job = drained_ack_context(&job);
+            let outcome = job.handle.await;
+            queue_drained_cancel_ack(acked_job, outcome, pending_cancel_acks);
         }
         // PACKET 37: await EVERY in-progress teardown (was a single slot —
         // a second cancel detached the first). Completion is guaranteed for
         // all of them; the Vec is bounded by MAX_DRAINING_TEARDOWNS.
         for job in draining.drain(..) {
-            let _ = job.handle.await;
+            let acked_job = drained_ack_context(&job);
+            let outcome = job.handle.await;
+            queue_drained_cancel_ack(acked_job, outcome, pending_cancel_acks);
         }
+    }
+
+    /// F4 CANCEL-ACK (disconnect-drain leg): a dispatch-canceled job whose
+    /// teardown finished after the socket died never reaches the suppression
+    /// branch — its terminal frame goes unread — so the ack is recorded from
+    /// the job record + the joined outcome instead. Only a job that ended
+    /// FAILED while dispatch-canceled queues anything (a job acked on a live
+    /// socket is no longer in `draining` — the suppression site joins and
+    /// removes it); a COMPLETED job (cancel-after-done race) is not an ack
+    /// (it was never stopped), and a panicked task has an unproven teardown.
+    fn drained_ack_context(job: &InFlightJob) -> Option<CanceledJob> {
+        let received_at = job.cancel_received_at?;
+        Some(CanceledJob {
+            tenant: job.tenant.clone(),
+            job_id: job.job_id.clone(),
+            attempt: job.attempt,
+            received_at,
+        })
+    }
+
+    fn queue_drained_cancel_ack(
+        canceled: Option<CanceledJob>,
+        outcome: Result<JobOutcome, tokio::task::JoinError>,
+        pending_cancel_acks: &mut Vec<JobCanceledAckMessage>,
+    ) {
+        let Some(canceled) = canceled else {
+            return;
+        };
+        if !matches!(outcome, Ok(JobOutcome::Failed)) {
+            return;
+        }
+        queue_pending_cancel_ack(pending_cancel_acks, &canceled);
     }
 
     loop {
@@ -660,7 +780,7 @@ async fn run_session(
                 obs.log(LogLine::info("Connection closed"));
                 // Close the socket FIRST so dispatch can requeue immediately;
                 // then finish killing what we started before returning.
-                drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                drain_in_flight_jobs(&mut in_flight, &mut draining, pending_cancel_acks).await;
                 return Ok(Disconnect::Shutdown);
             }
             _ = auto_upgrade_tick.tick(), if config.auto_upgrade.is_some() => {
@@ -678,7 +798,7 @@ async fn run_session(
                     // `idle` proved no live job; completed cancel teardowns may
                     // still have owned handles in the Vec, so join them before
                     // handing package-manager work to the caller.
-                    drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                    drain_in_flight_jobs(&mut in_flight, &mut draining, pending_cancel_acks).await;
                     return Ok(Disconnect::AutoUpgrade(version));
                 }
             }
@@ -719,7 +839,7 @@ async fn run_session(
                     // cancel and drain it BEFORE returning, or the render tree
                     // is stranded live on the operator machine.
                     obs.update_status(|s| s.connection = ConnectionState::Disconnected);
-                    drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                    drain_in_flight_jobs(&mut in_flight, &mut draining, pending_cancel_acks).await;
                     return Ok(Disconnect::Abnormal);
                 }
                 heartbeats_sent += 1;
@@ -729,7 +849,7 @@ async fn run_session(
                         obs.log(LogLine::info("Heartbeat limit reached — closing"));
                         sink.send(Message::Close(None)).await.ok();
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
-                        drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                        drain_in_flight_jobs(&mut in_flight, &mut draining, pending_cancel_acks).await;
                         return Ok(Disconnect::HeartbeatLimit);
                     }
                 }
@@ -761,12 +881,12 @@ async fn run_session(
                 // The workdir purge happened in the runner regardless.
                 let suppress_after_cancel = match &msg {
                     WorkerMessage::JobFailed(f) => frame_is_for(
-                        canceled_job.as_ref().map(|(id, attempt)| (id.as_str(), *attempt)),
+                        canceled_job.as_ref().map(CanceledJob::pair),
                         f.job_id.as_str(),
                         f.attempt,
                     ),
                     WorkerMessage::JobComplete(c) => frame_is_for(
-                        canceled_job.as_ref().map(|(id, attempt)| (id.as_str(), *attempt)),
+                        canceled_job.as_ref().map(CanceledJob::pair),
                         c.job_id.as_str(),
                         c.attempt,
                     ),
@@ -818,24 +938,25 @@ async fn run_session(
                     }
                     if canceled_job
                         .as_ref()
-                        .map(|(canceled_id, canceled_attempt)| {
-                            frame_is_for(
-                                Some((canceled_id.as_str(), *canceled_attempt)),
-                                id,
-                                attempt,
-                            )
+                        .map(|canceled| {
+                            frame_is_for(Some(canceled.pair()), id, attempt)
                         })
                         .unwrap_or(false)
                     {
-                        canceled_job = None;
+                        // F4: hand the record to the suppression branch below
+                        // (which emits the cancel-ack) instead of dropping it.
+                        just_canceled = canceled_job.take();
                     }
                 }
                 if suppress_after_cancel {
-                    let (job_id, what) = match &msg {
-                        WorkerMessage::JobFailed(f) => (f.job_id.as_str(), "jobFailed"),
-                        WorkerMessage::JobComplete(c) => (c.job_id.as_str(), "jobComplete"),
+                    let (job_id, what, failed) = match &msg {
+                        WorkerMessage::JobFailed(f) => (f.job_id.as_str(), "jobFailed", true),
+                        WorkerMessage::JobComplete(c) => {
+                            (c.job_id.as_str(), "jobComplete", false)
+                        }
                         _ => unreachable!("suppress_after_cancel only set for terminal frames"),
                     };
+                    eprintln!("F4DEBUG suppressing: {msg:?}");
                     tracing::info!(
                         job_id = job_id,
                         "render terminal frame after cancel — suppressing {what}"
@@ -854,12 +975,63 @@ async fn run_session(
                     obs.log(LogLine::info(format!(
                         "Job {job_id} render terminal frame after cancel — not reporting {what}"
                     )));
+                    // F4 CANCEL-ACK WITNESS — the emission site. IN ADDITION to
+                    // the suppression above (which stays exactly as it was):
+                    // dispatch learns the cancel's teardown completed, with
+                    // the measured teardown time. Sent only when the
+                    // suppressed terminal is a FAILURE — the cancel stopped a
+                    // running render. A suppressed COMPLETION (the
+                    // cancel-after-done race) is NOT acked: the job was never
+                    // stopped, it has no teardown to witness, and it already
+                    // purged on its success path.
+                    //
+                    // Ordering — the whole point of the witness: the frame
+                    // above arrives only after run_job finished teardown +
+                    // purge (it is the task's last act), and the join below
+                    // makes "after the job task is joined" literal. NEVER
+                    // move this to the cancel-frame arm: "cancel accepted" is
+                    // not "job stopped" (FARM-1 §1-C / astra §B).
+                    if failed {
+                        if let Some(canceled) = just_canceled.take() {
+                            // Join the teardown task (belt-and-braces: the
+                            // terminal frame proves teardown ran; the join
+                            // proves the TASK ended), then take the entry OUT
+                            // of draining — its completion guarantee is now
+                            // discharged HERE and a JoinHandle may only be
+                            // awaited once (drain would re-poll it). The
+                            // over-cap path (packet 37) awaited the handle
+                            // inline at cancel time, so a miss here means
+                            // teardown already completed — proceed either way.
+                            if let Some(index) = draining.iter().position(|j| {
+                                j.job_id == canceled.job_id && j.attempt == canceled.attempt
+                            }) {
+                                let entry = draining.remove(index);
+                                let _ = entry.handle.await;
+                            }
+                            tracing::info!(
+                                job_id = %canceled.job_id,
+                                attempt = canceled.attempt.unwrap_or(1),
+                                "teardown complete after cancel — sending jobCanceledAck"
+                            );
+                            obs.log(LogLine::info(format!(
+                                "Job {} teardown complete — acknowledging cancel",
+                                canceled.job_id
+                            )));
+                            let ack = cancel_ack_for(&canceled);
+                            if sink.send(Message::Text(send(ack))).await.is_err() {
+                                // Socket died between the suppressed terminal
+                                // and the ack — queue for the next session's
+                                // post-register flush (at-least-once).
+                                queue_pending_cancel_ack(pending_cancel_acks, &canceled);
+                            }
+                        }
+                    }
                 } else {
                     emit(obs, &msg);
                     if sink.send(Message::Text(send(msg))).await.is_err() {
                         // PACKET 5: drain before returning — see heartbeat arm.
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
-                        drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                        drain_in_flight_jobs(&mut in_flight, &mut draining, pending_cancel_acks).await;
                         return Ok(Disconnect::Abnormal);
                     }
                 }
@@ -936,7 +1108,7 @@ async fn run_session(
                                             // No in-flight job yet on THIS path (the
                                             // spawn is below), but drain anyway for
                                             // uniformity and safety against reorders.
-                                            drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                                            drain_in_flight_jobs(&mut in_flight, &mut draining, pending_cancel_acks).await;
                                             return Ok(Disconnect::Abnormal);
                                         }
                                         // Transition to rendering phase once the runner starts.
@@ -956,8 +1128,10 @@ async fn run_session(
                                         // PACKET 5: keep the JoinHandle — every exit path awaits it.
                                         in_flight = Some(InFlightJob {
                                             job_id: job_id_owned,
+                                            tenant: assign_snapshot.tenant.clone(),
                                             attempt: assign_snapshot.attempt,
                                             cancel: Some(cancel_tx),
+                                            cancel_received_at: None,
                                             cache_keys: crate::runner::cache_keys_for(&assign_snapshot),
                                             handle,
                                         });
@@ -967,14 +1141,26 @@ async fn run_session(
                                             == Some(cancel.job_id.as_str()) =>
                                     {
                                         if let Some(mut job) = in_flight.take() {
-                                            // C-4: record the pair (job, attempt)
-                                            // being torn down — `CancelMessage`
-                                            // carries no attempt on the wire, so
-                                            // the attempt comes from the in-flight
+                                            // C-4 + F4: record the cancel being torn
+                                            // down — tenant + (job, attempt) pair +
+                                            // the RECEIPT instant (the zero point
+                                            // of the ack's teardownMs). `CancelMessage`
+                                            // carries no attempt on the wire, so the
+                                            // attempt comes from the in-flight
                                             // record; only THAT attempt's terminal
                                             // frame is the cancel's expected outcome.
-                                            canceled_job =
-                                                Some((job.job_id.clone(), job.attempt));
+                                            // The ACK itself is NOT sent here — only
+                                            // after the job task is joined (the
+                                            // suppression branch / the drain path).
+                                            canceled_job = Some(CanceledJob {
+                                                tenant: job.tenant.clone(),
+                                                job_id: job.job_id.clone(),
+                                                attempt: job.attempt,
+                                                received_at: Instant::now(),
+                                            });
+                                            job.cancel_received_at = canceled_job
+                                                .as_ref()
+                                                .map(|c| c.received_at);
                                             obs.update_status(|s| {
                                                 if let Some(j) = &mut s.current_job {
                                                     j.phase = JobPhase::Canceled;
@@ -1072,7 +1258,7 @@ async fn run_session(
                                 // runtime with it, leaving a wedged runner and
                                 // a daemonized Chrome with nothing left to
                                 // escalate. Drain before giving up.
-                                drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                                drain_in_flight_jobs(&mut in_flight, &mut draining, pending_cancel_acks).await;
                                 return Ok(Disconnect::UpgradeRequired);
                             }
                             tracing::info!(%reason, "socket closed by server");
@@ -1083,7 +1269,7 @@ async fn run_session(
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
                         // PACKET 5: the tree we started still needs killing
                         // before this task returns — mid-grace drop strands it.
-                        drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                        drain_in_flight_jobs(&mut in_flight, &mut draining, pending_cancel_acks).await;
                         return Ok(Disconnect::Clean);
                     }
                     // tungstenite answers Ping frames automatically.
@@ -1095,7 +1281,7 @@ async fn run_session(
                             s.last_error = Some(msg.clone());
                         });
                         obs.log(LogLine::error(&msg));
-                        drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                        drain_in_flight_jobs(&mut in_flight, &mut draining, pending_cancel_acks).await;
                         // PACKET 23: this is the fly-deploy shape —
                         // "peer closed connection without sending TLS
                         // close_notify", RST, EOF mid-frame. Session over,
@@ -1106,7 +1292,7 @@ async fn run_session(
                         tracing::info!("socket stream ended");
                         obs.log(LogLine::info("Socket stream ended"));
                         obs.update_status(|s| s.connection = ConnectionState::Disconnected);
-                        drain_in_flight_jobs(&mut in_flight, &mut draining).await;
+                        drain_in_flight_jobs(&mut in_flight, &mut draining, pending_cancel_acks).await;
                         return Ok(Disconnect::Clean);
                     }
                 }
@@ -1285,6 +1471,12 @@ pub async fn run_until_exit(
     // sweep fills it.
     let mut last_protected: Vec<String> = Vec::new();
 
+    // F4 CANCEL-ACK (at-least-once): cancel acks that could not be sent on a
+    // live socket survive the session here and flush after the next
+    // register. They do NOT survive a process exit (shutdown/heartbeat
+    // limit): a restarting node's fresh sweep is the backstop for those.
+    let mut pending_cancel_acks: Vec<JobCanceledAckMessage> = Vec::new();
+
     loop {
         let session_start = std::time::Instant::now();
         match run_session(
@@ -1294,6 +1486,7 @@ pub async fn run_until_exit(
             obs,
             &mut shutdown,
             &mut last_protected,
+            &mut pending_cancel_acks,
         )
         .await
         {

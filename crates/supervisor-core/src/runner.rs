@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::artifact_fetch;
 use anyhow::{anyhow, Context};
@@ -91,6 +91,10 @@ pub(crate) fn parse_workdir_bytes_override(raw: Option<&str>) -> u64 {
 #[derive(Debug)]
 pub struct InFlightJob {
     pub job_id: String,
+    /// The tenant this job belongs to (F4): the cancel-ack frame carries
+    /// it, and the disconnect-drain path — which cannot see the suppressed
+    /// terminal frame — needs it off the job record.
+    pub tenant: String,
     /// The assignment lease this in-flight job belongs to (C-4). Terminal
     /// frames are guarded by (job_id, attempt): dispatch requeues a failed
     /// or refunded job as attempt+1 of the same job id, so matching by job
@@ -98,6 +102,11 @@ pub struct InFlightJob {
     /// attempt-N+1 render.
     pub attempt: Option<u32>,
     pub cancel: Option<oneshot::Sender<()>>,
+    /// F4 CANCEL-ACK: when dispatch's cancel frame was RECEIVED for this
+    /// job (None while it merely runs — a job killed by shutdown or socket
+    /// death is NOT dispatch-canceled and must never be acked). The zero
+    /// point of the teardownMs measurement.
+    pub cancel_received_at: Option<Instant>,
     /// The cache keys (kind:sha) this job is using — its payload, browser
     /// and bundle shas. Consumed by the post-termination cache sweep so a
     /// sweep that starts after this job ends can still protect a
@@ -106,14 +115,16 @@ pub struct InFlightJob {
     /// were touched moments ago, but explicit protection is cheaper to
     /// reason about than marker recency).
     pub cache_keys: Vec<String>,
-    /// The run_job task itself. The connection loop MUST await this on every
+    /// run_job() itself. The connection loop MUST await this on every
     /// exit path (PACKET 5): cancel triggers teardown, but teardown runs to
     /// completion INSIDE the task — TERM → CANCEL_GRACE → KILL → pidfile
     /// sweep → purge. Dropping the JoinHandle (or returning while it is
     /// mid-grace) aborts the future at its await point and strands a live
     /// render tree on the operator machine. Observed in packet 4's wedge run:
     /// wedged runner + ffmpeg + 8 Chrome, alive until killed by hand.
-    pub handle: tokio::task::JoinHandle<()>,
+    /// Yields the job's [`JobOutcome`] (F4) so paths that never read the
+    /// terminal frame can still apply the cancel-ack predicate.
+    pub handle: tokio::task::JoinHandle<JobOutcome>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -679,13 +690,25 @@ fn apply_child_env(command: &mut Command, parent: impl Iterator<Item = (String, 
     }
 }
 
+/// How [`run_job`] ended — the terminal frame's discriminant (F4). The
+/// connection loop uses it on the paths that never read the terminal frame
+/// (disconnect-drain): the cancel-ack is emitted only for a job that ended
+/// FAILED while dispatch-canceled. A job that COMPLETED despite the cancel
+/// (the cancel-after-done race) is not acked — it was never stopped, so it
+/// has no teardown to witness; it already purged on its success path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobOutcome {
+    Complete,
+    Failed,
+}
+
 pub async fn run_job(
     assign: JobAssignMessage,
     mut cancel_rx: oneshot::Receiver<()>,
     tx: tokio::sync::mpsc::UnboundedSender<WorkerMessage>,
     wall_clock_limit: Duration,
     workdir_cap_bytes: u64,
-) {
+) -> JobOutcome {
     let job_id = assign.job_id.clone();
     let tenant = assign.tenant.clone();
     let output_key = assign.output_key.clone();
@@ -713,6 +736,7 @@ pub async fn run_job(
                 output_key,
                 metrics,
             }));
+            JobOutcome::Complete
         }
         Err(err) => {
             let _ = tx.send(WorkerMessage::JobFailed(JobFailedMessage {
@@ -721,6 +745,7 @@ pub async fn run_job(
                 attempt,
                 reason: err.to_string(),
             }));
+            JobOutcome::Failed
         }
     }
 }

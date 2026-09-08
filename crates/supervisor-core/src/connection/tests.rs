@@ -63,6 +63,7 @@ async fn an_http_401_at_connect_is_an_auth_failure_not_unreachable() {
 use super::*;
 use crate::protocol::{Capabilities, Platform, PROTOCOL_VERSION};
 use crate::tests_support::RemoveOnDrop;
+use std::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::WebSocketStream;
@@ -1100,6 +1101,496 @@ async fn genuine_failure_without_cancel_emits_job_failed() {
     while ws.next().await.is_some() {}
     client.await.unwrap().expect("clean exit");
     std::fs::remove_dir_all(&payload_dir).ok();
+}
+
+/// F4: wait until a runner's `armed` marker exists - the script touches it
+/// right AFTER installing its TERM traps, so a cancel sent past this point
+/// provably lands on a runner that is alive AND immune (sending earlier
+/// races /bin/sh's own exec: the TERM hits before the trap line runs and the
+/// tree dies instantly - the jobAccepted the test keys on is sent by the
+/// CONNECTION at assign time, not by the runner).
+#[cfg(unix)]
+async fn wait_for_armed(armed: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !armed.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "runner never armed its TERM traps"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A jobAssign frame with an explicit attempt lease (dispatch always sends
+/// one; the attempt-less shape is `job_assign_json` above).
+#[cfg(unix)]
+fn job_assign_json_with_attempt(job_id: &str, payload_sha: &str, attempt: u32) -> String {
+    format!(
+        r#"{{"type":"jobAssign","tenant":"driffs","jobId":"{job_id}","attempt":{attempt},"kind":"standard","durationFrames":1,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"{payload_sha}","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}}"#
+    )
+}
+
+/// F4 CANCEL-ACK WITNESS — the emission contract, driven end-to-end through
+/// the real connection loop (never a helper call):
+///
+/// 1. NOT ON RECEIPT: a runner that ignores SIGTERM cannot be dead before the
+///    10 s CANCEL_GRACE expires, so NO ack may appear in the window right
+///    after the cancel frame — "cancel accepted" is not "job stopped".
+/// 2. AFTER THE JOIN: the ack arrives once teardown (grace KILL → pidfile
+///    sweep → purge) completed, carrying the canceled ATTEMPT and a
+///    teardownMs that measures the full grace.
+/// 3. EXACTLY ONCE, and jobFailed stays suppressed (the ack is IN ADDITION to
+///    suppression, never a replacement).
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_ack_sent_once_after_teardown_not_on_receipt() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
+    let pid = std::process::id();
+    let sha = format!("test-cancel-ack-{pid}");
+    let job_id = format!("job-cancel-ack-{pid}");
+    // TERM-immune "render" (the grandchild_script_immune recipe: traps set
+    // BEFORE the first sleep, two sleeps in belt-and-braces): teardown can
+    // only complete via the group SIGKILL
+    // at CANCEL_GRACE (10 s) — the teardown clock is observable on the wire.
+    // TERM-immune "render" (the grandchild_script_immune recipe: traps set
+    // BEFORE the first sleep, `armed` touched right after, two sleeps in
+    // belt-and-braces): teardown can only complete via the group SIGKILL
+    // at CANCEL_GRACE - the teardown clock is observable on the wire.
+    let armed = std::env::temp_dir().join(format!("decent-f4-ack-{pid}.armed"));
+    let _ = std::fs::remove_file(&armed);
+    let payload_dir = seed_fake_payload(
+        &sha,
+        &format!(
+            "#!/bin/sh\ntrap '' TERM INT\ntouch {armed}\nsleep 60\nsleep 60\n",
+            armed = armed.display()
+        ),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = long_config(port);
+    let register = test_register();
+    let (obs, mut status_rx, _log_rx) =
+        Observability::channels(crate::status::SupervisorStatus::default());
+    obs.set_allow_real_jobs(true);
+
+    let obs2 = obs.clone();
+    let client =
+        tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+    let (mut ws, _uri) = accept_ws(&listener).await;
+    let _register = next_text(&mut ws).await;
+
+    ws.send(Message::Text(Utf8Bytes::from(
+        job_assign_json_with_attempt(&job_id, &sha, 2),
+    )))
+    .await
+    .unwrap();
+
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    loop {
+        let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
+            .await
+            .expect("expected jobAccepted before timeout");
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        let accepted = v["type"] == "jobAccepted";
+        frames.push(v);
+        if accepted {
+            break;
+        }
+    }
+
+    // Only cancel once the runner is provably alive WITH its traps installed
+    // (see wait_for_armed) — otherwise the TERM wins the exec race, the tree
+    // dies instantly, and the timing assertions become vacuous.
+    wait_for_armed(&armed).await;
+
+    // Dispatch cancels the in-flight job — the ack clock starts at receipt.
+    ws.send(Message::Text(Utf8Bytes::from(format!(
+        r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+    ))))
+    .await
+    .unwrap();
+
+    // (1) NOT ON RECEIPT: for 2.5 s of WALL TIME after the cancel, only
+    // heartbeats may appear — the TERM-immune runner is provably still alive
+    // (its teardown cannot finish before the 10 s grace). An ack in this
+    // window is the exact lie the witness exists to expose. Wall-bounded, not
+    // read-timeout-bounded: the 50 ms heartbeats would reset a read timeout
+    // forever.
+    let fired_early = {
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break None;
+            }
+            match tokio::time::timeout(remaining, next_text(&mut ws)).await {
+                Ok(t) => {
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                    if v["type"] == "jobCanceledAck" {
+                        break Some(v);
+                    }
+                    frames.push(v);
+                }
+                Err(_) => break None,
+            }
+        }
+    };
+    assert!(
+        fired_early.is_none(),
+        "jobCanceledAck arrived on cancel RECEIPT (before the 10 s grace could kill the runner): {fired_early:?} frames={frames:?}"
+    );
+
+    // (2) AFTER THE JOIN: the grace KILL lands, teardown + purge complete,
+    // the suppressed jobFailed is processed, and the ack follows it.
+    let ack = loop {
+        let t = tokio::time::timeout(Duration::from_secs(25), next_text(&mut ws))
+            .await
+            .expect("expected jobCanceledAck after the grace window");
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["type"] == "jobCanceledAck" {
+            break v;
+        }
+        frames.push(v);
+    };
+    frames.push(ack.clone());
+    assert_eq!(ack["jobId"], job_id.as_str());
+    assert_eq!(ack["tenant"], "driffs");
+    // The canceled ATTEMPT is the provenance key — dispatch's idempotent
+    // write predicate is (jobId, attempt).
+    assert_eq!(ack["attempt"], 2, "ack must carry the canceled attempt");
+    let teardown_ms = ack["teardownMs"].as_u64().expect("teardownMs present");
+    assert!(
+        teardown_ms >= 9000,
+        "teardownMs {teardown_ms} must cover the 10 s grace — the TERM-immune runner cannot die sooner"
+    );
+    assert!(
+        teardown_ms < 25_000,
+        "teardownMs {teardown_ms} implausibly long"
+    );
+
+    // The suppression signal fired alongside the ack.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status_rx.wait_for(|s| s.jobs_canceled == 1 && s.current_job.is_none()),
+    )
+    .await
+    .expect("canceled render was not processed in time")
+    .expect("status channel closed");
+    assert!(
+        job_workdirs(&job_id).is_empty(),
+        "workdir must be purged before the ack (join = teardown + purge done)"
+    );
+
+    // (3) EXACTLY ONCE + suppression intact: drain everything the client
+    // ever sent — no second ack, no jobFailed.
+    ws.close(None).await.ok();
+    while let Some(Ok(frame)) = ws.next().await {
+        if let Message::Text(t) = frame {
+            frames.push(serde_json::from_str(t.as_str()).unwrap());
+        }
+    }
+    client.await.unwrap().expect("clean exit");
+
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|v| v["type"] == "jobCanceledAck")
+            .count(),
+        1,
+        "exactly ONE jobCanceledAck per canceled attempt, got {frames:?}"
+    );
+    assert!(
+        frames.iter().all(|v| v["type"] != "jobFailed"),
+        "jobFailed must stay suppressed after cancel (the ack is IN ADDITION), got {frames:?}"
+    );
+    std::fs::remove_dir_all(&payload_dir).ok();
+    let _ = std::fs::remove_file(&armed);
+}
+
+/// F4: a lease assigned WITHOUT an attempt is acked as attempt 1 — exactly
+/// what dispatch's `assignmentAttempt` assumes for attempt-less leases.
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_ack_defaults_attempt_one_for_attemptless_lease() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
+    let pid = std::process::id();
+    let sha = format!("test-cancel-ack-noattempt-{pid}");
+    let job_id = format!("job-cancel-ack-noattempt-{pid}");
+    // Honors TERM: teardown is fast, the ack should follow within seconds.
+    let payload_dir = seed_fake_payload(&sha, "#!/bin/sh\nwhile true; do sleep 5; done\n");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = long_config(port);
+    let register = test_register();
+    let (obs, _status_rx, _log_rx) =
+        Observability::channels(crate::status::SupervisorStatus::default());
+    obs.set_allow_real_jobs(true);
+
+    let obs2 = obs.clone();
+    let client =
+        tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+    let (mut ws, _uri) = accept_ws(&listener).await;
+    let _register = next_text(&mut ws).await;
+
+    ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+        &job_id, &sha,
+    ))))
+    .await
+    .unwrap();
+
+    loop {
+        let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
+            .await
+            .expect("expected jobAccepted before timeout");
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["type"] == "jobAccepted" {
+            break;
+        }
+    }
+
+    ws.send(Message::Text(Utf8Bytes::from(format!(
+        r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+    ))))
+    .await
+    .unwrap();
+
+    let ack = loop {
+        let t = tokio::time::timeout(Duration::from_secs(20), next_text(&mut ws))
+            .await
+            .expect("expected jobCanceledAck after teardown");
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["type"] == "jobCanceledAck" {
+            break v;
+        }
+    };
+    assert_eq!(ack["attempt"], 1, "attempt-less lease acks as attempt 1");
+    assert_eq!(ack["jobId"], job_id.as_str());
+    assert!(
+        ack["teardownMs"].as_u64().is_some(),
+        "teardownMs is measured even for a fast teardown"
+    );
+
+    ws.close(None).await.ok();
+    while ws.next().await.is_some() {}
+    client.await.unwrap().expect("clean exit");
+    std::fs::remove_dir_all(&payload_dir).ok();
+}
+
+/// F4: the cancel-after-done race — the runner finished its work before the
+/// cancel landed, so the job was never STOPPED and there is no teardown to
+/// witness. The completion is suppressed (pre-existing semantics) and NO ack
+/// is sent: an ack would claim a teardown that never happened.
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_after_done_race_sends_no_ack() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
+    let pid = std::process::id();
+    let sha = format!("test-cancel-ack-done-{pid}");
+    let job_id = format!("job-cancel-ack-done-{pid}");
+    let payload_dir = seed_fake_payload(
+        &sha,
+        "#!/bin/sh\necho '{\"type\":\"done\",\"outputSizeInBytes\":123,\"wallTimeMs\":50}'\nexec 1>&-\nsleep 2\nexit 0\n",
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = long_config(port);
+    let register = test_register();
+    let (obs, mut status_rx, _log_rx) =
+        Observability::channels(crate::status::SupervisorStatus::default());
+    obs.set_allow_real_jobs(true);
+
+    let obs2 = obs.clone();
+    let client =
+        tokio::spawn(async move { run(&config, &register, &obs2, never_shutdown()).await });
+
+    let (mut ws, _uri) = accept_ws(&listener).await;
+    let _register = next_text(&mut ws).await;
+
+    ws.send(Message::Text(Utf8Bytes::from(job_assign_json(
+        &job_id, &sha,
+    ))))
+    .await
+    .unwrap();
+
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    loop {
+        let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
+            .await
+            .expect("expected jobAccepted before timeout");
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        let accepted = v["type"] == "jobAccepted";
+        frames.push(v);
+        if accepted {
+            break;
+        }
+    }
+
+    // Let the runner's `done` + stdout EOF land, then cancel into the
+    // child.wait() window (same determinism recipe as the suppression test).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    ws.send(Message::Text(Utf8Bytes::from(format!(
+        r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+    ))))
+    .await
+    .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        status_rx.wait_for(|s| s.jobs_canceled == 1 && s.current_job.is_none()),
+    )
+    .await
+    .expect("post-done completion after cancel was not processed in time")
+    .expect("status channel closed");
+
+    // Give any (unwanted) ack a moment to make itself visible, then drain
+    // everything: neither a completion NOR an ack may have been sent.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    ws.close(None).await.ok();
+    while let Some(Ok(frame)) = ws.next().await {
+        if let Message::Text(t) = frame {
+            frames.push(serde_json::from_str(t.as_str()).unwrap());
+        }
+    }
+    client.await.unwrap().expect("clean exit");
+
+    assert!(
+        frames.iter().all(|v| v["type"] != "jobComplete"),
+        "jobComplete must be suppressed after cancel, got {frames:?}"
+    );
+    assert!(
+        frames.iter().all(|v| v["type"] != "jobCanceledAck"),
+        "a job that COMPLETED despite the cancel must NOT be acked — it was never stopped, got {frames:?}"
+    );
+    std::fs::remove_dir_all(&payload_dir).ok();
+}
+
+/// F4 AT-LEAST-ONCE (the pinned choice): the socket dies mid-teardown — the
+/// dispatch-redeploy shape. The teardown completes inside the drain (unseen
+/// terminal frame), the ack is QUEUED, and the next session flushes it right
+/// after its register frame. Exactly one ack across the whole run; the
+/// teardownMs still measures receipt → teardown-complete, not the reconnect.
+#[cfg(unix)]
+#[tokio::test]
+async fn disconnect_mid_teardown_flushes_ack_after_reconnect() {
+    let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
+    let pid = std::process::id();
+    let sha = format!("test-cancel-ack-drain-{pid}");
+    let job_id = format!("job-cancel-ack-drain-{pid}");
+    // TERM-immune (armed recipe): teardown takes the full 10 s grace,
+    // comfortably outliving the socket close below.
+    let armed = std::env::temp_dir().join(format!("decent-f4-drain-{pid}.armed"));
+    let _ = std::fs::remove_file(&armed);
+    let payload_dir = seed_fake_payload(
+        &sha,
+        &format!(
+            "#!/bin/sh\ntrap '' TERM INT\ntouch {armed}\nsleep 60\nsleep 60\n",
+            armed = armed.display()
+        ),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // reconnect: true + short backoff — the run must come back for session 2.
+    let mut config = long_config(port);
+    config.reconnect = true;
+    config.reconnect_backoff_base = Duration::from_millis(50);
+    config.reconnect_backoff_max = Duration::from_millis(300);
+    let register = test_register();
+    let (obs, _status_rx, _log_rx) =
+        Observability::channels(crate::status::SupervisorStatus::default());
+    obs.set_allow_real_jobs(true);
+
+    // A REAL shutdown channel this time: reconnect:true means run() loops
+    // until shutdown — fire it once the flushed ack is observed.
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let obs2 = obs.clone();
+    let client = tokio::spawn(async move { run(&config, &register, &obs2, shutdown_rx).await });
+
+    // Session 1: assign, accept, cancel MID-TEARDOWN, kill the socket.
+    let (mut ws, _uri) = accept_ws(&listener).await;
+    let _register = next_text(&mut ws).await;
+
+    ws.send(Message::Text(Utf8Bytes::from(
+        job_assign_json_with_attempt(&job_id, &sha, 1),
+    )))
+    .await
+    .unwrap();
+    loop {
+        let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
+            .await
+            .expect("expected jobAccepted before timeout");
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["type"] == "jobAccepted" {
+            break;
+        }
+    }
+    // The cancel must land on a runner with its traps installed (see
+    // wait_for_armed), or the teardown finishes before the socket dies.
+    wait_for_armed(&armed).await;
+    ws.send(Message::Text(Utf8Bytes::from(format!(
+        r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
+    ))))
+    .await
+    .unwrap();
+    // Socket dies immediately — the runner is TERM-immune, teardown has ~10 s
+    // left to run. The supervisor must finish it in the drain regardless.
+    ws.close(None).await.ok();
+    while ws.next().await.is_some() {}
+
+    // Session 2: the reconnect registers first, THEN flushes the queued ack.
+    let (mut ws2, _uri2) = tokio::time::timeout(Duration::from_secs(30), accept_ws(&listener))
+        .await
+        .expect("supervisor never reconnected — drain or reconnect broken");
+    let second_register = next_text(&mut ws2).await;
+    assert!(second_register.contains("\"register\""));
+
+    let mut session2_frames: Vec<serde_json::Value> = Vec::new();
+    let ack = loop {
+        let t = tokio::time::timeout(Duration::from_secs(15), next_text(&mut ws2))
+            .await
+            .expect("expected the flushed jobCanceledAck after register");
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["type"] == "jobCanceledAck" {
+            break v;
+        }
+        session2_frames.push(v);
+    };
+    assert_eq!(ack["jobId"], job_id.as_str());
+    assert_eq!(ack["attempt"], 1);
+    let teardown_ms = ack["teardownMs"].as_u64().expect("teardownMs present");
+    assert!(
+        teardown_ms >= 9000,
+        "teardownMs {teardown_ms} must measure the grace KILL, not the reconnect"
+    );
+    // The teardown was joined BEFORE the queue decision: the workdir is gone.
+    assert!(
+        job_workdirs(&job_id).is_empty(),
+        "workdir must be purged during the drain, before the ack was queued"
+    );
+
+    // Teardown complete on the node side too: exactly one ack total, and no
+    // second one appears before shutdown.
+    shutdown_tx.send(()).expect("shutdown channel live");
+    ws2.close(None).await.ok();
+    while let Some(Ok(frame)) = ws2.next().await {
+        if let Message::Text(t) = frame {
+            session2_frames.push(serde_json::from_str(t.as_str()).unwrap());
+        }
+    }
+    client.await.unwrap().expect("clean exit after shutdown");
+    assert!(
+        session2_frames
+            .iter()
+            .all(|v| v["type"] != "jobCanceledAck"),
+        "exactly ONE flushed ack — the drain queued it once and the flush sent it once, got {session2_frames:?}"
+    );
+    std::fs::remove_dir_all(&payload_dir).ok();
+    let _ = std::fs::remove_file(&armed);
 }
 
 /// Shutdown during the connect-retry loop must exit cleanly rather than
@@ -3071,11 +3562,13 @@ fn frame_is_for_matches_id_and_attempt_pairs() {
 /// `jobs_canceled` before sending the third assign.
 /// Read the next NON-heartbeat frame: long_config's 50 ms heartbeat
 /// interleaves outbound heartbeats between the frames the test cares about.
+/// Also skips `jobCanceledAck` (F4): the ack for a drained cancel rides the
+/// same socket and is asserted by the dedicated cancel-ack tests below.
 #[cfg(unix)]
 async fn next_non_heartbeat(ws: &mut WebSocketStream<TcpStream>) -> serde_json::Value {
     loop {
         let v: serde_json::Value = serde_json::from_str(&next_text(ws).await).unwrap();
-        if v["type"] == "heartbeat" {
+        if v["type"] == "heartbeat" || v["type"] == "jobCanceledAck" {
             continue;
         }
         return v;
