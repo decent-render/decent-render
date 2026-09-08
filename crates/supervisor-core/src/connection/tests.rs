@@ -1244,15 +1244,25 @@ async fn cancel_ack_sent_once_after_teardown_not_on_receipt() {
 
     // (2) AFTER THE JOIN: the grace KILL lands, teardown + purge complete,
     // the suppressed jobFailed is processed, and the ack follows it.
-    let ack = loop {
-        let t = tokio::time::timeout(Duration::from_secs(25), next_text(&mut ws))
-            .await
-            .expect("expected jobCanceledAck after the grace window");
-        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-        if v["type"] == "jobCanceledAck" {
-            break v;
+    // Wall-bounded (heartbeats would reset a per-read timeout forever — the
+    // dropped-ack RED proof hangs without the wall bound).
+    let ack = {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "no jobCanceledAck within 30 s of the cancel — the emission site dropped it (frames so far: {frames:?})"
+            );
+            let t = tokio::time::timeout(remaining, next_text(&mut ws))
+                .await
+                .expect("socket died waiting for jobCanceledAck");
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["type"] == "jobCanceledAck" {
+                break v;
+            }
+            frames.push(v);
         }
-        frames.push(v);
     };
     frames.push(ack.clone());
     assert_eq!(ack["jobId"], job_id.as_str());
