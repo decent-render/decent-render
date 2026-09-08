@@ -2,6 +2,13 @@
 
 ## 0.3.0 — unreleased
 
+- **Accrued-cost protocol (F2)**: render status responses may carry
+  `accruedCredits` (integer ≥ 0 or null) and `accruedAt` — the farm's
+  mid-flight priced accrual, computed from the node's raw measurements.
+  Both are OPTIONAL in the schema so responses from a dispatch predating
+  the fields still parse during the deploy window, and NULL (never zero)
+  while a pre-F2 node renders. Terminal money stays `creditsSettled`.
+
 - **Behaviour:** `verifyWebhookSignature()` now enforces a replay window —
   a delivery whose `X-Decent-Timestamp` is more than `toleranceSeconds`
   (default 300) from `now` returns `false` before the HMAC is compared, and a

@@ -96,7 +96,7 @@ export function purgeActiveWorkDir(): void {
 }
 
 type Options = {
-  onProgress?: (progress: number) => void;
+  onProgress?: (event: {progress: number; elapsedMs: number; framesSoFar: number}) => void;
   binariesDirectory?: string | null;
   /** Browser shipped in the payload — see RendererApi.browserExecutable. */
   browserExecutable?: string | null;
@@ -238,6 +238,22 @@ export async function renderJob<TComposition extends MinimalComposition>(
     // sees the true cost).
     let composition: TComposition | undefined;
     let lastReported = 0;
+    // ACCRUED-COST PROTOCOL (F2): progress events carry RAW MEASUREMENTS —
+    // elapsedMs since `started` and framesSoFar derived from the resolved
+    // composition's durationInFrames — so dispatch can price accrual
+    // mid-render with its own private rate card. The runner never computes
+    // a price. floor() on purpose: framesSoFar counts frames DEFINITELY
+    // done, never a rounded-up estimate, so a derived accrual can only
+    // under-report, never over-report. Rides the EXISTING 5 % throttle —
+    // no extra events, no tighter cadence.
+    const emitProgress = (progress: number) => {
+      const duration = composition?.durationInFrames ?? 0;
+      options.onProgress?.({
+        progress,
+        elapsedMs: Date.now() - started,
+        framesSoFar: Math.max(0, Math.min(Math.floor(progress * duration), duration)),
+      });
+    };
     const attemptRender = async (attempt: 1 | 2): Promise<void> => {
       composition = await renderer.selectComposition({serveUrl, id: compositionId, inputProps, ...renderOptions});
       lastReported = 0; // the retry restarts the progress curve from 0
@@ -253,7 +269,7 @@ export async function renderJob<TComposition extends MinimalComposition>(
         onProgress: ({progress}) => {
           if (progress - lastReported >= 0.05 || progress === 1) {
             lastReported = progress;
-            options.onProgress?.(progress);
+            emitProgress(progress);
           }
         },
       });

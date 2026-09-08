@@ -205,7 +205,7 @@ describe('renderJob retry-once on delayRender timeout', () => {
 		await renderJob(jobAssign({bundleSha256: bundle.sha256}), renderer as never, {
 			binariesDirectory: null,
 			log: () => {},
-			onProgress: (p) => progressReports.push(p),
+			onProgress: (e) => progressReports.push(e.progress),
 		});
 		// 0.6 (attempt 1) then 0.2 (attempt 2 restart) — both surface.
 		expect(progressReports).toContain(0.6);

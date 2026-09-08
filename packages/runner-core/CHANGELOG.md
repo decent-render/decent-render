@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Accrued-cost protocol (F2)**: the `progress` stdout event now carries
+  `elapsedMs` (ms since render start) and `framesSoFar`
+  (floor(progress × durationInFrames)) alongside `progress`, on the EXISTING
+  5 %-throttled events — no new events, no tighter cadence. Raw measurements
+  only; the runner never prices anything. Old supervisors parse the frames
+  fine (unknown fields ignored). On the packet-25 whole-render retry the
+  progress curve restarts at 0 while elapsedMs keeps counting — dispatch's
+  monotonic guard, not the runner, reconciles that.
+
 ## 0.1.3 — 2026-09-02
 
 - Cap the extracted size of the tenant bundle and pin tar traversal

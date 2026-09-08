@@ -42,6 +42,17 @@ const renderStatusBase = z.object({
   renderId: z.string(),
   progress: z.number().min(0).max(1).nullable(),
   creditsReserved: z.number().int().nonnegative().nullable(),
+  /**
+   * ACCRUED-COST PROTOCOL (F2): mid-flight accrued cost, priced by the
+   * farm from the node's raw measurements (elapsedMs/framesSoFar on
+   * jobProgress) — nullable, and OPTIONAL so responses from a dispatch
+   * predating the field still parse during the deploy window. NULL (never
+   * zero) while a pre-F2 node renders: an old node reports no measurements
+   * and "no figure" is not "free". Terminal money stays creditsSettled.
+   */
+  accruedCredits: z.number().int().nonnegative().nullable().optional(),
+  /** When accruedCredits was last computed (dispatch-side timestamp). */
+  accruedAt: isoDateSchema.optional(),
   error: z.string().nullable(),
   createdAt: isoDateSchema,
   completedAt: isoDateSchema,

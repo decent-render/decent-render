@@ -85,7 +85,27 @@ export const JobProgressMessageSchema = z.object({
 	jobId: z.string(),
 	attempt: z.number().int().positive().optional(),
 	progress: z.number().min(0).max(1),
+	/**
+	 * ACCRUED-COST PROTOCOL (F2) — RAW MEASUREMENTS, never money.
+	 *
+	 * A new runner reports how long it has been rendering (integer ms since
+	 * render start) and how many frames it has finished (integer, derived
+	 * progress × composition.durationInFrames). The DISPATCH service prices
+	 * these with its own rate card to persist mid-flight accrued cost;
+	 * the runner cannot price its own work and must never try — pricing is the
+	 * platform's private concern and lives nowhere in this package.
+	 *
+	 * Both fields are optional so every node predating them stays a fully
+	 * functional v2 peer: an old node's frames parse unchanged, and dispatch
+	 * leaves accrued null rather than zero. NO PROTOCOL_VERSION bump — the
+	 * pin is a register-time gate that would orphan every existing node
+	 * (inspection-I10 §1.4); additive-optional fields are wire-tolerant in
+	 * both directions.
+	 */
+	elapsedMs: z.number().int().nonnegative().optional(),
+	framesSoFar: z.number().int().nonnegative().optional(),
 });
+export type JobProgressMessage = z.infer<typeof JobProgressMessageSchema>;
 
 export const JobMetricsSchema = z.object({
 	/** Wall-clock render time on the worker, milliseconds. */

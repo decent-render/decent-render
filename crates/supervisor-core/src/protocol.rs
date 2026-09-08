@@ -129,6 +129,23 @@ pub struct JobProgressMessage {
     /// Render progress in `[0, 1]`.
     #[serde(deserialize_with = "unit_interval")]
     pub progress: f64,
+    /// ACCRUED-COST PROTOCOL (F2) — RAW MEASUREMENTS, never money.
+    ///
+    /// Integer ms since render start. A new runner reports how long it has
+    /// been rendering and how many frames it has finished; DISPATCH prices
+    /// those with its own rate card to persist mid-flight accrued cost.
+    /// The runner cannot price its own work — pricing is the platform's private
+    /// concern and lives nowhere in this crate. Optional so every node
+    /// predating these fields stays a fully functional v2 peer (no
+    /// `PROTOCOL_VERSION` bump: the pin is a register-time gate that would
+    /// orphan every existing node).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    /// Integer frames finished so far (derived progress × duration). Same
+    /// contract as [`Self::elapsed_ms`]: raw measurement, integer ≥ 0,
+    /// optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames_so_far: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,6 +372,26 @@ mod tests {
         let orig: Value = serde_json::from_str(literal).unwrap();
         assert_eq!(re, orig, "round trip must preserve every field");
         parsed
+    }
+
+    /// PROTOCOL_VERSION stays pinned at 2 — additive fields, never a bump
+    /// (F2 accrued-cost protocol / inspection-I10 §1.4).
+    ///
+    /// The pin is a REGISTER-TIME gate, not a capability signal:
+    /// `pinned_protocol_version` (and TS's `z.literal(PROTOCOL_VERSION)`)
+    /// make a node announcing any other version fail the register parse
+    /// entirely — an old node speaking v2 to a v3 dispatch becomes an
+    /// UNREGISTERED socket, never assigned, never told why. A bump therefore
+    /// orphans every existing node at register. Additive-optional fields
+    /// (jobProgress's elapsedMs/framesSoFar) are wire-tolerant in BOTH
+    /// directions — serde ignores unknown fields here, zod strips them on
+    /// dispatch — which is exactly why that change needed NO bump. If this
+    /// test fails, you changed the wire in a way that breaks old nodes;
+    /// either revert to an additive shape or make the fleet-orphaning an
+    /// explicit, human-gated decision instead of editing the test.
+    #[test]
+    fn protocol_version_stays_pinned_at_2() {
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     /// The register frame exactly as spike-worker.ts sends it (onOpen).

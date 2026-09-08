@@ -6,6 +6,21 @@ itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
 
 ## [Unreleased]
 
+- **Accrued-cost protocol (F2)** — `jobProgress` gains two OPTIONAL fields,
+  `elapsedMs` (integer ms since render start) and `framesSoFar` (integer
+  frames finished). RAW MEASUREMENTS ONLY — the runner/supervisor report
+  them, dispatch prices them with its private rate card; no pricing
+  vocabulary may ever appear in this package (pinned by a new grep test).
+  Both directions stay wire-tolerant: an old node's frame without the fields
+  parses unchanged, and a new node's frame is stripped to its known-field
+  shape by an older dispatch's zod objects. `PROTOCOL_VERSION` stays **2** —
+  now pinned by explicit tests on both sides (a bump is a register-time gate
+  that orphans every existing node; additive-optional fields need no bump).
+- `fixtures/v2.json`: +1 accept case (jobProgress with the measurements),
+  +1 reject case (negative framesSoFar). `fixtures/runner-stdout-v1.json`:
+  +2 accept cases (with fields / elapsedMs only) and +3 reject cases
+  (negative elapsedMs, non-integer framesSoFar, string framesSoFar).
+
 ## [0.1.3] — 2026-09-02
 
 - `fixtures/runner-stdout-v1.json`: the runner→supervisor stdout contract

@@ -171,9 +171,13 @@ export async function runRunner<TComposition extends MinimalComposition>(rendere
       binariesDirectory: binariesDirectory(),
       browserExecutable: chrome,
       log: (message) => console.error(message),
-      onProgress: (progress) => {
+      onProgress: (event) => {
         sawActivity = true;
-        writeEvent({type: 'progress', progress});
+        // ACCRUED-COST PROTOCOL (F2): forward the raw measurements
+        // (elapsedMs/framesSoFar) alongside progress — computed by renderJob
+        // on the existing 5 % throttled events. Raw numbers only; pricing
+        // happens dispatch-side.
+        writeEvent({type: 'progress', progress: event.progress, elapsedMs: event.elapsedMs, framesSoFar: event.framesSoFar});
       },
     }).finally(() => clearInterval(heartbeat));
     writeEvent({type: 'done', outputSizeInBytes: metrics.outputSizeInBytes, wallTimeMs: metrics.wallMs, metrics});

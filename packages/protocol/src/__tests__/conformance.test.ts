@@ -4,7 +4,7 @@ import {fileURLToPath} from 'node:url';
 
 import {describe, expect, it} from 'vitest';
 
-import {ServerMessageSchema, WorkerMessageSchema} from '../index';
+import {ServerMessageSchema, WorkerMessageSchema, PROTOCOL_VERSION} from '../index';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const cases = JSON.parse(
@@ -47,6 +47,55 @@ describe('protocol v2 — Rust⇄TS golden-fixture conformance', () => {
 	// gutted file cannot turn into a green run.
 	it('the positive fixture set is non-empty', () => {
 		expect(cases.cases.length).toBeGreaterThan(0);
+	});
+
+	it('PROTOCOL_VERSION stays pinned at 2 — additive fields, never a bump (F2/I10 §1.4)', () => {
+		// The version pin is a REGISTER-TIME gate, not a capability signal:
+		// `protocolVersion: z.literal(PROTOCOL_VERSION)` (and Rust's
+		// `pinned_protocol_version`) make a node announcing any other version
+		// fail the register parse entirely — an old node speaking v2 to a v3
+		// dispatch becomes an UNREGISTERED socket, never assigned, never told
+		// why (inspection-I10 §1.4). A bump therefore orphans every existing
+		// node at register. Additive-optional fields like jobProgress's
+		// elapsedMs/framesSoFar (F2, accrued-cost protocol) are wire-tolerant
+		// in BOTH directions — unknown fields are stripped by the receiving
+		// zod object and ignored by Rust's serde (no deny_unknown_fields) —
+		// which is exactly why this change needs NO bump. If this test fails,
+		// you changed the wire in a way that breaks old nodes; either revert to
+		// an additive shape or make the fleet-orphaning an explicit, human-
+		// gated decision instead of a test edit.
+		expect(PROTOCOL_VERSION).toBe(2);
+		expect(cases.protocolVersion).toBe(2);
+	});
+
+	it('old↔new tolerance: an old-node jobProgress (no accrued fields) parses under the NEW schema', () => {
+		const oldNodeFrame = {
+			type: 'jobProgress',
+			tenant: 'driffs',
+			jobId: 'spike-1',
+			attempt: 1,
+			progress: 0.5,
+		};
+		const parsed = WorkerMessageSchema.parse(oldNodeFrame);
+		if (parsed.type !== 'jobProgress') throw new Error('expected jobProgress');
+		// Fields stay ABSENT (not zero, not null) — dispatch leaves accrued
+		// null for such nodes by design.
+		expect(parsed.elapsedMs).toBeUndefined();
+		expect(parsed.framesSoFar).toBeUndefined();
+	});
+
+	it('old↔new tolerance: a new-node jobProgress keeps its accrued measurements through the round-trip', () => {
+		const newNodeFrame = {
+			type: 'jobProgress',
+			tenant: 'driffs',
+			jobId: 'spike-1',
+			attempt: 1,
+			progress: 0.35,
+			elapsedMs: 8453,
+			framesSoFar: 105,
+		};
+		const parsed = WorkerMessageSchema.parse(newNodeFrame);
+		expect(JSON.parse(JSON.stringify(parsed))).toEqual(newNodeFrame);
 	});
 
 	it('the negative fixture set is non-empty', () => {
@@ -102,6 +151,15 @@ describe('protocol v2 — Rust⇄TS golden-fixture conformance', () => {
 		const assigns = casesOfType('jobAssign');
 		expect(assigns.some((c) => 'browserSha256' in (c.wire as object))).toBe(true);
 		expect(assigns.some((c) => !('browserSha256' in (c.wire as object)))).toBe(true);
+	});
+
+	it('fixtures cover the accrued measurements both PRESENT and ABSENT (F2)', () => {
+		// Scoped to jobProgress: the ABSENT case is what an old node sends and
+		// must keep parsing forever; the PRESENT case is the F2 raw-measurement
+		// pair. Deleting either half silently narrows the tolerance contract.
+		const progresses = casesOfType('jobProgress');
+		expect(progresses.some((c) => 'elapsedMs' in (c.wire as object) && 'framesSoFar' in (c.wire as object))).toBe(true);
+		expect(progresses.some((c) => !('elapsedMs' in (c.wire as object)))).toBe(true);
 	});
 
 	it('accepts assignments with no browser artifact (payload ships its own)', () => {

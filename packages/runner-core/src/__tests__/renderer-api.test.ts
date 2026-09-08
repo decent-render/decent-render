@@ -153,7 +153,34 @@ describe('RendererApi injection contract', () => {
 				return undefined;
 			},
 		};
-		await renderJob(jobAssign({bundleSha256: bundle.sha256}), throttling, {log: () => {}, onProgress: (p) => seen.push(p)});
+		await renderJob(jobAssign({bundleSha256: bundle.sha256}), throttling, {log: () => {}, onProgress: (e) => seen.push(e.progress)});
 		expect(seen).toEqual([0.06, 0.2, 0.99, 1]);
+	});
+
+	// F2 accrued-cost protocol: the raw measurements ride the SAME throttled
+	// events (no extra callback, no tighter cadence) so dispatch can price
+	// accrual mid-render. framesSoFar floors — a derived accrual can only
+	// under-report, never over-report — and clamps to [0, duration].
+	it('carries elapsedMs and framesSoFar on the throttled progress events', async () => {
+		const {api} = harness();
+		const events: Array<{progress: number; elapsedMs: number; framesSoFar: number}> = [];
+		const started = Date.now();
+		const measuring = {
+			...api,
+			renderMedia: async (options: RenderOptions) => {
+				for (const progress of [0.05, 0.5, 1]) options.onProgress({progress});
+				writeFileSync(options.outputLocation, Buffer.alloc(8, 1));
+				return undefined;
+			},
+		};
+		const metrics = await renderJob(jobAssign({bundleSha256: bundle.sha256}), measuring, {log: () => {}, onProgress: (e) => events.push(e)});
+		expect(events.map((e) => e.progress)).toEqual([0.05, 0.5, 1]);
+		// duration 24 (harness composition): floor of progress × 24.
+		expect(events.map((e) => e.framesSoFar)).toEqual([1, 12, 24]);
+		for (const event of events) {
+			expect(event.elapsedMs).toBeGreaterThanOrEqual(0);
+			expect(event.elapsedMs).toBeLessThanOrEqual(Date.now() - started);
+		}
+		expect(metrics.frames).toBe(24);
 	});
 });

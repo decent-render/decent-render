@@ -15,6 +15,14 @@
       "wire": { "type": "progress", "progress": 1 }
     },
     {
+      "name": "progress with accrued measurements (elapsedMs + framesSoFar, F2)",
+      "wire": { "type": "progress", "progress": 0.35, "elapsedMs": 8453, "framesSoFar": 105 }
+    },
+    {
+      "name": "progress with elapsedMs only (framesSoFar optional too)",
+      "wire": { "type": "progress", "progress": 0.1, "elapsedMs": 2117 }
+    },
+    {
       "name": "heartbeat (liveness, no payload)",
       "wire": { "type": "heartbeat" }
     },
@@ -59,6 +67,21 @@
       "name": "progress negative (-0.1)",
       "wire": { "type": "progress", "progress": -0.1 },
       "reason": "progress is a fraction in [0, 1]."
+    },
+    {
+      "name": "progress with negative elapsedMs",
+      "wire": { "type": "progress", "progress": 0.4, "elapsedMs": -3 },
+      "reason": "elapsedMs is a duration in ms since render start; a negative value is a runner bug and must not travel the wire — dispatch would price a negative accrual off it"
+    },
+    {
+      "name": "progress with non-integer framesSoFar (2.5)",
+      "wire": { "type": "progress", "progress": 0.4, "framesSoFar": 2.5 },
+      "reason": "framesSoFar is a frame COUNT; a fractional frame count is a runner bug, not a value to round downstream"
+    },
+    {
+      "name": "progress with string framesSoFar",
+      "wire": { "type": "progress", "progress": 0.4, "framesSoFar": "120" },
+      "reason": "framesSoFar is an integer count; a string (even a numeric one) must fail to parse rather than coerce — the same no-silent-coercion rule as every other numeric field"
     },
     {
       "name": "done missing outputSizeInBytes",

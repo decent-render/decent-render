@@ -125,6 +125,20 @@ enum RunnerEvent {
         /// accepted out-of-range values dispatch would refuse downstream.)
         #[serde(deserialize_with = "crate::protocol::unit_interval")]
         progress: f64,
+        /// ACCRUED-COST PROTOCOL (F2): raw measurement — integer ms since
+        /// render start. Forwarded to dispatch untouched; pricing accrued
+        /// cost is dispatch's private concern, never the node's.
+        /// Optional so runners predating the fields still parse.
+        #[serde(rename = "elapsedMs", default, skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
+        /// Raw measurement — integer frames finished so far. Same contract
+        /// as `elapsed_ms`.
+        #[serde(
+            rename = "framesSoFar",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        frames_so_far: Option<u64>,
     },
     /// Liveness only — the runner is alive but has no progress to report (a
     /// heavy composition can exceed the 5% reporting delta by more than
@@ -914,12 +928,14 @@ async fn run_job_inner(
                     RunnerEvent::Heartbeat => {
                         tracing::trace!(job_id = %assign.job_id, "runner heartbeat");
                     }
-                    RunnerEvent::Progress { progress } => {
+                    RunnerEvent::Progress { progress, elapsed_ms, frames_so_far } => {
                         let _ = tx.send(WorkerMessage::JobProgress(JobProgressMessage {
                             tenant: assign.tenant.clone(),
                             job_id: assign.job_id.clone(),
                             attempt: assign.attempt,
                             progress,
+                            elapsed_ms,
+                            frames_so_far,
                         }));
                     }
                     RunnerEvent::Done { output_size_in_bytes, wall_time_ms, metrics } => {

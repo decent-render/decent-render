@@ -68,6 +68,40 @@ describe('public API schemas', () => {
     }).verification).toBe('flagged');
   });
 
+  // F2 accrued-cost protocol: mid-flight accrued cost is nullable (an old
+  // node reports no measurements — null, never zero) and optional (a
+  // dispatch predating the field omits it during the deploy window).
+  it('parses mid-flight accrued cost when the farm reports it', () => {
+    const parsed = renderStatusResponseSchema.parse({
+      renderId: 'job-render-3', status: 'rendering', progress: 0.35,
+      outputUrl: null, creditsReserved: 5, accruedCredits: 5, accruedAt: '2026-09-08T10:00:30.000Z',
+      creditsSettled: null, error: null,
+      createdAt: '2026-09-08T10:00:00.000Z', completedAt: null, verification: 'pending',
+    });
+    expect(parsed.accruedCredits).toBe(5);
+    expect(parsed.accruedAt).toBe('2026-09-08T10:00:30.000Z');
+  });
+
+  it('parses accrued cost as null while a pre-F2 node renders (never zero)', () => {
+    const parsed = renderStatusResponseSchema.parse({
+      renderId: 'job-render-4', status: 'rendering', progress: 0.5,
+      outputUrl: null, creditsReserved: 5, accruedCredits: null, accruedAt: null,
+      creditsSettled: null, error: null,
+      createdAt: '2026-09-08T10:00:00.000Z', completedAt: null, verification: 'pending',
+    });
+    expect(parsed.accruedCredits).toBeNull();
+  });
+
+  it('still parses status responses from a dispatch predating accrued fields', () => {
+    const parsed = renderStatusResponseSchema.parse({
+      renderId: 'job-render-5', status: 'rendering', progress: 0.5,
+      outputUrl: null, creditsReserved: 5,
+      creditsSettled: null, error: null,
+      createdAt: '2026-09-08T10:00:00.000Z', completedAt: null, verification: 'pending',
+    });
+    expect(parsed.accruedCredits).toBeUndefined();
+  });
+
   it('parses the active runner matrix', () => {
     const parsed = versionsResponseSchema.parse({
       supportedRemotionVersions: [{remotionVersion: '4.0.487', payloadVersion: 'runner-v1'}],

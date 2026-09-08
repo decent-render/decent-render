@@ -72,6 +72,19 @@
       }
     },
     {
+      "name": "jobProgress (accrued measurements PRESENT — elapsedMs + framesSoFar, F2)",
+      "direction": "worker",
+      "wire": {
+        "type": "jobProgress",
+        "tenant": "driffs",
+        "jobId": "spike-1",
+        "attempt": 1,
+        "progress": 0.35,
+        "elapsedMs": 8453,
+        "framesSoFar": 105
+      }
+    },
+    {
       "name": "jobComplete (outputSizeInBytes ABSENT — the drift scar)",
       "direction": "worker",
       "wire": {
@@ -256,6 +269,19 @@
         "jobId": "spike-1",
         "attempt": 1,
         "progress": -0.1
+      }
+    },
+    {
+      "name": "jobProgress with negative framesSoFar",
+      "direction": "worker",
+      "reason": "framesSoFar is a raw frame COUNT (F2 accrued protocol); a negative count is a runner bug, and dispatch must never price a negative accrual off it. Integer ≥ 0 or absent — same for elapsedMs.",
+      "wire": {
+        "type": "jobProgress",
+        "tenant": "driffs",
+        "jobId": "spike-1",
+        "attempt": 1,
+        "progress": 0.35,
+        "framesSoFar": -12
       }
     },
     {
