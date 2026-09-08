@@ -10,6 +10,16 @@ The format follows Keep a Changelog and semantic versioning.
 
 ### Fixed
 
+- **F2 verify fix, residual (F-3)**: the unpinned call site — the spot in
+  the runner-stdout read loop that hands each parsed `progress` event to
+  the wire-frame builder — is now pinned end-to-end by a test that drives
+  a real job (`run_job`) against a scripted fake runner and asserts the
+  serialized `jobProgress` frames carry exactly the `elapsedMs` /
+  `framesSoFar` values the runner printed (and omit the keys for an
+  old-runner line without them). Previously halving the values at that
+  call site left every test green; the earlier F-3 pin covered only the
+  builder helper.
+
 - **F2 verify fix (F-3)**: the supervisor's forwarding of the accrued-cost
   raw measurements (`elapsedMs`/`framesSoFar`) from the runner's stdout
   `progress` event onto the wire `jobProgress` frame is now pinned by a

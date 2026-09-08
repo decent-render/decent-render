@@ -1304,6 +1304,120 @@ mod tests {
         assert!(old_json.get("framesSoFar").is_none());
     }
 
+    /// F2c (verify F-3 residual): the F2b pin covers `progress_to_wire` the
+    /// HELPER; the CALL SITE inside `run_job_inner`'s stdout read loop was
+    /// still unpinned — halving `elapsed_ms`/`frames_so_far` at the call
+    /// site left all 150 tests green (re-proven for this packet: mutation
+    /// → `150 passed; 0 failed`). This test pins the read loop END-TO-END:
+    /// a real spawned runner's stdout lines, parsed by the loop's own
+    /// `serde_json` path, forwarded by the REAL `run_job`, asserted as
+    /// SERIALIZED wire frames. The same call-site mutation now fails HERE
+    /// and ONLY here — the helper pin above still passes, which is what
+    /// proves this test pins the wiring, not the helper.
+    ///
+    /// The fake runner is a POSIX shell script (values lifted verbatim from
+    /// `runner-stdout-v1.json` accept cases): two progress lines carrying
+    /// measurements, one old-runner line WITHOUT them, then a valid `done`.
+    /// It never reads its stdin — the jobAssign write is buffered, and its
+    /// failure is deliberately deferred (and moot: `done` is emitted).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_loop_forwards_runner_progress_lines_to_the_wire_untouched() {
+        let _serial = crate::tests_support::PROCESS_TREE_TESTS.lock().await;
+        let root = unique_worker_root("f2c");
+        set_worker_root_for_tests(root.clone());
+        // First-write-wins OnceLock: a parallel test may already have set
+        // the root. Harmless — the payload sha below is the hash of THIS
+        // tarball (globally unique), so whichever root is active, this
+        // test's entry cannot collide with anyone else's. Root deliberately
+        // not removed afterwards (shared-OnceLock pattern, see the dl tests).
+
+        let script = r#"#!/bin/sh
+echo '{"type":"progress","progress":0.35,"elapsedMs":8453,"framesSoFar":105}'
+echo '{"type":"progress","progress":0.1,"elapsedMs":2117}'
+echo '{"type":"progress","progress":0.75}'
+echo '{"type":"done","outputSizeInBytes":2048,"wallTimeMs":912}'
+"#;
+        let tarball = make_payload_tarball(script.as_bytes());
+        let sha = sha256_hex(&tarball);
+        let (url, server) = serve_bytes(tarball).await;
+
+        let job_id = format!("job-f2c-{}", std::process::id());
+        let assign: JobAssignMessage = serde_json::from_str(&format!(
+            r#"{{"type":"jobAssign","tenant":"driffs","jobId":"{job_id}","attempt":3,"kind":"standard","durationFrames":24,"fps":30,"codec":"h264","bundleSha256":"s","bundleGetUrl":"u","payloadSha256":"{sha}","payloadGetUrl":"{url}","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}}"#
+        ))
+        .unwrap();
+
+        // Bound, not dropped: dropping the sender resolves the cancel
+        // receiver and would end the job as a cancel (connection-tests trap).
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let job = tokio::spawn(run_job(
+            assign,
+            cancel_rx,
+            tx,
+            Duration::from_secs(120),
+            u64::MAX / 2,
+        ));
+
+        let mut frames = Vec::new();
+        let complete = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+                .await
+                .expect("run_job stopped emitting frames for 60s — spawn path broken")
+                .expect("worker channel closed without a terminal frame");
+            match msg {
+                WorkerMessage::JobProgress(frame) => frames.push(
+                    serde_json::to_value(WorkerMessage::JobProgress(frame))
+                        .expect("JobProgress must serialize"),
+                ),
+                WorkerMessage::JobComplete(complete) => break complete,
+                other => panic!("unexpected worker message: {other:?}"),
+            }
+        };
+        job.await.expect("run_job task panicked");
+        drop(_cancel_tx);
+        server.abort();
+
+        // EXACTLY one wire frame per stdout progress line, in order —
+        // mpsc is FIFO and the terminal frame is sent only after the read
+        // loop has drained the runner's stdout.
+        assert_eq!(
+            frames.len(),
+            3,
+            "expected one wire frame per stdout progress line: {frames:?}"
+        );
+        for frame in &frames {
+            assert_eq!(frame["type"], "jobProgress");
+            assert_eq!(frame["tenant"], "driffs");
+            assert_eq!(frame["jobId"], job_id);
+            assert_eq!(frame["attempt"], 3);
+        }
+        // Measurement-bearing line: EXACTLY the values the runner reported —
+        // not halves, not drops, not re-derivations. 0.35/8453/105 is the
+        // fixtures' accrued-measurement accept case, verbatim.
+        assert_eq!(frames[0]["progress"], 0.35);
+        assert_eq!(frames[0]["elapsedMs"], 8453);
+        assert_eq!(frames[0]["framesSoFar"], 105);
+        // elapsedMs-only line (the fixtures' optional-field accept case):
+        // forwarded as an elapsedMs-only frame.
+        assert_eq!(frames[1]["progress"], 0.1);
+        assert_eq!(frames[1]["elapsedMs"], 2117);
+        assert!(
+            frames[1].get("framesSoFar").is_none(),
+            "an elapsedMs-only line must forward as an elapsedMs-only frame"
+        );
+        // Old-runner line (no fields): the frame must NOT carry the keys.
+        assert_eq!(frames[2]["progress"], 0.75);
+        assert!(
+            frames[2].get("elapsedMs").is_none() && frames[2].get("framesSoFar").is_none(),
+            "old-runner progress line leaked measurement keys: {frames:?}"
+        );
+        // And the `done` line ended the job with its output size stamped.
+        assert_eq!(complete.job_id, job_id);
+        assert_eq!(complete.metrics.output_size_in_bytes, Some(2048));
+    }
+
     // ── PACKET 67: the runner child's allowlisted environment ─────────────
 
     #[test]
@@ -1666,7 +1780,12 @@ env
         (format!("http://{addr}/artifact.tar.gz"), handle)
     }
 
-    /// A valid tar.gz containing a single `decent-render-runner` marker file.
+    /// A valid tar.gz containing a single executable
+    /// `decent-render-runner` marker file (F2c: the member carries mode
+    /// 0755, exactly like a published payload — extraction is system tar,
+    /// which preserves modes, so the supervisor can exec the extracted
+    /// runner; the earlier 0644 default was invisible to tests that never
+    /// executed the extracted file).
     fn make_payload_tarball(runner_contents: &[u8]) -> Vec<u8> {
         // tar with a 512-byte header + padded content + two zero blocks,
         // then gzip -9 via flate2? No extra dep: shell out to tar+gzip on
@@ -1681,6 +1800,14 @@ env
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("decent-render-runner"), runner_contents).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("decent-render-runner"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
         let out = std::process::Command::new("tar")
             .arg("-czf")
             .arg("-")
