@@ -23,6 +23,17 @@ The format follows Keep a Changelog and semantic versioning.
 
 ### Fixed
 
+- **F4 verify fix (F-2)**: the disconnect-drain's ack gate and the live
+  suppression site's gate are now ONE shared `cancel_ack_predicate`
+  (only a FAILED terminal is an ack). The drain's copy of that decision
+  was previously a second, unpinned implementation: letting the drain ack
+  a job that COMPLETED during the disconnect (the cancel-after-done race
+  from the drain side — a fabricated teardown witness) left all 156 tests
+  green. Now pinned from BOTH call sites: direct unit tests drive the
+  drain (Complete → nothing queued, Failed → queued, panic → nothing,
+  not-canceled → nothing), and the existing live-path race test pins the
+  suppression site; mutating the shared predicate reddens all of them.
+
 - **F2 verify fix, residual (F-3)**: the unpinned call site — the spot in
   the runner-stdout read loop that hands each parsed `progress` event to
   the wire-frame builder — is now pinned end-to-end by a test that drives

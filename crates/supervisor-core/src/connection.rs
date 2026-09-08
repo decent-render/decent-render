@@ -246,6 +246,19 @@ impl CanceledJob {
     }
 }
 
+/// F4: the ONE shared ack decision (verify F-2 — "pin the wiring" / F2b's
+/// lesson: a decision that exists in two code paths gets mutated in both).
+/// BOTH emission sites — the live suppression branch and the
+/// disconnect-drain — ask this same predicate: only a FAILED terminal is an
+/// ack. The cancel's teardown kills the runner, so any failure IS the
+/// teardown's outcome; a COMPLETED job (the cancel-after-done race) was
+/// never stopped, has no teardown to witness, and already purged on its
+/// success path — acking it would fabricate a stop and silently deflate the
+/// complete-race rate Q19-iv measures.
+fn cancel_ack_predicate(outcome: JobOutcome) -> bool {
+    matches!(outcome, JobOutcome::Failed)
+}
+
 /// F4 CANCEL-ACK: build the acknowledgement frame for a teardown that just
 /// completed. `teardown_ms` = cancel receipt → process-tree dead + purge done
 /// (the witness measurement). A lease assigned without an attempt is acked
@@ -283,6 +296,32 @@ fn queue_pending_cancel_ack(pending: &mut Vec<JobCanceledAckMessage>, canceled: 
         WorkerMessage::JobCanceledAck(ack) => ack,
         _ => unreachable!("cancel_ack_for builds a JobCanceledAck"),
     });
+}
+
+/// F4 CANCEL-ACK (disconnect-drain leg, hoisted to module scope so its gate
+/// is directly pinnable — verify F-2): queue the ack for a dispatch-canceled
+/// job whose teardown finished after the socket died (its terminal frame
+/// goes unread, so it never reaches the live suppression branch). A panicked
+/// task has an unproven teardown — `Err` (JoinError) never acks — and `Ok`
+/// outcomes go through the SHARED cancel_ack_predicate, the same one the
+/// live suppression site gates on. This drain predicate was previously a
+/// second, unpinned implementation of the same decision: letting it ack
+/// `Complete` left 156/156 tests green (verify R2).
+fn queue_drained_cancel_ack(
+    canceled: Option<CanceledJob>,
+    outcome: Result<JobOutcome, tokio::task::JoinError>,
+    pending_cancel_acks: &mut Vec<JobCanceledAckMessage>,
+) {
+    let Some(canceled) = canceled else {
+        return;
+    };
+    let Ok(outcome) = outcome else {
+        return;
+    };
+    if !cancel_ack_predicate(outcome) {
+        return;
+    }
+    queue_pending_cancel_ack(pending_cancel_acks, &canceled);
 }
 
 /// Pure state machine for the quiet-idle handoff. `run_session` owns it in
@@ -732,20 +771,6 @@ async fn run_session(
         })
     }
 
-    fn queue_drained_cancel_ack(
-        canceled: Option<CanceledJob>,
-        outcome: Result<JobOutcome, tokio::task::JoinError>,
-        pending_cancel_acks: &mut Vec<JobCanceledAckMessage>,
-    ) {
-        let Some(canceled) = canceled else {
-            return;
-        };
-        if !matches!(outcome, Ok(JobOutcome::Failed)) {
-            return;
-        }
-        queue_pending_cancel_ack(pending_cancel_acks, &canceled);
-    }
-
     loop {
         // PACKET 37 (audit 12): count draining teardowns too — a node that
         // reports idle while still tearing down gets double-assigned by
@@ -949,10 +974,12 @@ async fn run_session(
                     }
                 }
                 if suppress_after_cancel {
-                    let (job_id, what, failed) = match &msg {
-                        WorkerMessage::JobFailed(f) => (f.job_id.as_str(), "jobFailed", true),
+                    let (job_id, what, outcome) = match &msg {
+                        WorkerMessage::JobFailed(f) => {
+                            (f.job_id.as_str(), "jobFailed", JobOutcome::Failed)
+                        }
                         WorkerMessage::JobComplete(c) => {
-                            (c.job_id.as_str(), "jobComplete", false)
+                            (c.job_id.as_str(), "jobComplete", JobOutcome::Complete)
                         }
                         _ => unreachable!("suppress_after_cancel only set for terminal frames"),
                     };
@@ -990,7 +1017,12 @@ async fn run_session(
                     // makes "after the job task is joined" literal. NEVER
                     // move this to the cancel-frame arm: "cancel accepted" is
                     // not "job stopped" (FARM-1 §1-C / astra §B).
-                    if failed {
+                    //
+                    // The gate is the SHARED cancel_ack_predicate — the same
+                    // one the disconnect-drain queues through (verify F-2:
+                    // the drain's copy of this decision was once a second,
+                    // unpinned implementation).
+                    if cancel_ack_predicate(outcome) {
                         if let Some(canceled) = just_canceled.take() {
                             // Join the teardown task (belt-and-braces: the
                             // terminal frame proves teardown ran; the join

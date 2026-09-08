@@ -1603,6 +1603,97 @@ async fn disconnect_mid_teardown_flushes_ack_after_reconnect() {
     let _ = std::fs::remove_file(&armed);
 }
 
+// ── F4b (verify F-2): the drain path's ack gate shares ONE predicate with
+// the live suppression site — `cancel_ack_predicate`. The verifier's R2
+// mutation (let the drain ack a job that COMPLETED during the disconnect)
+// left 156/156 green before these pins. Both call sites drive the shared
+// predicate: these unit tests drive the DRAIN leg directly, and the live
+// leg stays pinned by `cancel_after_done_race_sends_no_ack` (unchanged) —
+// so mutating the shared predicate reddens BOTH legs, and re-implementing
+// the drain's gate independently reddens here. ─────────────────────────
+
+#[test]
+fn cancel_ack_predicate_only_a_failed_terminal_is_an_ack() {
+    assert!(
+        cancel_ack_predicate(JobOutcome::Failed),
+        "the cancel's teardown kills the runner — any failure IS its outcome"
+    );
+    assert!(
+        !cancel_ack_predicate(JobOutcome::Complete),
+        "a completion raced the cancel — never stopped, no teardown to witness"
+    );
+}
+
+/// A canceled-job record for the pure drain unit tests (no process tree).
+fn probe_canceled_job() -> CanceledJob {
+    CanceledJob {
+        tenant: "driffs".into(),
+        job_id: "job-f2-probe".into(),
+        attempt: Some(2),
+        received_at: Instant::now(),
+    }
+}
+
+#[test]
+fn drain_queues_the_ack_for_a_failed_teardown() {
+    let mut pending = Vec::new();
+    queue_drained_cancel_ack(
+        Some(probe_canceled_job()),
+        Ok(JobOutcome::Failed),
+        &mut pending,
+    );
+    assert_eq!(pending.len(), 1, "a FAILED teardown queues exactly one ack");
+    assert_eq!(pending[0].job_id, "job-f2-probe");
+    assert_eq!(
+        pending[0].attempt, 2,
+        "the canceled attempt is the provenance key"
+    );
+    assert!(
+        pending[0].teardown_ms.is_some(),
+        "the queued ack carries the teardown measurement"
+    );
+}
+
+#[test]
+fn drain_never_queues_a_completed_outcome() {
+    // THE R2 PIN (verify F-2): a job that COMPLETED during the disconnect
+    // — the cancel-after-done race seen from the drain — is not a stop.
+    // Acking it would fabricate a teardown witness and silently deflate the
+    // complete-race rate Q19-iv exists to measure.
+    let mut pending = Vec::new();
+    queue_drained_cancel_ack(
+        Some(probe_canceled_job()),
+        Ok(JobOutcome::Complete),
+        &mut pending,
+    );
+    assert!(
+        pending.is_empty(),
+        "a completed job must NOT be acked from the drain"
+    );
+}
+
+#[tokio::test]
+async fn drain_never_queues_a_panicked_task() {
+    // A panicked task has an unproven teardown — Err(JoinError) never acks.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let handle = tokio::spawn(async { panic!("drain probe") });
+    let joined: Result<JobOutcome, tokio::task::JoinError> = handle.await;
+    std::panic::set_hook(prev_hook);
+    let mut pending = Vec::new();
+    queue_drained_cancel_ack(Some(probe_canceled_job()), joined, &mut pending);
+    assert!(pending.is_empty(), "a panicked task must NOT be acked");
+}
+
+#[test]
+fn drain_ignores_a_job_that_was_never_dispatch_canceled() {
+    // cancel_received_at == None → no CanceledJob → nothing to witness
+    // (a shutdown/socket-death kill is not a dispatch cancel).
+    let mut pending = Vec::new();
+    queue_drained_cancel_ack(None, Ok(JobOutcome::Failed), &mut pending);
+    assert!(pending.is_empty());
+}
+
 /// Shutdown during the connect-retry loop must exit cleanly rather than
 /// leaving the process to be killed by the signal. No job is in flight yet,
 /// so nothing is purged — this is purely about a clean exit.
