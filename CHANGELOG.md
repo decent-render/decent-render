@@ -34,6 +34,18 @@ The format follows Keep a Changelog and semantic versioning.
   not-canceled → nothing), and the existing live-path race test pins the
   suppression site; mutating the shared predicate reddens all of them.
 
+- **F4 verify fix (F-4)**: every `loop { timeout(d, next_text) }` wait in
+  the connection tests is now wall-bounded through one helper,
+  `next_text_before(ws, want, deadline, others)` — previously only ONE of
+  the two identical ack waits had the wall bound: with the ack emission
+  dropped, `cancel_ack_defaults_attempt_one_for_attemptless_lease` never
+  terminated (50 ms heartbeats reset the per-read timeout forever), held
+  the `PROCESS_TREE_TESTS` mutex, and froze every test queued behind it
+  (two orphaned test binaries ran 2–4 h before being killed). Binary-level
+  proof with the emission disabled: both ack tests now FAIL in 34 s and
+  30 s wall respectively (was: one red at ~33 s, one eternal hang); the
+  six `jobAccepted` waits and the drain-flush wait share the same helper.
+
 - **F2 verify fix, residual (F-3)**: the unpinned call site — the spot in
   the runner-stdout read loop that hands each parsed `progress` event to
   the wire-frame builder — is now pinned end-to-end by a test that drives

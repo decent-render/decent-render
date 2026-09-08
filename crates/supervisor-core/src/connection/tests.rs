@@ -239,6 +239,39 @@ async fn next_text(ws: &mut WebSocketStream<TcpStream>) -> String {
     }
 }
 
+/// Wall-bounded frame wait (F4b, verify F-4): read frames until one of type
+/// `want` arrives — but NEVER past `deadline`, no matter how chatty the peer
+/// is. A bare `loop { timeout(d, next_text) }` only gives up when the peer
+/// goes QUIET: the 50 ms test heartbeats reset the per-read timer forever,
+/// so with the ack dropped, `cancel_ack_defaults_attempt_one…` hung
+/// eternally, held the PROCESS_TREE_TESTS mutex, and froze every test queued
+/// behind it (two orphaned test binaries ran 2–4 h before the orchestrator
+/// killed them) — a dropped-frame regression became an eternal CI hang
+/// instead of a red test. Non-wanted frames are pushed to `others` so callers
+/// keep their "everything ever sent" assertions; returns the wanted frame.
+async fn next_text_before(
+    ws: &mut WebSocketStream<TcpStream>,
+    want: &str,
+    deadline: Instant,
+    others: &mut Vec<serde_json::Value>,
+) -> serde_json::Value {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "no {want} before the wall deadline — dropped or never sent (frames so far: {others:?})"
+        );
+        let t = tokio::time::timeout(remaining, next_text(ws))
+            .await
+            .unwrap_or_else(|_| panic!("socket died waiting for {want}"));
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["type"] == want {
+            return v;
+        }
+        others.push(v);
+    }
+}
+
 /// Seed a fake cached render payload so `ensure_payload` short-circuits
 /// (no download). The "runner" is a shell script standing in for
 /// `decent-render-runner`. Returns the payload dir for cleanup.
@@ -878,18 +911,17 @@ async fn cancel_then_render_abort_suppresses_job_failed_and_purges() {
     .unwrap();
 
     // Collect frames until the job is accepted (heartbeats may interleave).
+    // Wall-bounded via next_text_before (F4b, verify F-4): a bare per-read
+    // timeout resets on every heartbeat and would hang on a dropped frame.
     let mut frames: Vec<serde_json::Value> = Vec::new();
-    loop {
-        let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
-            .await
-            .expect("expected jobAccepted before timeout");
-        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-        let accepted = v["type"] == "jobAccepted";
-        frames.push(v);
-        if accepted {
-            break;
-        }
-    }
+    let accepted = next_text_before(
+        &mut ws,
+        "jobAccepted",
+        Instant::now() + Duration::from_secs(30),
+        &mut frames,
+    )
+    .await;
+    frames.push(accepted);
 
     // Dispatch cancels the in-flight job.
     ws.send(Message::Text(Utf8Bytes::from(format!(
@@ -981,19 +1013,17 @@ async fn cancel_after_runner_done_suppresses_job_complete() {
     .await
     .unwrap();
 
-    // Collect frames until jobAccepted (heartbeats may interleave).
+    // Collect frames until jobAccepted (heartbeats may interleave) —
+    // wall-bounded via next_text_before (F4b).
     let mut frames: Vec<serde_json::Value> = Vec::new();
-    loop {
-        let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
-            .await
-            .expect("expected jobAccepted before timeout");
-        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-        let accepted = v["type"] == "jobAccepted";
-        frames.push(v);
-        if accepted {
-            break;
-        }
-    }
+    let accepted = next_text_before(
+        &mut ws,
+        "jobAccepted",
+        Instant::now() + Duration::from_secs(30),
+        &mut frames,
+    )
+    .await;
+    frames.push(accepted);
 
     // Let the runner's `done` + stdout EOF be processed first (see the
     // determinism note above), then cancel into the child.wait() window.
@@ -1188,17 +1218,14 @@ async fn cancel_ack_sent_once_after_teardown_not_on_receipt() {
     .unwrap();
 
     let mut frames: Vec<serde_json::Value> = Vec::new();
-    loop {
-        let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
-            .await
-            .expect("expected jobAccepted before timeout");
-        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-        let accepted = v["type"] == "jobAccepted";
-        frames.push(v);
-        if accepted {
-            break;
-        }
-    }
+    let accepted = next_text_before(
+        &mut ws,
+        "jobAccepted",
+        Instant::now() + Duration::from_secs(30),
+        &mut frames,
+    )
+    .await;
+    frames.push(accepted);
 
     // Only cancel once the runner is provably alive WITH its traps installed
     // (see wait_for_armed) — otherwise the TERM wins the exec race, the tree
@@ -1244,26 +1271,16 @@ async fn cancel_ack_sent_once_after_teardown_not_on_receipt() {
 
     // (2) AFTER THE JOIN: the grace KILL lands, teardown + purge complete,
     // the suppressed jobFailed is processed, and the ack follows it.
-    // Wall-bounded (heartbeats would reset a per-read timeout forever — the
-    // dropped-ack RED proof hangs without the wall bound).
-    let ack = {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "no jobCanceledAck within 30 s of the cancel — the emission site dropped it (frames so far: {frames:?})"
-            );
-            let t = tokio::time::timeout(remaining, next_text(&mut ws))
-                .await
-                .expect("socket died waiting for jobCanceledAck");
-            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-            if v["type"] == "jobCanceledAck" {
-                break v;
-            }
-            frames.push(v);
-        }
-    };
+    // Wall-bounded via next_text_before (heartbeats would reset a per-read
+    // timeout forever — the dropped-ack RED proof hangs without the wall
+    // bound).
+    let ack = next_text_before(
+        &mut ws,
+        "jobCanceledAck",
+        Instant::now() + Duration::from_secs(30),
+        &mut frames,
+    )
+    .await;
     frames.push(ack.clone());
     assert_eq!(ack["jobId"], job_id.as_str());
     assert_eq!(ack["tenant"], "driffs");
@@ -1352,15 +1369,14 @@ async fn cancel_ack_defaults_attempt_one_for_attemptless_lease() {
     .await
     .unwrap();
 
-    loop {
-        let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
-            .await
-            .expect("expected jobAccepted before timeout");
-        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-        if v["type"] == "jobAccepted" {
-            break;
-        }
-    }
+    let mut ignored = Vec::new();
+    next_text_before(
+        &mut ws,
+        "jobAccepted",
+        Instant::now() + Duration::from_secs(30),
+        &mut ignored,
+    )
+    .await;
 
     ws.send(Message::Text(Utf8Bytes::from(format!(
         r#"{{"type":"cancel","tenant":"driffs","jobId":"{job_id}"}}"#
@@ -1368,15 +1384,17 @@ async fn cancel_ack_defaults_attempt_one_for_attemptless_lease() {
     .await
     .unwrap();
 
-    let ack = loop {
-        let t = tokio::time::timeout(Duration::from_secs(20), next_text(&mut ws))
-            .await
-            .expect("expected jobCanceledAck after teardown");
-        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-        if v["type"] == "jobCanceledAck" {
-            break v;
-        }
-    };
+    // Wall-bounded (F4b, verify F-4): the previous per-read 20 s timeout was
+    // reset by every 50 ms heartbeat — with the ack dropped this loop never
+    // gave up and froze the whole PROCESS_TREE_TESTS queue behind it.
+    let mut ignored_ack = Vec::new();
+    let ack = next_text_before(
+        &mut ws,
+        "jobCanceledAck",
+        Instant::now() + Duration::from_secs(30),
+        &mut ignored_ack,
+    )
+    .await;
     assert_eq!(ack["attempt"], 1, "attempt-less lease acks as attempt 1");
     assert_eq!(ack["jobId"], job_id.as_str());
     assert!(
@@ -1428,17 +1446,14 @@ async fn cancel_after_done_race_sends_no_ack() {
     .unwrap();
 
     let mut frames: Vec<serde_json::Value> = Vec::new();
-    loop {
-        let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
-            .await
-            .expect("expected jobAccepted before timeout");
-        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-        let accepted = v["type"] == "jobAccepted";
-        frames.push(v);
-        if accepted {
-            break;
-        }
-    }
+    let accepted = next_text_before(
+        &mut ws,
+        "jobAccepted",
+        Instant::now() + Duration::from_secs(30),
+        &mut frames,
+    )
+    .await;
+    frames.push(accepted);
 
     // Let the runner's `done` + stdout EOF land, then cancel into the
     // child.wait() window (same determinism recipe as the suppression test).
@@ -1530,15 +1545,14 @@ async fn disconnect_mid_teardown_flushes_ack_after_reconnect() {
     )))
     .await
     .unwrap();
-    loop {
-        let t = tokio::time::timeout(Duration::from_secs(5), next_text(&mut ws))
-            .await
-            .expect("expected jobAccepted before timeout");
-        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-        if v["type"] == "jobAccepted" {
-            break;
-        }
-    }
+    let mut ignored = Vec::new();
+    next_text_before(
+        &mut ws,
+        "jobAccepted",
+        Instant::now() + Duration::from_secs(30),
+        &mut ignored,
+    )
+    .await;
     // The cancel must land on a runner with its traps installed (see
     // wait_for_armed), or the teardown finishes before the socket dies.
     wait_for_armed(&armed).await;
@@ -1560,16 +1574,15 @@ async fn disconnect_mid_teardown_flushes_ack_after_reconnect() {
     assert!(second_register.contains("\"register\""));
 
     let mut session2_frames: Vec<serde_json::Value> = Vec::new();
-    let ack = loop {
-        let t = tokio::time::timeout(Duration::from_secs(15), next_text(&mut ws2))
-            .await
-            .expect("expected the flushed jobCanceledAck after register");
-        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-        if v["type"] == "jobCanceledAck" {
-            break v;
-        }
-        session2_frames.push(v);
-    };
+    // Wall-bounded (F4b): same shape as the two live-path ack waits — a
+    // per-read timeout alone never gives up under 50 ms heartbeats.
+    let ack = next_text_before(
+        &mut ws2,
+        "jobCanceledAck",
+        Instant::now() + Duration::from_secs(30),
+        &mut session2_frames,
+    )
+    .await;
     assert_eq!(ack["jobId"], job_id.as_str());
     assert_eq!(ack["attempt"], 1);
     let teardown_ms = ack["teardownMs"].as_u64().expect("teardownMs present");
