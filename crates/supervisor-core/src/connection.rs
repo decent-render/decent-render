@@ -956,7 +956,6 @@ async fn run_session(
                         }
                         _ => unreachable!("suppress_after_cancel only set for terminal frames"),
                     };
-                    eprintln!("F4DEBUG suppressing: {msg:?}");
                     tracing::info!(
                         job_id = job_id,
                         "render terminal frame after cancel — suppressing {what}"
