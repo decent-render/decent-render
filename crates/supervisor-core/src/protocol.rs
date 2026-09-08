@@ -193,6 +193,37 @@ pub enum RejectReason {
     Busy,
 }
 
+/// CANCEL-ACK WITNESS (F4) — the node→dispatch acknowledgement of a
+/// dispatch-initiated cancel, emitted in `connection.rs` at the point where
+/// the terminal frame is suppressed, i.e. AFTER the job task (teardown +
+/// purge) is joined — never on cancel-frame receipt ("cancel accepted" is
+/// not "job stopped", FARM-1 §1-C).
+///
+/// `attempt` is REQUIRED — the provenance key. Dispatch persists it beside
+/// the ack timestamp and its write predicate is idempotent by
+/// (job_id, attempt); a requeued job can never inherit an earlier attempt's
+/// ack. A lease assigned without an attempt is acked as attempt 1, matching
+/// what dispatch's `assignmentAttempt` already assumes.
+///
+/// `teardown_ms` is the witness measurement: integer ms from cancel receipt
+/// to process-tree dead + purge done. Optional (int ≥ 0 on the wire; a
+/// negative value fails to parse on both sides — `u64` here, the reject
+/// fixture pins the TS side).
+///
+/// Additive frame, [`PROTOCOL_VERSION`] stays 2: an old dispatch ignores an
+/// unknown `type` (its inbound-frames policy), an old node never sends this.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobCanceledAckMessage {
+    pub tenant: String,
+    pub job_id: String,
+    /// REQUIRED (unlike the terminal frames' optional lease attempt).
+    pub attempt: u32,
+    /// Integer ms from cancel receipt to process tree dead + purge done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teardown_ms: Option<u64>,
+}
+
 /// A job was declined **without being started** — distinct from
 /// [`JobFailedMessage`], which reports a render that ran and failed.
 ///
@@ -220,6 +251,7 @@ pub enum WorkerMessage {
     JobComplete(JobCompleteMessage),
     JobFailed(JobFailedMessage),
     JobRejected(JobRejectedMessage),
+    JobCanceledAck(JobCanceledAckMessage),
 }
 
 // ── Server → worker ─────────────────────────────────────────────────────────
@@ -497,6 +529,49 @@ mod tests {
         round_trip_server(
             r#"{"type":"updateAvailable","tenant":"driffs","supervisorVersion":"rust-0.0.2","payloadVersion":"remotion-4.0.339"}"#,
         );
+    }
+
+    /// F4 cancel-ack: the node→dispatch acknowledgement of a cancel, sent
+    /// after the job task (teardown + purge) is joined. `attempt` is REQUIRED
+    /// (the provenance key — missing-attempt and string-attempt are reject
+    /// fixtures), `teardown_ms` optional (the shared fixtures carry both
+    /// shapes; negative is a reject fixture — `u64` rejects it at parse).
+    #[test]
+    fn job_canceled_ack_shape() {
+        let with_teardown = round_trip_worker(
+            r#"{"type":"jobCanceledAck","tenant":"driffs","jobId":"spike-1","attempt":2,"teardownMs":812}"#,
+        );
+        let WorkerMessage::JobCanceledAck(a) = with_teardown else {
+            panic!("expected jobCanceledAck");
+        };
+        assert_eq!(a.attempt, 2);
+        assert_eq!(a.teardown_ms, Some(812));
+        assert_eq!(a.tenant, "driffs");
+
+        let without = round_trip_worker(
+            r#"{"type":"jobCanceledAck","tenant":"driffs","jobId":"spike-1","attempt":1}"#,
+        );
+        let WorkerMessage::JobCanceledAck(b) = without else {
+            panic!("expected jobCanceledAck");
+        };
+        assert_eq!(b.teardown_ms, None);
+
+        // attempt is required: a missing field must not parse (serde's
+        // missing-field error, not a default).
+        assert!(serde_json::from_str::<WorkerMessage>(
+            r#"{"type":"jobCanceledAck","tenant":"driffs","jobId":"spike-1","teardownMs":812}"#
+        )
+        .is_err());
+        // A string attempt is not a lease number.
+        assert!(serde_json::from_str::<WorkerMessage>(
+            r#"{"type":"jobCanceledAck","tenant":"driffs","jobId":"spike-1","attempt":"1"}"#
+        )
+        .is_err());
+        // u64 rejects a negative teardown measurement.
+        assert!(serde_json::from_str::<WorkerMessage>(
+            r#"{"type":"jobCanceledAck","tenant":"driffs","jobId":"spike-1","attempt":1,"teardownMs":-5}"#
+        )
+        .is_err());
     }
 
     /// Cross-language conformance: every fixture in

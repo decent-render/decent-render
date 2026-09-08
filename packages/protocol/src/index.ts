@@ -138,6 +138,38 @@ export const JobFailedMessageSchema = z.object({
 export type JobFailedMessage = z.infer<typeof JobFailedMessageSchema>;
 
 /**
+ * CANCEL-ACK WITNESS (F4) — the node→dispatch acknowledgement of a
+ * dispatch-initiated cancel, sent AFTER the job task (teardown + purge) is
+ * joined, never on cancel-frame receipt ("cancel accepted" is not "job
+ * stopped", FARM-1 §1-C).
+ *
+ * `attempt` is REQUIRED — it is the provenance key. Dispatch's write
+ * predicate is `status='canceled' ∧ attempts = attempt ∧
+ * cancel_acked_at IS NULL`, so the ack is idempotent by (jobId, attempt):
+ * a duplicate is absorbed, an ack for a re-assigned/other attempt matches
+ * zero rows, and a requeued job can never inherit an earlier attempt's ack.
+ * A job assigned without an attempt on the wire is acked as attempt 1 —
+ * exactly what dispatch's `assignmentAttempt` already assumes for such
+ * leases.
+ *
+ * `teardownMs` is the raw measurement the witness exists for: integer ms
+ * from cancel-frame receipt to process-tree dead + workdir purge done.
+ * Optional (int ≥ 0) so a node that cannot measure it stays a valid peer.
+ *
+ * Additive frame, `PROTOCOL_VERSION` stays 2: an old dispatch classifies an
+ * unknown `type` as ignorable (inbound-frames.ts, once-per-type info log —
+ * pinned by the dispatch census test), and old nodes simply never send it.
+ */
+export const JobCanceledAckMessageSchema = z.object({
+	type: z.literal('jobCanceledAck'),
+	tenant: z.string(),
+	jobId: z.string(),
+	attempt: z.number().int().positive(),
+	teardownMs: z.number().int().nonnegative().optional(),
+});
+export type JobCanceledAckMessage = z.infer<typeof JobCanceledAckMessageSchema>;
+
+/**
  * A job declined **without being started** — distinct from `jobFailed`, which
  * reports a render that ran and failed.
  *
@@ -162,6 +194,7 @@ export const WorkerMessageSchema = z.discriminatedUnion('type', [
 	JobCompleteMessageSchema,
 	JobFailedMessageSchema,
 	JobRejectedMessageSchema,
+	JobCanceledAckMessageSchema,
 ]);
 export type WorkerMessage = z.infer<typeof WorkerMessageSchema>;
 

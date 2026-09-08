@@ -148,6 +148,27 @@
       }
     },
     {
+      "name": "jobCanceledAck (teardownMs PRESENT — the witness measurement, F4)",
+      "direction": "worker",
+      "wire": {
+        "type": "jobCanceledAck",
+        "tenant": "driffs",
+        "jobId": "spike-1",
+        "attempt": 1,
+        "teardownMs": 812
+      }
+    },
+    {
+      "name": "jobCanceledAck (teardownMs ABSENT — a node that cannot measure teardown, F4)",
+      "direction": "worker",
+      "wire": {
+        "type": "jobCanceledAck",
+        "tenant": "driffs",
+        "jobId": "spike-1",
+        "attempt": 1
+      }
+    },
+    {
       "name": "jobAssign (browser ABSENT — payload bundles its own chrome/)",
       "direction": "server",
       "wire": {
@@ -282,6 +303,41 @@
         "attempt": 1,
         "progress": 0.35,
         "framesSoFar": -12
+      }
+    },
+    {
+      "name": "jobCanceledAck with attempt ABSENT",
+      "direction": "worker",
+      "reason": "attempt is REQUIRED on the cancel-ack (F4): it is the provenance key — dispatch's idempotent write predicate is (jobId, attempt). Without it a requeued job could inherit an earlier attempt's ack.",
+      "wire": {
+        "type": "jobCanceledAck",
+        "tenant": "driffs",
+        "jobId": "spike-1",
+        "teardownMs": 812
+      }
+    },
+    {
+      "name": "jobCanceledAck with negative teardownMs",
+      "direction": "worker",
+      "reason": "teardownMs measures ms from cancel receipt to process-tree dead + purge done — a duration, never negative. Integer >= 0 or absent (u64 on the Rust side rejects it at parse).",
+      "wire": {
+        "type": "jobCanceledAck",
+        "tenant": "driffs",
+        "jobId": "spike-1",
+        "attempt": 1,
+        "teardownMs": -5
+      }
+    },
+    {
+      "name": "jobCanceledAck with a string attempt",
+      "direction": "worker",
+      "reason": "attempt is an integer lease number on the wire; a stringified number is not a wire value to coerce.",
+      "wire": {
+        "type": "jobCanceledAck",
+        "tenant": "driffs",
+        "jobId": "spike-1",
+        "attempt": "1",
+        "teardownMs": 812
       }
     },
     {
