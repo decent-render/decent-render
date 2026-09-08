@@ -6,6 +6,15 @@ itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
 
 ## [Unreleased]
 
+- **F2 verify fix (F-6)** — the pricing grep pin is widened: the bare word
+  `pricing` is now banned in runner-core/protocol/supervisor-core non-test
+  source (the brief's check was "the word → 0"; the pin only banned
+  `pricing.ts`, so six "pricing does not happen here" prose lines
+  survived). Each surviving line is on a documented exact-line allow-list
+  in the test; a new use of the word fails the pin until consciously
+  allow-listed, and a stale entry fails the freshness assertion, so the
+  list cannot rot.
+
 - **Accrued-cost protocol (F2)** — `jobProgress` gains two OPTIONAL fields,
   `elapsedMs` (integer ms since render start) and `framesSoFar` (integer
   frames finished). RAW MEASUREMENTS ONLY — the runner/supervisor report
