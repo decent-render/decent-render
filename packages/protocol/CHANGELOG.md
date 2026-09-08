@@ -6,6 +6,18 @@ itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
 
 ## [Unreleased]
 
+- **Cancel-ack witness (F4)** — new worker→server frame `jobCanceledAck
+  {tenant, jobId, attempt, teardownMs?}`: the node's acknowledgement of a
+  dispatch-initiated cancel, emitted after the job task (teardown +
+  purge) is joined. `attempt` is REQUIRED — the provenance key, making
+  dispatch's persist idempotent by (jobId, attempt) — and `teardownMs`
+  (optional int ≥ 0) is the raw measurement: ms from cancel receipt to
+  process tree dead + purge done. Fixtures carry the PRESENT/ABSENT
+  teardownMs pair plus three rejects (attempt missing, attempt as string,
+  negative teardownMs). No `PROTOCOL_VERSION` bump — additive frame,
+  tolerated by old dispatches (unknown type → ignored) and never sent by
+  old nodes.
+
 - **F2 verify fix (F-6)** — the pricing grep pin is widened: the bare word
   `pricing` is now banned in runner-core/protocol/supervisor-core non-test
   source (the brief's check was "the word → 0"; the pin only banned

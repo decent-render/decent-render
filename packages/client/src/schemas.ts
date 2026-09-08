@@ -53,6 +53,20 @@ const renderStatusBase = z.object({
   accruedCredits: z.number().int().nonnegative().nullable().optional(),
   /** When accruedCredits was last computed (dispatch-side timestamp). */
   accruedAt: isoDateSchema.optional(),
+  /**
+   * CANCEL-ACK WITNESS (F4): when the node acknowledged the dispatch's
+   * cancel — sent AFTER the job task (teardown + purge) joined, never on
+   * cancel-frame receipt. Nullable, and OPTIONAL so responses from a
+   * dispatch predating the field still parse during the deploy window.
+   * NULL forever on rows canceled by a pre-F4 node (no ack ever arrives).
+   */
+  cancelAckedAt: isoDateSchema.optional(),
+  /**
+   * The node-measured teardown duration (ms): cancel-frame receipt →
+   * process tree dead + workdir purge done (F4). Nullable + optional for
+   * the same deploy-window reason as cancelAckedAt.
+   */
+  cancelTeardownMs: z.number().int().nonnegative().nullable().optional(),
   error: z.string().nullable(),
   createdAt: isoDateSchema,
   completedAt: isoDateSchema,

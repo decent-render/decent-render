@@ -2,6 +2,14 @@
 
 ## 0.3.0 — unreleased
 
+- **Cancel-ack witness (F4)**: render status responses may carry
+  `cancelAckedAt` (ISO date or null) and `cancelTeardownMs` (integer ≥ 0
+  or null) — when the node acknowledged the farm's cancel (AFTER the
+  job's teardown + purge joined, never on cancel-frame receipt) and how
+  long that teardown took, ms. Both OPTIONAL + nullable: a dispatch
+  predating the fields omits them during the deploy window, and a
+  pre-F4 node never sends an ack, so its rows read NULL forever.
+
 - **Accrued-cost protocol (F2)**: render status responses may carry
   `accruedCredits` (integer ≥ 0 or null) and `accruedAt` — the farm's
   mid-flight priced accrual, computed from the node's raw measurements.

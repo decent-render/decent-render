@@ -102,6 +102,44 @@ describe('public API schemas', () => {
     expect(parsed.accruedCredits).toBeUndefined();
   });
 
+  // F4 cancel-ack witness: when the node acknowledged the cancel (AFTER the
+  // teardown join) and how long the teardown took. Nullable + optional so a
+  // pre-F4 dispatch's responses still parse during the deploy window.
+  it('parses the cancel-ack fields when the farm reports them', () => {
+    const parsed = renderStatusResponseSchema.parse({
+      renderId: 'job-render-6', status: 'canceled', progress: 0.6,
+      outputUrl: null, creditsReserved: 5, accruedCredits: 5, accruedAt: '2026-09-08T10:00:30.000Z',
+      cancelAckedAt: '2026-09-08T10:00:41.250Z', cancelTeardownMs: 812,
+      creditsSettled: null, error: 'Render canceled by user',
+      createdAt: '2026-09-08T10:00:00.000Z', completedAt: '2026-09-08T10:00:41.000Z', verification: 'pending',
+    });
+    expect(parsed.cancelAckedAt).toBe('2026-09-08T10:00:41.250Z');
+    expect(parsed.cancelTeardownMs).toBe(812);
+  });
+
+  it('parses cancel-ack fields as null on a pre-F4 node (no ack ever arrives)', () => {
+    const parsed = renderStatusResponseSchema.parse({
+      renderId: 'job-render-7', status: 'canceled', progress: 0.6,
+      outputUrl: null, creditsReserved: 5, accruedCredits: null, accruedAt: null,
+      cancelAckedAt: null, cancelTeardownMs: null,
+      creditsSettled: null, error: 'Render canceled by user',
+      createdAt: '2026-09-08T10:00:00.000Z', completedAt: '2026-09-08T10:00:41.000Z', verification: 'pending',
+    });
+    expect(parsed.cancelAckedAt).toBeNull();
+    expect(parsed.cancelTeardownMs).toBeNull();
+  });
+
+  it('still parses cancel responses from a dispatch predating the cancel-ack fields', () => {
+    const parsed = renderStatusResponseSchema.parse({
+      renderId: 'job-render-8', status: 'canceled', progress: 0.6,
+      outputUrl: null, creditsReserved: 5,
+      creditsSettled: null, error: 'Render canceled by user',
+      createdAt: '2026-09-08T10:00:00.000Z', completedAt: '2026-09-08T10:00:41.000Z', verification: 'pending',
+    });
+    expect(parsed.cancelAckedAt).toBeUndefined();
+    expect(parsed.cancelTeardownMs).toBeUndefined();
+  });
+
   it('parses the active runner matrix', () => {
     const parsed = versionsResponseSchema.parse({
       supportedRemotionVersions: [{remotionVersion: '4.0.487', payloadVersion: 'runner-v1'}],

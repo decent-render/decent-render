@@ -8,6 +8,19 @@ The format follows Keep a Changelog and semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **F4 cancel-ack witness**: `jobCanceledAck {tenant, jobId, attempt,
+  teardownMs?}` — a new worker→server frame acknowledging a
+  dispatch-initiated cancel. Emitted by the supervisor AFTER the job task
+  (teardown + purge) is joined (the suppression site in connection.rs),
+  never on cancel-frame receipt; `attempt` is REQUIRED (the provenance key
+  — dispatch's write is idempotent by (jobId, attempt)), `teardownMs`
+  (int ≥ 0) measures cancel receipt → process tree dead + purge done.
+  At-least-once across socket death (queued on the dead-socket drain,
+  flushed after the next register). `PROTOCOL_VERSION` stays 2 — an old
+  dispatch ignores the unknown type; an old node never sends it.
+
 ### Fixed
 
 - **F2 verify fix, residual (F-3)**: the unpinned call site — the spot in
