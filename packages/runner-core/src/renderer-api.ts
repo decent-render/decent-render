@@ -51,4 +51,25 @@ export type RendererApi<TComposition extends MinimalComposition> = {
       onProgress: (progress: {progress: number}) => void;
     },
   ) => Promise<unknown>;
+  /**
+   * FARM-STILL: render exactly ONE frame of the composition. Injected by the
+   * versioned runner apps next to `renderMedia` so `bun build --compile`
+   * embeds the app's pinned renderer, exactly like the video functions. The
+   * still path passes the SAME chrome/binaries options as the video path —
+   * the capture surface (`chrome-for-testing` + `gl: 'angle'`) must be
+   * identical, only the output is a single lossless PNG.
+   */
+  renderStill: (options: SharedRenderOptions & {
+    composition: TComposition;
+    /** Zero-based frame index — the wire guarantees frame < durationFrames. */
+    frame: number;
+    /** The certification contract is lossless; the set is closed at png. */
+    imageFormat: 'png';
+    /**
+     * Remotion's renderStill names this `output` (renderMedia names it
+     * `outputLocation`) — the slice keeps the injected function's OWN
+     * option names so the object can be passed through verbatim.
+     */
+    output: string;
+  }) => Promise<unknown>;
 };

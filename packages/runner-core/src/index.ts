@@ -33,9 +33,9 @@ function heartbeatIntervalMs(): number {
 }
 
 export {renderJob} from './render-job.js';
-export {verifyRenderedOutput} from './verify-output.js';
+export {verifyRenderedOutput, verifyStillOutput} from './verify-output.js';
 export {purgeActiveWorkDir, jobCanceled, markJobCanceled} from './render-job.js';
-export type {OutputProbe, VerifyOptions} from './verify-output.js';
+export type {OutputProbe, StillProbe, VerifyOptions, VerifyStillOptions} from './verify-output.js';
 export type {MinimalComposition, RendererApi} from './renderer-api.js';
 
 /**
@@ -80,12 +80,15 @@ export function resolveBrowserExecutable(
  * the injected `@remotion/renderer` functions, emits protocol frames on
  * stdout, and exits. Each versioned runner app's entry point is just:
  *
- *   import {renderMedia, selectComposition} from '@remotion/renderer';
+ *   import {renderMedia, renderStill, selectComposition} from '@remotion/renderer';
  *   import {runRunner} from '@decent-render/runner-core';
- *   await runRunner({renderMedia, selectComposition});
+ *   await runRunner({renderMedia, renderStill, selectComposition});
  *
  * The renderer import MUST stay in the app entry file so that
  * `bun build --compile` resolves it against the app's own pinned version.
+ * `renderStill` (FARM-STILL) rides the same injection: the still branch in
+ * renderJob calls it only when the jobAssign carries `still`; video jobs
+ * never touch it.
  */
 export async function runRunner<TComposition extends MinimalComposition>(renderer: RendererApi<TComposition>): Promise<never> {
   const protocolWrite = process.stdout.write.bind(process.stdout);

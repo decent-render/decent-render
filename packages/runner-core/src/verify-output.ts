@@ -39,7 +39,7 @@
  * no assumption about what is installed on the operator's machine.
  */
 import {spawnSync} from 'node:child_process';
-import {existsSync, statSync} from 'node:fs';
+import {closeSync, existsSync, openSync, readSync, statSync} from 'node:fs';
 import path from 'node:path';
 
 /** What the file actually turned out to contain. */
@@ -374,4 +374,89 @@ export function verifyRenderedOutput(options: VerifyOptions): OutputProbe {
 
   log(`output verified: ${probe.frames} frames, ${probe.width}x${probe.height}, ${probe.codec}, ${sizeInBytes} bytes`);
   return probe;
+}
+
+// ── FARM-STILL: PNG verification (signature + IHDR geometry) ───────────────
+
+export type StillProbe = {
+  width: number;
+  height: number;
+  sizeInBytes: number;
+};
+
+export type VerifyStillOptions = {
+  outputLocation: string;
+  /** Composition geometry — MEASURED against the IHDR when present. */
+  expectedWidth?: number;
+  expectedHeight?: number;
+  log?: (message: string) => unknown;
+};
+
+/** PNG magic: 89 50 4E 47 0D 0A 1A 0A. */
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+/** Fixed first-chunk layout: signature + length(4) + 'IHDR' + width(4) + height(4). */
+const PNG_HEADER_BYTES = 8 + 4 + 4 + 4 + 4;
+
+/**
+ * Verify a still output BEFORE the upload — the same trust model as
+ * {@link verifyRenderedOutput}: this catches honest failures (a truncated
+ * file, a zero-byte file, a renderer that wrote the wrong geometry) before
+ * they reach storage and get reported as a success. It is NOT
+ * tamper-resistant; the off-node referee is still unbuilt, so a completed
+ * still's `verification` stays honestly `pending`.
+ *
+ * The checks are structural and cheap: PNG signature, then the IHDR header
+ * (the only chunk at a fixed offset) whose width/height must equal the
+ * composition's geometry. No image decode — a signature+IHDR check cannot
+ * prove the pixels are the right pixels; that is the tenant's
+ * re-verification's job. What it DOES prove: the bytes are a PNG of the
+ * claimed dimensions, which is exactly the honest-failure class a broken
+ * ANGLE path or a failed capture produces.
+ */
+export function verifyStillOutput(options: VerifyStillOptions): StillProbe {
+  const {outputLocation, expectedWidth, expectedHeight} = options;
+  const log = options.log ?? (() => {});
+
+  if (!existsSync(outputLocation)) {
+    throw new Error('still render reported success but produced no output file');
+  }
+  const sizeInBytes = statSync(outputLocation).size;
+  if (sizeInBytes === 0) {
+    throw new Error('still render produced a zero-byte output file');
+  }
+
+  const header = Buffer.alloc(PNG_HEADER_BYTES);
+  const fd = openSync(outputLocation, 'r');
+  try {
+    const read = readSync(fd, header, 0, PNG_HEADER_BYTES, 0);
+    if (read < PNG_HEADER_BYTES) {
+      throw new Error(`still output is ${read} bytes — not a PNG (truncated header)`);
+    }
+  } finally {
+    closeSync(fd);
+  }
+  if (!header.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    throw new Error('still output is not a PNG (bad signature) — refusing the upload');
+  }
+  const ihdrType = header.subarray(12, 16).toString('ascii');
+  if (ihdrType !== 'IHDR') {
+    throw new Error(`still output's first chunk is ${ihdrType}, not IHDR — refusing the upload`);
+  }
+  const width = header.readUInt32BE(16);
+  const height = header.readUInt32BE(20);
+  if (width === 0 || height === 0) {
+    throw new Error(`still output declares ${width}x${height} — refusing the upload`);
+  }
+  if (expectedWidth !== undefined && expectedHeight !== undefined) {
+    if (width !== expectedWidth || height !== expectedHeight) {
+      throw new Error(
+        `still output is ${width}x${height}, composition declares ${expectedWidth}x${expectedHeight} — refusing the upload`,
+      );
+    }
+  } else {
+    log('composition exposed no width/height — still geometry check skipped');
+  }
+
+  log(`still verified: PNG ${width}x${height}, ${sizeInBytes} bytes`);
+  return {width, height, sizeInBytes};
 }

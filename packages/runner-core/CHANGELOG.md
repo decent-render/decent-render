@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Still render path (FARM-STILL, 0.1.4)**: a `jobAssign` carrying the
+  optional `still: {frame, format:'png'}` directive now renders exactly ONE
+  frame via the injected `renderStill` (new required member of `RendererApi`
+  — versioned runner apps must pass it next to `renderMedia`), writes
+  `still-f<frame>.png` into the per-job workdir, verifies the output BEFORE
+  the upload (PNG signature + IHDR geometry against the resolved composition
+  — `verifyStillOutput`; the verify-before-upload invariant is never
+  skipped), uploads with `content-type: image/png`, reports `frames: 1`, and
+  emits progress as a single 0 → 1 step with `framesSoFar ∈ {0,1}` (never
+  the composition's duration). The packet-25 whole-render retry is MIRRORED
+  for stills: exactly one retry on a delayRender timeout, never for other
+  failures, never after a cancel, visible in the `[retry]` log line. The
+  purge invariant is unchanged: the workdir is removed on success AND on
+  failure. The video path is byte-identical — pinned option-for-option by
+  `still-render.test.ts`'s video-path guard. `verification` stays honestly
+  `pending` for stills (no off-node referee exists).
+
 - **F2 verify fix (F-3)**: the two forwarding hops the accrued measurements
   ride are now PINNED, not just their schemas. Dropping `elapsedMs`/
   `framesSoFar` from the runner's stdout line (or halving them in the

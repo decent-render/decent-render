@@ -2,8 +2,8 @@
 
 The render logic that runs on an operator's machine: the runner main loop and
 the render job itself — bundle download + sha256 verification, Remotion
-`selectComposition`/`renderMedia`, presigned upload of the output, and working-
-directory purge.
+`selectComposition`/`renderMedia` (videos) or `renderStill` (single-frame PNGs,
+FARM-STILL), presigned upload of the output, and working-directory purge.
 
 This is the code that touches tenant content, so it lives here in the open
 rather than inside the closed platform.
@@ -18,9 +18,9 @@ all. Each versioned runner app imports its own pinned renderer and hands it in:
 ```ts
 #!/usr/bin/env bun
 import {runRunner} from '@decent-render/runner-core';
-import {renderMedia, selectComposition} from '@remotion/renderer';
+import {renderMedia, renderStill, selectComposition} from '@remotion/renderer';
 
-await runRunner({renderMedia, selectComposition});
+await runRunner({renderMedia, renderStill, selectComposition});
 ```
 
 The `@remotion/renderer` import MUST stay in the app's entry file. That is what

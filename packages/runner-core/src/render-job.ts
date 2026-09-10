@@ -6,7 +6,7 @@ import {existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, stat
 import os from 'node:os';
 import path from 'node:path';
 import type {MinimalComposition, RendererApi} from './renderer-api.js';
-import {verifyRenderedOutput} from './verify-output.js';
+import {verifyRenderedOutput, verifyStillOutput} from './verify-output.js';
 
 const bundleCacheDir = path.join(os.homedir(), '.decent-worker', 'bundles');
 const defaultLog = (message: string) => process.stderr.write(`${message}\n`);
@@ -206,6 +206,67 @@ export function isDelayRenderTimeout(message: string): boolean {
   );
 }
 
+/**
+ * Stream one rendered output file to the job's presigned PUT — the shared
+ * upload leg of BOTH render paths (video and still). Same contract as the
+ * renderJob inline code this was factored from: streamed body (never
+ * buffered), Content-Length for Bun.file / explicit header for Node streams,
+ * body discarded on failure so the `finally` purge can never race an open
+ * read stream.
+ */
+async function putOutputToPresignedUrl(params: {
+  outputPutUrl: string;
+  outputLocation: string;
+  contentType: string;
+  outputSize: number;
+}): Promise<void> {
+  const {outputPutUrl, outputLocation, contentType, outputSize} = params;
+  // STREAM the file as the PUT body — never buffer it. The size cap allows
+  // up to 2 GiB of output, and readFileSync would commit that much memory
+  // per job (packet 9's OWED). S3-compatible presigned PUTs reject chunked
+  // transfer encoding, so the body must carry Content-Length:
+  //   - Bun (the payload runtime): Bun.file sets Content-Length from the
+  //     file size (probed at the raw-socket level, packet 15).
+  //   - Node (the vitest runtime): a stream body needs duplex:'half' and
+  //     an EXPLICIT content-length header — without it undici rejects, and
+  //     Bun would strip it to chunked anyway (probed both ways).
+  // BodyInit is not in this tsconfig's libs; derive it from fetch's own
+  // RequestInit so the type tracks whatever the runtime defines.
+  let putBody: NonNullable<Parameters<typeof fetch>[1]>['body'];
+  let putHeaders: Record<string, string> = {'content-type': contentType};
+  if (typeof Bun !== 'undefined' && typeof Bun.file === 'function') {
+    putBody = Bun.file(outputLocation);
+  } else {
+    putBody = createReadStream(outputLocation) as unknown as ReadableStream;
+    putHeaders = {...putHeaders, 'content-length': String(outputSize), duplex: 'half'} as Record<string, string>;
+  }
+  let uploaded: Response;
+  try {
+    uploaded = await fetch(outputPutUrl, {
+    method: 'PUT',
+    body: putBody,
+    // The duplex hint is ignored by Bun and required by Node's undici for
+    // stream bodies; typing it through a cast keeps one call site.
+    ...(putBody instanceof ReadableStream || typeof (putBody as {pipe?: unknown}).pipe === 'function'
+      ? {duplex: 'half' as const}
+      : {}),
+    headers: putHeaders,
+    } as RequestInit);
+  } catch (err) {
+    await discardBody(putBody).catch(() => {});
+    throw err;
+  }
+  if (!uploaded.ok) {
+    // A streamed body may still be opening/reading when fetch rejects or
+    // returns early; make sure nothing can touch the workdir after the
+    // finally-purge below. (Not theoretical: under a refused connection
+    // the stream-open races the purge and surfaces as an unhandled ENOENT
+    // — caught by the ffmpeg-hidden CI-parity run, packet 15.)
+    await discardBody(putBody).catch(() => {});
+    throw new Error(`output upload failed: HTTP ${uploaded.status}`);
+  }
+}
+
 export async function renderJob<TComposition extends MinimalComposition>(
   assign: JobAssignMessage,
   renderer: RendererApi<TComposition>,
@@ -220,13 +281,103 @@ export async function renderJob<TComposition extends MinimalComposition>(
   const workDir = mkdtempSync(path.join(os.tmpdir(), `job-${assign.jobId}-`));
   activeWorkDir = workDir;
   try {
-    const outputLocation = path.join(workDir, assign.codec === 'vp8' ? 'out.webm' : 'out.mp4');
     const renderOptions = {
       binariesDirectory: options.binariesDirectory ?? null,
       browserExecutable: options.browserExecutable ?? null,
       chromeMode: 'chrome-for-testing',
       chromiumOptions: {gl: 'angle'},
     } as const;
+
+    // ── FARM-STILL: the still branch ────────────────────────────────────
+    // One frame, lossless PNG, same capture surface as a video job
+    // (chrome-for-testing + gl:'angle' via renderOptions) and the SAME
+    // verify-before-upload + cancel-guard + purge discipline. Absent
+    // `still` ⇒ the video path below, byte-identical to its pre-still
+    // behaviour.
+    if (assign.still) {
+      const still = assign.still;
+      // Protocol-level invariant re-checked: the wire parse already refuses
+      // this on both sides (TS refine / Rust Deserialize); one comparison
+      // here keeps a bad frame from ever reaching renderStill even if a
+      // peer regresses.
+      if (still.frame >= assign.durationFrames) {
+        throw new Error(
+          `still.frame ${still.frame} must be < durationFrames ${assign.durationFrames}`,
+        );
+      }
+      const outputLocation = path.join(workDir, `still-f${still.frame}.png`);
+      // Progress for a still is one step, 0 → 1, and framesSoFar counts
+      // FRAMES DEFINITELY done — for a still that is 0, then 1. NEVER the
+      // composition's full duration (a still is one frame of it).
+      const emitStillProgress = (progress: number) => {
+        options.onProgress?.({
+          progress,
+          elapsedMs: Date.now() - started,
+          framesSoFar: progress >= 1 ? 1 : 0,
+        });
+      };
+      let doneComposition: TComposition | undefined;
+      const attemptStill = async (): Promise<void> => {
+        const composition = await renderer.selectComposition({serveUrl, id: compositionId, inputProps, ...renderOptions});
+        doneComposition = composition;
+        emitStillProgress(0);
+        await renderer.renderStill({
+          serveUrl,
+          composition,
+          inputProps,
+          frame: still.frame,
+          imageFormat: 'png',
+          // renderStill names the file `output` (renderMedia: outputLocation).
+          output: outputLocation,
+          ...renderOptions,
+        });
+        emitStillProgress(1);
+      };
+      // Mirror of the video path's packet-25 retry: the WHOLE still render
+      // (select + renderStill — both hang under the packet-22 GPU-adapter
+      // contention) retried exactly ONCE on a delayRender timeout, never
+      // for other failures, never after a cancel.
+      try {
+        await attemptStill();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!isDelayRenderTimeout(message)) throw error;
+        if (jobCanceled()) throw error; // a canceled job must not retry
+        log(
+          `[retry] attempt 1 failed with a delayRender timeout (renderer/GPU init hang, packet-22 class) — ` +
+            `retrying the still render once (attempt 2 of 2): ${message}`,
+        );
+        await attemptStill();
+      }
+      // Verify BEFORE the upload (runner invariant — never skipped): PNG
+      // signature + IHDR geometry against the resolved composition.
+      verifyStillOutput({
+        outputLocation,
+        expectedWidth: doneComposition?.width,
+        expectedHeight: doneComposition?.height,
+        log,
+      });
+      const outputSize = statSync(outputLocation).size;
+      // Same cancel guard as the video path: a cancel observed up to and
+      // including the tick before the PUT suppresses the upload.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (jobCanceled()) {
+        throw new Error(
+          'cancel observed before the output upload — refusing to upload a canceled job (the workdir purge in this finally block is the cleanup)',
+        );
+      }
+      await putOutputToPresignedUrl({
+        outputPutUrl: assign.outputPutUrl,
+        outputLocation,
+        contentType: 'image/png',
+        outputSize,
+      });
+      // One frame, MEASURED as a verified PNG — not the composition's
+      // declared duration.
+      return {wallMs: Date.now() - started, frames: 1, outputSizeInBytes: outputSize};
+    }
+
+    const outputLocation = path.join(workDir, assign.codec === 'vp8' ? 'out.webm' : 'out.mp4');
     // PACKET 25 (0.1.3): retry the WHOLE render (select + renderMedia —
     // both hang under the packet-22 GPU-adapter contention) exactly ONCE
     // when the first attempt dies with a delayRender timeout. The hung
@@ -317,50 +468,12 @@ export async function renderJob<TComposition extends MinimalComposition>(
         'cancel observed before the output upload — refusing to upload a canceled job (the workdir purge in this finally block is the cleanup)',
       );
     }
-    // STREAM the file as the PUT body — never buffer it. The size cap allows
-    // up to 2 GiB of output, and readFileSync would commit that much memory
-    // per job (packet 9's OWED). S3-compatible presigned PUTs reject chunked
-    // transfer encoding, so the body must carry Content-Length:
-    //   - Bun (the payload runtime): Bun.file sets Content-Length from the
-    //     file size (probed at the raw-socket level, packet 15).
-    //   - Node (the vitest runtime): a stream body needs duplex:'half' and
-    //     an EXPLICIT content-length header — without it undici rejects, and
-    //     Bun would strip it to chunked anyway (probed both ways).
-    // BodyInit is not in this tsconfig's libs; derive it from fetch's own
-    // RequestInit so the type tracks whatever the runtime defines.
-    let putBody: NonNullable<Parameters<typeof fetch>[1]>['body'];
-    let putHeaders: Record<string, string> = {'content-type': assign.codec === 'vp8' ? 'video/webm' : 'video/mp4'};
-    if (typeof Bun !== 'undefined' && typeof Bun.file === 'function') {
-      putBody = Bun.file(outputLocation);
-    } else {
-      putBody = createReadStream(outputLocation) as unknown as ReadableStream;
-      putHeaders = {...putHeaders, 'content-length': String(outputSize), duplex: 'half'} as Record<string, string>;
-    }
-    let uploaded: Response;
-    try {
-      uploaded = await fetch(assign.outputPutUrl, {
-      method: 'PUT',
-      body: putBody,
-      // The duplex hint is ignored by Bun and required by Node's undici for
-      // stream bodies; typing it through a cast keeps one call site.
-      ...(putBody instanceof ReadableStream || typeof (putBody as {pipe?: unknown}).pipe === 'function'
-        ? {duplex: 'half' as const}
-        : {}),
-      headers: putHeaders,
-      } as RequestInit);
-    } catch (err) {
-      await discardBody(putBody).catch(() => {});
-      throw err;
-    }
-    if (!uploaded.ok) {
-      // A streamed body may still be opening/reading when fetch rejects or
-      // returns early; make sure nothing can touch the workdir after the
-      // finally-purge below. (Not theoretical: under a refused connection
-      // the stream-open races the purge and surfaces as an unhandled ENOENT
-      // — caught by the ffmpeg-hidden CI-parity run, packet 15.)
-      await discardBody(putBody).catch(() => {});
-      throw new Error(`output upload failed: HTTP ${uploaded.status}`);
-    }
+    await putOutputToPresignedUrl({
+      outputPutUrl: assign.outputPutUrl,
+      outputLocation,
+      contentType: assign.codec === 'vp8' ? 'video/webm' : 'video/mp4',
+      outputSize,
+    });
     // `frames` is the MEASURED count from the file, not the composition's
     // declared duration — the whole point of verifying is that the two can
     // disagree, and the claim is what used to be reported.
