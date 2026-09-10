@@ -6,6 +6,24 @@ itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
 
 ## [Unreleased]
 
+- **Still render directive (FARM-STILL)** — `jobAssign` gains one OPTIONAL
+  field, `still: {frame, format}`. Present ⇒ the job renders exactly ONE
+  frame as a lossless PNG (`renderStill`) instead of a video; absent ⇒
+  today's video job, byte-identical behaviour. `frame` is zero-based and
+  must be `< durationFrames` — enforced at PARSE time on both sides (a TS
+  cross-field refine ON `JobAssignMessageSchema`, and Rust's hand-written
+  `Deserialize` over a derive-only `JobAssignMessageUnchecked` mirror), with
+  reject fixtures pinning both the `frame == durationFrames` boundary and
+  the closed `format: 'png'` set. `durationFrames` itself is untouched
+  (≥ 1; the tenant sends the composition's real duration). NO
+  `PROTOCOL_VERSION` bump — additive-optional field, wire-tolerant in both
+  directions (old dispatch never sends it; old nodes ignore it). Old-node
+  rollout caveat (dispatch-side, not wire): a pre-still node that receives
+  a still frame will render a VIDEO and the job fails at output
+  verification — republish payloads before enqueueing stills.
+- `fixtures/v2.json`: +1 accept case (jobAssign with `still`), +2 reject
+  cases (still.frame at durationFrames; unknown format 'jpeg').
+
 - **Cancel-ack witness (F4)** — new worker→server frame `jobCanceledAck
   {tenant, jobId, attempt, teardownMs?}`: the node's acknowledgement of a
   dispatch-initiated cancel, emitted after the job task (teardown +

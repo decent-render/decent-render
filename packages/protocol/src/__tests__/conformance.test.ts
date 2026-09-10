@@ -153,6 +153,40 @@ describe('protocol v2 — Rust⇄TS golden-fixture conformance', () => {
 		expect(assigns.some((c) => !('browserSha256' in (c.wire as object)))).toBe(true);
 	});
 
+	it('old↔new tolerance: an old-dispatch jobAssign (no still directive) parses under the NEW schema', () => {
+		const wire = firstOfType('jobAssign');
+		expect('still' in wire).toBe(false);
+		const parsed = ServerMessageSchema.parse(wire);
+		if (parsed.type !== 'jobAssign') throw new Error('expected jobAssign');
+		// The field stays ABSENT (not null) — the runner branches on presence.
+		expect(parsed.still).toBeUndefined();
+	});
+
+	it('old↔new tolerance: a still jobAssign keeps its directive through the round-trip (FARM-STILL)', () => {
+		const still = casesOfType('jobAssign').find((c) => 'still' in (c.wire as object));
+		expect(still, 'no still jobAssign fixture').toBeDefined();
+		const parsed = ServerMessageSchema.parse(still!.wire);
+		if (parsed.type !== 'jobAssign') throw new Error('expected jobAssign');
+		expect(JSON.parse(JSON.stringify(parsed))).toEqual(still!.wire);
+	});
+
+	it('fixtures cover the still directive both PRESENT and ABSENT (FARM-STILL)', () => {
+		const assigns = casesOfType('jobAssign');
+		expect(assigns.some((c) => 'still' in (c.wire as object))).toBe(true);
+		expect(assigns.some((c) => !('still' in (c.wire as object)))).toBe(true);
+	});
+
+	it('the still cross-field bound refuses frame ≥ durationFrames at parse (FARM-STILL)', () => {
+		// Mirrored by a reject fixture AND by Rust's hand-written Deserialize;
+		// asserted directly here so the refine's teeth are visible without
+		// reading the fixture file.
+		const wire = firstOfType('jobAssign') as Record<string, unknown> & {
+			still?: {frame: number; format: string};
+		};
+		const bad = {...wire, still: {frame: wire.durationFrames as number, format: 'png'}};
+		expect(ServerMessageSchema.safeParse(bad).success).toBe(false);
+	});
+
 	it('fixtures cover the accrued measurements both PRESENT and ABSENT (F2)', () => {
 		// Scoped to jobProgress: the ABSENT case is what an old node sends and
 		// must keep parsing forever; the PRESENT case is the F2 raw-measurement

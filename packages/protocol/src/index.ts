@@ -201,6 +201,31 @@ export type WorkerMessage = z.infer<typeof WorkerMessageSchema>;
 // ── Server → worker ─────────────────────────────────────────────────────────
 
 /**
+ * STILL RENDER DIRECTIVE (FARM-STILL) — present when the job renders exactly
+ * ONE frame as a lossless PNG (`renderStill`) instead of a video
+ * (`renderMedia`). Absent ⇒ today's video job, byte-identical behaviour.
+ *
+ * `frame` is the zero-based frame index to render; dispatch and the runner
+ * both enforce `frame < durationFrames` (a still outside the composition is
+ * unrenderable, and the refusal must be a parse-time rejection on BOTH sides,
+ * not a mid-job failure — see the `reject` fixtures and the cross-field
+ * refine below / serde validation in protocol.rs).
+ *
+ * `format` is the closed set `png` — the certification stills this carries
+ * are lossless by contract; a lossy format would be a different (and
+ * dishonest) job type. Unknown formats fail to parse.
+ *
+ * Additive-optional field: NO `PROTOCOL_VERSION` bump (same class as
+ * jobProgress's elapsedMs/framesSoFar — old peers ignore/strips it; the
+ * version pin is a register-time gate that would orphan the fleet).
+ */
+export const StillDirectiveSchema = z.object({
+	frame: z.number().int().nonnegative(),
+	format: z.literal('png'),
+});
+export type StillDirective = z.infer<typeof StillDirectiveSchema>;
+
+/**
  * Job assignment. This is the privacy-rule carrier: assets arrive via presigned
  * R2 GET, output goes up via presigned PUT, and `purgeAfter` directs the
  * supervisor to wipe the working directory after the job. The device only ever
@@ -265,7 +290,22 @@ export const JobAssignMessageSchema = z.object({
 	outputKey: z.string(),
 	/** Supervisor MUST purge the working directory after the job. Always true. */
 	purgeAfter: z.literal(true),
-});
+	/**
+	 * STILL RENDER DIRECTIVE (FARM-STILL) — optional; absent ⇒ video job.
+	 * `frame` must be `< durationFrames` (validated cross-field below AND in
+	 * Rust's Deserialize for JobAssignMessage — neither side may accept it).
+	 */
+	still: StillDirectiveSchema.optional(),
+})
+	// Cross-field bound, ON the schema so every parse path (fixture
+	// conformance, dispatch sender gate, supervisor receive) refuses a still
+	// outside the composition at parse time. durationFrames stays ≥ 1 (schema
+	// compatibility — the tenant sends the composition's real duration; the
+	// still renders ONE frame of it).
+	.refine(
+		(assign) => !assign.still || assign.still.frame < assign.durationFrames,
+		{message: 'still.frame must be < durationFrames', path: ['still', 'frame']},
+	);
 export type JobAssignMessage = z.infer<typeof JobAssignMessageSchema>;
 
 export const CancelMessageSchema = z.object({

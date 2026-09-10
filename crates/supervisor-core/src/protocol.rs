@@ -272,6 +272,33 @@ pub enum Codec {
     Vp8,
 }
 
+/// The format of a still render (`jobAssign.still.format`). Closed set: the
+/// certification stills this directive carries are lossless PNGs by contract;
+/// a lossy or unknown format is a parse error, not a runtime surprise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StillFormat {
+    Png,
+}
+
+/// STILL RENDER DIRECTIVE (FARM-STILL) — `jobAssign.still`. Present when the
+/// job renders exactly ONE frame as a lossless PNG (`renderStill`) instead of
+/// a video (`renderMedia`); absent means today's video job, byte-identical
+/// behaviour. `frame` is the zero-based frame index; it must be
+/// `< durationFrames`, which [`JobAssignMessage`]'s `Deserialize` enforces at
+/// parse time (the TS side enforces it with a cross-field refine — neither
+/// side may accept a still outside the composition).
+///
+/// Additive-optional field: NO `PROTOCOL_VERSION` bump (old peers ignore the
+/// unknown field; the version pin is a register-time gate that would orphan
+/// the fleet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StillDirective {
+    pub frame: u64,
+    pub format: StillFormat,
+}
+
 /// The protocol.ts `purgeAfter: z.literal(true)` — a boolean that is always
 /// `true` on the wire. Deserialization rejects `false`, so a job that does not
 /// carry the purge directive cannot even be parsed. This is the privacy rule
@@ -299,7 +326,13 @@ impl<'de> Deserialize<'de> for PurgeAfter {
 /// directs the supervisor to wipe the working directory after the job. The
 /// device only ever holds platform bundles + transient job assets — never
 /// persisted user content.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Deserialize is HAND-WRITTEN (over [`JobAssignMessageUnchecked`]) solely to
+/// enforce the cross-field still bound (`still.frame < duration_frames`) at
+/// parse time; Serialize stays derived. Every field must appear in BOTH
+/// structs — the shared fixtures round-trip the checked struct, so a field
+/// missing from either side fails `cross_language_fixtures_round_trip`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobAssignMessage {
     pub tenant: String,
@@ -349,6 +382,85 @@ pub struct JobAssignMessage {
     pub output_key: String,
     /// Supervisor MUST purge the working directory after the job. Always true.
     pub purge_after: PurgeAfter,
+    /// STILL RENDER DIRECTIVE (FARM-STILL) — optional; absent ⇒ video job.
+    /// See [`StillDirective`] for the contract and the parse-time bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub still: Option<StillDirective>,
+}
+
+/// Derive-only mirror of [`JobAssignMessage`] used to deserialize without the
+/// cross-field check, which then runs in the hand-written `Deserialize` below.
+/// Keep the field list IDENTICAL to the checked struct (fixture round-trip
+/// pins it).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobAssignMessageUnchecked {
+    pub tenant: String,
+    pub job_id: String,
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    pub kind: JobKind,
+    pub duration_frames: u64,
+    pub fps: u32,
+    pub codec: Codec,
+    pub bundle_sha256: String,
+    pub bundle_get_url: String,
+    pub payload_sha256: String,
+    pub payload_get_url: String,
+    #[serde(default)]
+    pub browser_sha256: Option<String>,
+    #[serde(default)]
+    pub browser_get_url: Option<String>,
+    pub input_props_get_url: String,
+    pub asset_get_urls: Vec<String>,
+    pub output_put_url: String,
+    pub output_key: String,
+    pub purge_after: PurgeAfter,
+    #[serde(default)]
+    pub still: Option<StillDirective>,
+}
+
+impl TryFrom<JobAssignMessageUnchecked> for JobAssignMessage {
+    type Error = String;
+
+    fn try_from(u: JobAssignMessageUnchecked) -> Result<Self, Self::Error> {
+        if let Some(still) = &u.still {
+            if still.frame >= u.duration_frames {
+                return Err(format!(
+                    "still.frame {} must be < durationFrames {}",
+                    still.frame, u.duration_frames
+                ));
+            }
+        }
+        Ok(Self {
+            tenant: u.tenant,
+            job_id: u.job_id,
+            attempt: u.attempt,
+            kind: u.kind,
+            duration_frames: u.duration_frames,
+            fps: u.fps,
+            codec: u.codec,
+            bundle_sha256: u.bundle_sha256,
+            bundle_get_url: u.bundle_get_url,
+            payload_sha256: u.payload_sha256,
+            payload_get_url: u.payload_get_url,
+            browser_sha256: u.browser_sha256,
+            browser_get_url: u.browser_get_url,
+            input_props_get_url: u.input_props_get_url,
+            asset_get_urls: u.asset_get_urls,
+            output_put_url: u.output_put_url,
+            output_key: u.output_key,
+            purge_after: u.purge_after,
+            still: u.still,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for JobAssignMessage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let unchecked = JobAssignMessageUnchecked::deserialize(deserializer)?;
+        Self::try_from(unchecked).map_err(DeError::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -508,6 +620,57 @@ mod tests {
         assert!(serde_json::from_value::<ServerMessage>(v.clone()).is_ok());
         v["purgeAfter"] = json!(false);
         assert!(serde_json::from_value::<ServerMessage>(v).is_err());
+    }
+
+    /// FARM-STILL: a still jobAssign round-trips WITH the directive, and a
+    /// video jobAssign stays byte-identical (no `still` key is emitted).
+    #[test]
+    fn job_assign_still_round_trips_and_video_stays_unchanged() {
+        let video = r#"{"type":"jobAssign","tenant":"driffs","jobId":"j","kind":"standard","durationFrames":300,"fps":30,"codec":"h264","bundleSha256":"x","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#;
+        let msg = round_trip_server(video);
+        let ServerMessage::JobAssign(a) = msg else {
+            panic!("expected jobAssign");
+        };
+        assert_eq!(a.still, None);
+
+        let still_wire = "{\"type\":\"jobAssign\",\"tenant\":\"driffs\",\"jobId\":\"j\",\"kind\":\"standard\",\"durationFrames\":300,\"fps\":30,\"codec\":\"h264\",\"bundleSha256\":\"x\",\"bundleGetUrl\":\"u\",\"payloadSha256\":\"p\",\"payloadGetUrl\":\"u\",\"inputPropsGetUrl\":\"u\",\"assetGetUrls\":[],\"outputPutUrl\":\"u\",\"outputKey\":\"renders/t1/still-f12.png\",\"purgeAfter\":true,\"still\":{\"frame\":12,\"format\":\"png\"}}".to_string();
+        let msg = round_trip_server(&still_wire);
+        let ServerMessage::JobAssign(a) = msg else {
+            panic!("expected jobAssign");
+        };
+        assert_eq!(
+            a.still,
+            Some(StillDirective {
+                frame: 12,
+                format: StillFormat::Png
+            })
+        );
+    }
+
+    /// FARM-STILL cross-field bound: a still at or beyond the composition's
+    /// duration is unrenderable and must fail at PARSE time, exactly like the
+    /// TS side's refine. This is the Deserialize that delegates through
+    /// JobAssignMessageUnchecked.
+    #[test]
+    fn job_assign_rejects_still_frame_at_or_past_duration() {
+        let frame = |f: u64| {
+            format!(
+                "{{\"type\":\"jobAssign\",\"tenant\":\"driffs\",\"jobId\":\"j\",\"kind\":\"standard\",\"durationFrames\":300,\"fps\":30,\"codec\":\"h264\",\"bundleSha256\":\"x\",\"bundleGetUrl\":\"u\",\"payloadSha256\":\"p\",\"payloadGetUrl\":\"u\",\"inputPropsGetUrl\":\"u\",\"assetGetUrls\":[],\"outputPutUrl\":\"u\",\"outputKey\":\"k\",\"purgeAfter\":true,\"still\":{{\"frame\":{f},\"format\":\"png\"}}}}"
+            )
+        };
+        // At the boundary and past it: refused.
+        assert!(serde_json::from_str::<ServerMessage>(&frame(300)).is_err());
+        assert!(serde_json::from_str::<ServerMessage>(&frame(301)).is_err());
+        // One inside: accepted.
+        assert!(serde_json::from_str::<ServerMessage>(&frame(299)).is_ok());
+    }
+
+    /// FARM-STILL: the format set is closed — a lossy/unknown format must not
+    /// parse (the certification contract is lossless PNG only).
+    #[test]
+    fn job_assign_rejects_unknown_still_format() {
+        let wire = r#"{"type":"jobAssign","tenant":"driffs","jobId":"j","kind":"standard","durationFrames":300,"fps":30,"codec":"h264","bundleSha256":"x","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true,"still":{"frame":12,"format":"jpeg"}}"#;
+        assert!(serde_json::from_str::<ServerMessage>(wire).is_err());
     }
 
     /// Exact dispatch cancel frame (fixture-pinned shape; the frame is

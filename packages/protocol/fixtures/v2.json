@@ -221,6 +221,33 @@
       }
     },
     {
+      "name": "jobAssign (still directive — one lossless PNG frame, FARM-STILL)",
+      "direction": "server",
+      "wire": {
+        "type": "jobAssign",
+        "tenant": "driffs",
+        "jobId": "job-render-still1",
+        "attempt": 1,
+        "kind": "gpu",
+        "durationFrames": 300,
+        "fps": 30,
+        "codec": "h264",
+        "bundleSha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "bundleGetUrl": "https://r2.example.com/bundles/9f86.tar.gz?sig=1",
+        "payloadSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "payloadGetUrl": "https://r2.example.com/render-payloads/aaaa.tar.gz?sig=payload",
+        "inputPropsGetUrl": "https://r2.example.com/renders/t1/input-props.json?sig=2",
+        "assetGetUrls": [],
+        "outputPutUrl": "https://r2.example.com/renders/t1/still-f12.png?sig=5",
+        "outputKey": "renders/t1/still-f12.png",
+        "purgeAfter": true,
+        "still": {
+          "frame": 12,
+          "format": "png"
+        }
+      }
+    },
+    {
       "name": "cancel",
       "direction": "server",
       "wire": {
@@ -364,6 +391,62 @@
         "outputPutUrl": "https://r2.example.com/renders/t1/out.mp4?sig=4",
         "outputKey": "renders/t1/out.mp4",
         "purgeAfter": true
+      }
+    },
+    {
+      "name": "jobAssign still.frame AT durationFrames (unrenderable — off the composition)",
+      "direction": "server",
+      "reason": "FARM-STILL: a still renders ONE frame of the composition; frame is zero-based, so frame == durationFrames is already past the last frame. Refused at parse time on BOTH sides (TS cross-field refine; Rust's hand-written Deserialize over JobAssignMessageUnchecked) — never a mid-job failure.",
+      "wire": {
+        "type": "jobAssign",
+        "tenant": "driffs",
+        "jobId": "job-render-still-bad1",
+        "attempt": 1,
+        "kind": "gpu",
+        "durationFrames": 300,
+        "fps": 30,
+        "codec": "h264",
+        "bundleSha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "bundleGetUrl": "https://r2.example.com/bundles/9f86.tar.gz?sig=1",
+        "payloadSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "payloadGetUrl": "https://r2.example.com/render-payloads/aaaa.tar.gz?sig=payload",
+        "inputPropsGetUrl": "https://r2.example.com/renders/t1/input-props.json?sig=2",
+        "assetGetUrls": [],
+        "outputPutUrl": "https://r2.example.com/renders/t1/still-f300.png?sig=5",
+        "outputKey": "renders/t1/still-f300.png",
+        "purgeAfter": true,
+        "still": {
+          "frame": 300,
+          "format": "png"
+        }
+      }
+    },
+    {
+      "name": "jobAssign still with an unknown format (jpeg)",
+      "direction": "server",
+      "reason": "FARM-STILL: the format set is closed at png — the certification stills this directive carries are LOSSLESS by contract, and a lossy format would be a different, dishonest job type. Both sides refuse at parse.",
+      "wire": {
+        "type": "jobAssign",
+        "tenant": "driffs",
+        "jobId": "job-render-still-bad2",
+        "attempt": 1,
+        "kind": "gpu",
+        "durationFrames": 300,
+        "fps": 30,
+        "codec": "h264",
+        "bundleSha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "bundleGetUrl": "https://r2.example.com/bundles/9f86.tar.gz?sig=1",
+        "payloadSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "payloadGetUrl": "https://r2.example.com/render-payloads/aaaa.tar.gz?sig=payload",
+        "inputPropsGetUrl": "https://r2.example.com/renders/t1/input-props.json?sig=2",
+        "assetGetUrls": [],
+        "outputPutUrl": "https://r2.example.com/renders/t1/still-f12.jpeg?sig=5",
+        "outputKey": "renders/t1/still-f12.jpeg",
+        "purgeAfter": true,
+        "still": {
+          "frame": 12,
+          "format": "jpeg"
+        }
       }
     }
   ]
