@@ -16,8 +16,9 @@
 > Acted on in `2cc5940` (library path) and `5f8c823` (the verifier itself).
 
 Original research packet: `/tmp/decent-render-research-remotion-binaries.md`
-Date: 2026-08-21 (UTC evening). Remotion version under test: **4.0.506** (matches both
-`~/dev/driffs` and `farm-web/apps/runner-4.0.506`).
+Date: 2026-08-21 (UTC evening). Remotion version under test: the then-pinned
+runner version of that date (R2 note, 2026-09-10: the farm matrix has since
+been cut to a single active Remotion version — see farm-web docs/deploy.md).
 
 **Method note:** all four Linux compositor variants (`linux-x64-gnu`, `linux-arm64-gnu`,
 `linux-x64-musl`, `linux-arm64-musl`) were downloaded via `npm pack` into
@@ -116,7 +117,7 @@ Configure-line diffs between variants (all VERIFIED from `-version` output):
 - Filters/muxers/decoders: identical everywhere.
 
 **Q1 conclusion: your verifier (`scale`, `format`, `image2pipe` muxer, `rawvideo` encoder,
-avoiding `select`) is safe on every Linux variant of 4.0.506 — and the fallbacks `mjpeg`/`png`
+avoiding `select`) is safe on every Linux variant tested that day — and the fallbacks `mjpeg`/`png`
 encoders are present too.**
 
 ---
@@ -260,7 +261,7 @@ macOS and Linux code paths identical — recommended.**
    nodes under Bun, the runner must select the compositor package itself rather than via
    `getExecutablePath`. On glibc nodes it's moot.
 3. **Pin + probe:** the stripped component set is a per-build property. All of the above is
-   exactly true for **4.0.506**; any Remotion bump can change the allowlists. Cheap insurance:
+   exactly true for the version under test; any Remotion bump can change the allowlists. Cheap insurance:
    a boot-time capability probe on each node (`ffmpeg -hide_banner -filters/-muxers/-encoders`
    grep for `scale`, `format`, `image2pipe`, `rawvideo`) that fails the node loudly before it
    accepts jobs — the same class of guard that caught this whole issue.
@@ -268,7 +269,7 @@ macOS and Linux code paths identical — recommended.**
 ## What I could not determine
 
 - **Windows**: not tested (no Windows host); `getExecutablePath` implies `ffmpeg.exe` naming.
-- **Future/other Remotion versions**: only 4.0.506 was tested (the version driffs and the
+- **Future/other Remotion versions**: only the then-pinned version was tested (the version driffs and the
   runner pin). No changelog guarantee about the component allowlists exists — hence the probe
   recommendation.
 - **Whether `callFf`/`getExecutablePath` count as "supported" long-term**: they are exported and

@@ -22,6 +22,13 @@ The format follows Keep a Changelog and semantic versioning.
   closed `format` set. `PROTOCOL_VERSION` stays 2 — additive-optional
   field, ignored by supervisors that predate it.
 
+- **R2 legacy cut**: `jobAssign.codec` is OPTIONAL — a still job omits it
+  (a still has no video codec; the R1 `'h264'` stand-in rode the wire only
+  for old-schema compatibility and is gone), a video job must carry it
+  (parse-time enforced on both sides + shared reject fixture). The runner
+  matrix is cut to ONE active Remotion version (4.0.523) — see the farm-web
+  deploy docs for the single-runner release order.
+
 - **F4 cancel-ack witness**: `jobCanceledAck {tenant, jobId, attempt,
   teardownMs?}` — a new worker→server frame acknowledging a
   dispatch-initiated cancel. Emitted by the supervisor AFTER the job task

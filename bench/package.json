@@ -12,12 +12,12 @@
   "dependencies": {
     "@decent-render/protocol": "^0.1.1",
     "@decent-render/runner-core": "file:../packages/runner-core",
-    "@remotion/bundler": "4.0.506",
-    "@remotion/compositor-darwin-arm64": "4.0.506",
-    "@remotion/renderer": "4.0.506",
+    "@remotion/bundler": "4.0.523",
+    "@remotion/compositor-darwin-arm64": "4.0.523",
+    "@remotion/renderer": "4.0.523",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "remotion": "4.0.506"
+    "remotion": "4.0.523"
   },
   "devDependencies": {
     "@types/bun": "^1.3.0",
