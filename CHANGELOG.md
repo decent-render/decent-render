@@ -10,6 +10,18 @@ The format follows Keep a Changelog and semantic versioning.
 
 ### Added
 
+- **FARM-STILL — still renders**: `jobAssign` carries an OPTIONAL `still
+  {frame, format: 'png'}` directive. The supervisor's role is
+  payload-agnostic (invariant 5): it parses the field for the wire
+  round-trip and forwards it to the runner unchanged; the render itself is
+  the runner payload's concern (a new `@decent-render/runner-core` still
+  branch — one frame, lossless PNG, verified before upload, purged after).
+  Parse-time enforcement is cross-language: `still.frame < durationFrames`
+  is a hand-written `Deserialize` bound in `protocol.rs` and a refine in
+  the TS schema, with shared reject fixtures pinning the boundary and the
+  closed `format` set. `PROTOCOL_VERSION` stays 2 — additive-optional
+  field, ignored by supervisors that predate it.
+
 - **F4 cancel-ack witness**: `jobCanceledAck {tenant, jobId, attempt,
   teardownMs?}` — a new worker→server frame acknowledging a
   dispatch-initiated cancel. Emitted by the supervisor AFTER the job task
