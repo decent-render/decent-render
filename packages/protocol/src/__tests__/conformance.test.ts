@@ -176,10 +176,13 @@ describe('protocol v2 — Rust⇄TS golden-fixture conformance', () => {
 		expect(assigns.some((c) => !('still' in (c.wire as object)))).toBe(true);
 	});
 
-	it('the still cross-field bound refuses frame ≥ durationFrames at parse (FARM-STILL)', () => {
+	it('the still cross-field bound refuses frame ≥ durationFrames at parse — incl. at the dispatch sender gate, outbound-frame.ts safeParse, at SEND time (FARM-STILL fix1 P3-2)', () => {
 		// Mirrored by a reject fixture AND by Rust's hand-written Deserialize;
 		// asserted directly here so the refine's teeth are visible without
-		// reading the fixture file.
+		// reading the fixture file. The dispatch's enforcement point is the
+		// SENDER GATE (apps/dispatch/src/outbound-frame.ts safeParses every
+		// server frame before send) — assignJobToWorker itself returns the
+		// frame unvalidated, so this schema-level bound is what fires there.
 		const wire = firstOfType('jobAssign') as Record<string, unknown> & {
 			still?: {frame: number; format: string};
 		};

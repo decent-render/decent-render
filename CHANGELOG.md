@@ -8,6 +8,26 @@ The format follows Keep a Changelog and semantic versioning.
 
 ## [Unreleased]
 
+## [0.0.13] — 2026-09-10
+
+### Added
+
+- **Still directive (optional `still{frame,format}`, `codec`
+  optional-iff-still)** — the wire change a node needs to RECEIVE still
+  jobs (FARM-STILL): `jobAssign` carries an OPTIONAL `still
+  {frame, format: 'png'}` directive, and `codec` is optional-iff-video
+  (a still job omits it; a video job must carry it — parse-enforced on
+  both sides). The supervisor's role is payload-agnostic (invariant 5):
+  it parses the fields for the wire round-trip and forwards them to the
+  runner unchanged; the render itself is the runner payload's concern (a
+  new `@decent-render/runner-core` still branch — one frame, lossless
+  PNG, verified before upload, purged after). `still.frame <
+  durationFrames` is enforced at parse on both sides, with shared
+  reject fixtures pinning the boundary and the closed `format` set.
+  `PROTOCOL_VERSION` stays 2. Dispatch (farm-web) gates still
+  assignments on `supervisorVersion >= 0.0.13` — an older node is
+  skipped for stills (video unaffected) and the job queues.
+
 ### Added
 
 - **FARM-STILL — still renders**: `jobAssign` carries an OPTIONAL `still

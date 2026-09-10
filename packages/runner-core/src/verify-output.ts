@@ -447,14 +447,21 @@ export function verifyStillOutput(options: VerifyStillOptions): StillProbe {
   if (width === 0 || height === 0) {
     throw new Error(`still output declares ${width}x${height} — refusing the upload`);
   }
-  if (expectedWidth !== undefined && expectedHeight !== undefined) {
-    if (width !== expectedWidth || height !== expectedHeight) {
-      throw new Error(
-        `still output is ${width}x${height}, composition declares ${expectedWidth}x${expectedHeight} — refusing the upload`,
-      );
-    }
-  } else {
-    log('composition exposed no width/height — still geometry check skipped');
+  // Geometry leg is FAIL-CLOSED (fix1 P3-3): the packet's invariant says
+  // verification is never skipped, and "the composition exposed no
+  // width/height" is not a reason to upload an unchecked claim — it is a
+  // reason to refuse. Real selectComposition results always carry
+  // dimensions; reaching this branch without them means a test double or a
+  // renderer regression, and the honest outcome is a named refusal.
+  if (expectedWidth === undefined || expectedHeight === undefined) {
+    throw new Error(
+      'composition exposed no width/height — still geometry cannot be verified, refusing the upload',
+    );
+  }
+  if (width !== expectedWidth || height !== expectedHeight) {
+    throw new Error(
+      `still output is ${width}x${height}, composition declares ${expectedWidth}x${expectedHeight} — refusing the upload`,
+    );
   }
 
   log(`still verified: PNG ${width}x${height}, ${sizeInBytes} bytes`);

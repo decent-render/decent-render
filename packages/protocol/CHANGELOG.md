@@ -29,9 +29,16 @@ itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
   (≥ 1; the tenant sends the composition's real duration). NO
   `PROTOCOL_VERSION` bump — additive-optional field, wire-tolerant in both
   directions (old dispatch never sends it; old nodes ignore it). Old-node
-  rollout caveat (dispatch-side, not wire): a pre-still node that receives
-  a still frame will render a VIDEO and the job fails at output
-  verification — republish payloads before enqueueing stills.
+  rollout caveat (fix1 P3-1 CORRECTION of this entry's original wording):
+  with the R1 wire (codec stand-in present) an old supervisor parsed the
+  frame fine, DROPPED the `still` field on re-serialization to the runner,
+  and the runner rendered a silent, VALID VIDEO under the `.png` output key
+  — it PASSED video verification (which checks frames/geometry, not
+  extension), so the failure mode was a silent wrong-artifact SUCCESS, not
+  an output-verification failure. Moot since R2: the codec-less R2 still
+  frame is unparseable by the old supervisor AND old runner-core (zod
+  `codec` required there → parse throws), so the R2 wire fails safe by
+  drop/throw, never by silent mis-render.
 - `fixtures/v2.json`: +1 accept case (jobAssign with `still`), +2 reject
   cases (still.frame at durationFrames; unknown format 'jpeg').
 

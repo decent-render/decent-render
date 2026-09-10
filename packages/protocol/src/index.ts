@@ -303,11 +303,15 @@ export const JobAssignMessageSchema = z.object({
 	 */
 	still: StillDirectiveSchema.optional(),
 })
-	// Cross-field bound, ON the schema so every parse path (fixture
-	// conformance, dispatch sender gate, supervisor receive) refuses a still
-	// outside the composition at parse time. durationFrames stays ≥ 1 (schema
-	// compatibility — the tenant sends the composition's real duration; the
-	// still renders ONE frame of it).
+	// Cross-field bound, ON the schema so every parse path refuses a still
+	// outside the composition at parse time (fix1 P3-2 wording): fixture
+	// conformance on both languages, the DISPATCH SENDER GATE at SEND time —
+	// `apps/dispatch/src/outbound-frame.ts` (`rejectServerFrame`/`safeParse`)
+	// validates every server frame before it hits the WebSocket; the frame
+	// leaves `assignJobToWorker` unvalidated — and the supervisor's receive
+	// parse. durationFrames stays ≥ 1 (schema compatibility — the tenant
+	// sends the composition's real duration; the still renders ONE frame of
+	// it).
 	.refine(
 		(assign) => !assign.still || assign.still.frame < assign.durationFrames,
 		{message: 'still.frame must be < durationFrames', path: ['still', 'frame']},

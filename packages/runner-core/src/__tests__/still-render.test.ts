@@ -397,10 +397,30 @@ describe('still geometry verification unit (verifyStillOutput)', () => {
 			const file = path.join(dir, 'real.png');
 			const bytes = pngBytes(640, 360);
 			writeFileSync(file, bytes);
-			const probe = verifyStillOutput({outputLocation: file, log: () => {}});
+			const probe = verifyStillOutput({outputLocation: file, expectedWidth: 640, expectedHeight: 360, log: () => {}});
 			expect(probe.width).toBe(640);
 			expect(probe.height).toBe(360);
 			expect(probe.sizeInBytes).toBe(readFileSync(file).byteLength);
+		} finally {
+			rmSync(dir, {recursive: true, force: true});
+		}
+	});
+
+	it('the geometry leg is FAIL-CLOSED (fix1 P3-3): a composition without width/height is REFUSED, never "skipped"', async () => {
+		const {verifyStillOutput} = await import('../verify-output.js');
+		const dir = mkdtempSync(path.join(tmpdir(), 'still-verify-'));
+		try {
+			const file = path.join(dir, 'valid.png');
+			writeFileSync(file, pngBytes(640, 360));
+			// The old branch logged "geometry check skipped" and passed on the
+			// signature alone; the packet invariant says verification is never
+			// skipped. No dimensions → named refusal, not a pass.
+			expect(() =>
+				verifyStillOutput({outputLocation: file, log: () => {}}),
+			).toThrow(/composition exposed no width\/height — still geometry cannot be verified/);
+			expect(() =>
+				verifyStillOutput({outputLocation: file, expectedWidth: 640, log: () => {}}),
+			).toThrow(/composition exposed no width\/height/);
 		} finally {
 			rmSync(dir, {recursive: true, force: true});
 		}
