@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0 — unreleased
+
+- **R2 legacy cut**: the R1 deploy-window hedges are gone — complete status
+  REQUIRES the `outputSizeInBytes` KEY (value stays nullable: mirrors the
+  nullable column for HEADs with no size), and webhook `composition.codec`
+  is nullable-not-optional (dispatch always sends it; null for stills).
+  `renderStillOnFarm` unchanged: it requires a measured NUMBER and throws
+  `OUTPUT_SIZE_UNAVAILABLE` on null.
+
 ## 0.4.0 — unreleased
 
 - **`renderStillOnFarm()` (FARM-STILL)** — render ONE frame of a

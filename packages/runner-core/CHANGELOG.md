@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **R2 legacy cut (0.2.0)**: `jobAssign.codec` arrives as `Codec | undefined`
+  (protocol 0.2.0 made it optional so still jobs omit it). The video branch
+  is unchanged — the wire's cross-field bound guarantees a codec on every
+  video job, and the still branch never reads it. Requires protocol
+  ^0.2.0.
+
 - **Still render path (FARM-STILL, 0.1.4)**: a `jobAssign` carrying the
   optional `still: {frame, format:'png'}` directive now renders exactly ONE
   frame via the injected `renderStill` (new required member of `RendererApi`

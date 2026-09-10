@@ -13,7 +13,7 @@ const auth = {apiKey: process.env.DECENT_API_KEY!};
 const uploaded = await bundleAndUpload({
   ...auth,
   entryPoint: './src/remotion/index.ts',
-  remotionVersion: '4.0.487',
+  remotionVersion: '4.0.523',
 });
 const result = await renderMediaOnFarm({
   ...auth,

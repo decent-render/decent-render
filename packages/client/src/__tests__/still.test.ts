@@ -132,10 +132,12 @@ describe('renderStillOnFarm (FARM-STILL)', () => {
   });
 
   it('a complete response WITHOUT a measured size is a named client error — never a guessed figure', async () => {
-    const {outputSizeInBytes: _omitted, ...legacyComplete} = completeBody;
+    // R2: the key is required on the wire, so "no measured size" is an
+    // explicit null (HEAD found no size) — still a named client error, never
+    // a guess.
     vi.spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(response({renderId: 'job-still-1', status: 'pending', taskId: 'render-1', creditsReserved: 5}, 202))
-      .mockResolvedValueOnce(response(legacyComplete));
+      .mockResolvedValueOnce(response({...completeBody, outputSizeInBytes: null}));
     const error = await renderStillOnFarm(stillOptions).then(
       () => 'resolved',
       (e: unknown) => e,
@@ -184,7 +186,7 @@ describe('renderStillOnFarm (FARM-STILL)', () => {
 });
 
 describe('status + webhook schemas stay honest for stills', () => {
-  it('complete status parses with outputSizeInBytes PRESENT and ABSENT (deploy window)', () => {
+  it('complete status REQUIRES the outputSizeInBytes KEY (R2: the deploy-window hedge is gone); the value stays nullable', () => {
     const present = renderStatusResponseSchema.safeParse({
       renderId: 'j', status: 'complete', progress: 1,
       outputUrl: 'https://cdn.test/s.png', creditsReserved: 5, creditsSettled: null,
@@ -192,12 +194,21 @@ describe('status + webhook schemas stay honest for stills', () => {
       outputSizeInBytes: 42,
     });
     expect(present.success).toBe(true);
+    const nullValue = renderStatusResponseSchema.safeParse({
+      renderId: 'j', status: 'complete', progress: 1,
+      outputUrl: 'https://cdn.test/s.png', creditsReserved: 5, creditsSettled: null,
+      error: null, createdAt: null, completedAt: null, verification: 'pending',
+      outputSizeInBytes: null,
+    });
+    expect(nullValue.success).toBe(true);
+    // A complete body without the KEY is malformed now — dispatch always
+    // sends it; nothing legacy needs the looser shape.
     const absent = renderStatusResponseSchema.safeParse({
       renderId: 'j', status: 'complete', progress: 1,
       outputUrl: 'https://cdn.test/s.png', creditsReserved: 5, creditsSettled: null,
       error: null, createdAt: null, completedAt: null, verification: 'pending',
     });
-    expect(absent.success).toBe(true);
+    expect(absent.success).toBe(false);
   });
 
   it('webhook composition.codec is nullable (a still has no video codec)', () => {

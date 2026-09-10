@@ -115,12 +115,12 @@ const completeStatus = renderStatusBase.extend({
   creditsSettled: z.number().int().nonnegative().nullable(),
   /**
    * MEASURED object size (dispatch HEADs the output before completing the
-   * job). OPTIONAL so responses from a dispatch predating the field still
-   * parse during the deploy window; nullable for the same pre-0016 rows.
-   * `renderStillOnFarm` requires it (the certification evidence chain pins
-   * byte sizes) and throws a client-kind error when a farm omits it.
+   * job). Nullable — mirrors the nullable column for rows whose HEAD
+   * reported no size — never optional: the R2 deploy-window hedge is gone
+   * (no legacy dispatches matter). `renderStillOnFarm` requires a NUMBER
+   * and throws a client-kind error on null.
    */
-  outputSizeInBytes: z.number().int().nonnegative().nullable().optional(),
+  outputSizeInBytes: z.number().int().nonnegative().nullable(),
 });
 export const renderStatusResponseSchema = z.discriminatedUnion('status', [completeStatus, nonCompleteStatus]);
 export type RenderStatusResponse = z.infer<typeof renderStatusResponseSchema>;
@@ -194,10 +194,9 @@ export const webhookEventSchema = z.object({
     fps: z.number().positive(),
     durationFrames: z.number().int().positive(),
     // Nullable for still jobs (FARM-STILL): a still has no video codec —
-    // the honest value is null, never a fake 'h264'. Optional so responses
-    // from a dispatch predating the field still parse during the deploy
-    // window.
-    codec: z.enum(['h264', 'vp8']).nullable().optional(),
+    // the honest value is null, never a fake 'h264'. Not optional: dispatch
+    // always sends the key (the R2 deploy-window hedge is gone).
+    codec: z.enum(['h264', 'vp8']).nullable(),
   }),
   ts: z.string().datetime(),
 });

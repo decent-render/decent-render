@@ -21,6 +21,7 @@ describe('public API schemas', () => {
       createdAt: '2026-07-12T10:00:00.000Z',
       completedAt: '2026-07-12T10:01:00.000Z',
       verification: 'passed',
+      outputSizeInBytes: 647399,
     });
     expect(parsed.outputUrl).toContain('.mp4');
     expect(parsed.creditsSettled).toBe(5);
@@ -48,6 +49,7 @@ describe('public API schemas', () => {
       createdAt: '2026-07-12T10:00:00.000Z',
       completedAt: '2026-07-12T10:01:00.000Z',
       verification: 'pending',
+      outputSizeInBytes: null,
     });
     expect(parsed.status).toBe('complete');
     expect(parsed.creditsSettled).toBeNull();
@@ -142,7 +144,7 @@ describe('public API schemas', () => {
 
   it('parses the active runner matrix', () => {
     const parsed = versionsResponseSchema.parse({
-      supportedRemotionVersions: [{remotionVersion: '4.0.487', payloadVersion: 'runner-v1'}],
+      supportedRemotionVersions: [{remotionVersion: '4.0.523', payloadVersion: 'runner-v1'}],
     });
     expect(parsed.supportedRemotionVersions).toHaveLength(1);
   });

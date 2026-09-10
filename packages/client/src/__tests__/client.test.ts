@@ -36,7 +36,7 @@ describe('farm client', () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(response({renderId: 'job-1', status: 'pending', taskId: 'render-1', creditsReserved: 5}, 202))
       .mockResolvedValueOnce(response({renderId: 'job-1', status: 'rendering', progress: 0.5, outputUrl: null, creditsReserved: 5, creditsSettled: null, error: null, createdAt: null, completedAt: null, verification: 'pending'}))
-      .mockResolvedValueOnce(response({renderId: 'job-1', status: 'complete', progress: 1, outputUrl: 'https://cdn.test/video.mp4?sig=1', creditsReserved: 5, creditsSettled: 5, error: null, createdAt: null, completedAt: '2026-07-12T10:00:00.000Z', verification: 'passed'}));
+      .mockResolvedValueOnce(response({renderId: 'job-1', status: 'complete', progress: 1, outputUrl: 'https://cdn.test/video.mp4?sig=1', creditsReserved: 5, creditsSettled: 5, error: null, createdAt: null, completedAt: '2026-07-12T10:00:00.000Z', verification: 'passed', outputSizeInBytes: null}));
 
     const result = await renderMediaOnFarm({
       ...auth,
@@ -147,9 +147,9 @@ describe('farm client', () => {
 
   it('preflights active farm runner versions', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(response({
-      supportedRemotionVersions: [{remotionVersion: '4.0.487', payloadVersion: 'runner-487'}],
+      supportedRemotionVersions: [{remotionVersion: '4.0.523', payloadVersion: 'runner-527'}],
     }));
-    expect((await getVersions(auth)).supportedRemotionVersions[0]?.remotionVersion).toBe('4.0.487');
+    expect((await getVersions(auth)).supportedRemotionVersions[0]?.remotionVersion).toBe('4.0.523');
   });
 
   it('fetches the latest registered bundle', async () => {

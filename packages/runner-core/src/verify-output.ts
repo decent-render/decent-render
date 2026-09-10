@@ -70,8 +70,8 @@ export type OutputProbe = {
  * upstream rather than depending on a dyld fallback.
  *
  * Verified 2026-08-21: darwin-arm64 by running the shipped payload here;
- * linux-{x64,arm64}-{gnu,musl} at the pinned 4.0.506 by executing the real
- * binaries in Docker (ELF headers + `env -i`, cwd=/).
+ * linux-{x64,arm64}-{gnu,musl} at that era's pinned Remotion by executing
+ * the real binaries in Docker (ELF headers + `env -i`, cwd=/).
  */
 function ffEnv(binariesDirectory: string): NodeJS.ProcessEnv {
   const prepend = (existing: string | undefined) =>
@@ -237,7 +237,7 @@ const SAMPLE_HEIGHT = 36;
  * sample instead of walking the whole file.
  *
  * The allowlist is IDENTICAL on darwin-arm64 and on all four Linux variants
- * (x64/arm64 × gnu/musl) at the pinned 4.0.506 — verified 2026-08-21 by
+ * (x64/arm64 × gnu/musl) at the then-pinned Remotion — verified 2026-08-21 by
  * running the real binaries, not by reading about them. Everything this
  * sampler depends on (`scale`, `format`, the `image2pipe` muxer, the
  * `rawvideo` encoder) is present on every one of them.
