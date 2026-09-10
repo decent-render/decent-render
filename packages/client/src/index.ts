@@ -144,6 +144,12 @@ export type RenderMediaOnFarmResult = {
   renderId: string;
   creditsSettled: number | null;
   verification: RenderStatusResponse['verification'];
+  /**
+   * MEASURED output size (dispatch HEADs the object at completion).
+   * OPTIONAL so responses from a dispatch predating the field still parse;
+   * `renderStillOnFarm` requires it and throws when a farm omits it.
+   */
+  outputSizeInBytes?: number | null;
 };
 
 export type EnqueueRenderOptions = RequestOptions & EnqueueRenderRequest;
@@ -208,6 +214,9 @@ export async function renderMediaOnFarm(options: RenderMediaOnFarmOptions): Prom
         // Null when the job completed before measured settlement existed.
         creditsSettled: status.creditsSettled,
         verification: status.verification,
+        // Absent/null on a dispatch predating the field; renderStillOnFarm
+        // turns a missing figure into a named client error, not a guess.
+        outputSizeInBytes: status.outputSizeInBytes ?? null,
       };
     }
     if (status.status === 'failed' || status.status === 'canceled') {
@@ -224,6 +233,143 @@ export async function renderMediaOnFarm(options: RenderMediaOnFarmOptions): Prom
       return abandon(error);
     }
   }
+}
+
+/**
+ * Chromium options the caller WANTS. The farm currently renders EVERY job —
+ * video and still — on `chrome-for-testing` with `gl: 'angle'`; the wire
+ * does not carry a per-job gl override. Accepting the field keeps the
+ * `renderStillOnLambda` call-shape twin honest ONLY for 'angle': any other
+ * value is refused CLIENT-side with a named code instead of being silently
+ * ignored farm-side (a silent ignore would certify captures made on a
+ * backend the caller did not ask for).
+ */
+export type RenderStillChromiumOptions = {gl?: 'angle' | 'swangle' | 'swiftshader'};
+
+export type RenderStillOnFarmOptions = RequestOptions & {
+  /** The strict RenderDocument (or any input props), captureRenderer-stamped by the caller. */
+  inputProps: Record<string, unknown>;
+  /** Zero-based frame index — must be < durationFrames. */
+  frame: number;
+  /** The uploaded bundle the farm should compile (same sha the enqueue path uses). */
+  bundleSha256: string;
+  /** Composition id in the bundle. Default 'Main'. */
+  compositionId?: string;
+  /**
+   * Honored only as `gl: 'angle'` (the farm-wide constant today); anything
+   * else is refused before enqueue with `CHROMIUM_GL_UNSUPPORTED`.
+   */
+  chromiumOptions?: RenderStillChromiumOptions;
+  // ── Fields the farm's enqueue contract requires (they price and bound the
+  // job — a still is one frame OF this composition): ──
+  compositionWidth: number;
+  compositionHeight: number;
+  fps: number;
+  /** The composition's REAL duration in frames; the still renders frame `frame` of it. */
+  durationFrames: number;
+  /** Free render on company fleet, gated server-side by workspace entitlement. */
+  selfRender?: boolean;
+  /**
+   * Node-selection hint only (no price effect). Default 'gpu': the
+   * certification stills target WebGPU-capture compositions, which must
+   * land on a gpu-capable node. Pass 'standard' for plain DOM stills.
+   */
+  kind?: 'standard' | 'gpu';
+  // ── Poll tuning, identical semantics to renderMediaOnFarm: ──
+  pollIntervalMs?: number;
+  timeoutMs?: number;
+  onProgress?: (status: RenderStatusResponse) => void;
+  waitForCompletion?: (renderId: string) => Promise<RenderStatusResponse>;
+};
+
+export type RenderStillOnFarmResult = {
+  /** One-shot presigned HTTPS URL to the lossless PNG (15-minute TTL). */
+  url: string;
+  /** MEASURED size of the PNG object (dispatch HEADs it before completing). */
+  sizeInBytes: number;
+  /** Farm job id, for auditability. */
+  renderId: string;
+  /** Echo of the requested frame index. */
+  frame: number;
+  /**
+   * HONESTLY `pending` for stills: no off-node referee exists, so the farm
+   * never claims a still was independently verified. The FX-5 evidence
+   * chain re-verifies client-side (sha256 + inversion parity) — do not read
+   * this as a quality signal.
+   */
+  verification: RenderStatusResponse['verification'];
+  /** What settlement debited (0 for an entitled self-render). */
+  creditsSettled: number | null;
+};
+
+/**
+ * Render ONE frame of a composition on the farm as a lossless PNG — the
+ * certification unit for adjustment-effect evidence (FARM-STILL).
+ *
+ * Enqueues a still job (the SAME `POST /api/v1/renders` route and schema as
+ * `enqueueRender`, with the optional `still` directive) and polls it to
+ * completion, exactly like {@link renderMediaOnFarm} — including the
+ * walk-away cancel contract: a timeout or abort cancels the render before
+ * throwing.
+ *
+ * Output contract: a single PNG at
+ * `renders/<task>/attempt-<n>/still-f<frame>.png`, verified on the node
+ * (PNG signature + IHDR geometry) before upload. NOT a frame extracted from
+ * an mp4 — lossless by construction.
+ */
+export async function renderStillOnFarm(options: RenderStillOnFarmOptions): Promise<RenderStillOnFarmResult> {
+  const gl = options.chromiumOptions?.gl;
+  if (gl !== undefined && gl !== 'angle') {
+    throw new FarmApiError(
+      400,
+      `The farm renders stills with gl:'angle' only (got '${gl}') — it does not honor per-job chromium overrides yet`,
+      'CHROMIUM_GL_UNSUPPORTED',
+      undefined,
+      'client',
+    );
+  }
+  const result = await renderMediaOnFarm({
+    apiKey: options.apiKey,
+    apiUrl: options.apiUrl,
+    signal: options.signal,
+    bundleSha256: options.bundleSha256,
+    inputProps: options.inputProps,
+    compositionId: options.compositionId ?? 'Main',
+    compositionWidth: options.compositionWidth,
+    compositionHeight: options.compositionHeight,
+    fps: options.fps,
+    durationFrames: options.durationFrames,
+    selfRender: options.selfRender,
+    kind: options.kind ?? 'gpu',
+    // Schema defaults, passed explicitly to satisfy the EnqueueRenderRequest
+    // output type: INERT for stills (the wire/runner branch on `still`).
+    codec: 'h264',
+    tier: 'cloud',
+    communityConsented: false,
+    inputAssetKeys: [],
+    pollIntervalMs: options.pollIntervalMs,
+    timeoutMs: options.timeoutMs,
+    onProgress: options.onProgress,
+    waitForCompletion: options.waitForCompletion,
+    still: {frame: options.frame, format: 'png'},
+  });
+  if (typeof result.outputSizeInBytes !== 'number') {
+    throw new FarmApiError(
+      500,
+      `Render ${result.renderId} completed without a measured output size — the farm predates FARM-STILL`,
+      'OUTPUT_SIZE_UNAVAILABLE',
+      undefined,
+      'client',
+    );
+  }
+  return {
+    url: result.outputUrl,
+    sizeInBytes: result.outputSizeInBytes,
+    renderId: result.renderId,
+    frame: options.frame,
+    verification: result.verification,
+    creditsSettled: result.creditsSettled,
+  };
 }
 
 export type BundleAndUploadOptions = RequestOptions & {

@@ -7,7 +7,23 @@ export const verificationStatusSchema = z.enum(['pending', 'passed', 'flagged'])
 export type VerificationStatus = z.infer<typeof verificationStatusSchema>;
 export const isoDateSchema = z.string().datetime().nullable();
 
-export const enqueueRenderRequestSchema = z.object({
+/**
+ * STILL DIRECTIVE (FARM-STILL) — render ONE frame of the composition as a
+ * lossless PNG instead of a video. `frame` is the zero-based frame index and
+ * must be `< durationFrames` (the composition's REAL duration — the still
+ * renders one frame OF it); the cross-field refine below enforces that on
+ * both the SDK and the dispatch front door, and the wire/runner enforce it
+ * again at parse time. The format set is closed at png: certification stills
+ * are lossless by contract.
+ */
+export const stillDirectiveSchema = z.object({
+  frame: z.number().int().nonnegative(),
+  format: z.literal('png'),
+});
+export type StillDirective = z.infer<typeof stillDirectiveSchema>;
+
+export const enqueueRenderRequestSchema = z
+  .object({
   bundleSha256: sha256Schema,
   inputProps: z.unknown().optional(),
   compositionId: z.string().min(1).default('Main'),
@@ -27,7 +43,20 @@ export const enqueueRenderRequestSchema = z.object({
   // which pins a job to a specific community operator's own device.
   selfRender: z.boolean().optional(),
   inputAssetKeys: z.array(z.string()).default([]),
-});
+  // FARM-STILL: absent ⇒ video job, byte-identical request. Present ⇒ the
+  // farm renders ONE frame as a lossless PNG and the output is
+  // `still-f<frame>.png`. codec still defaults and is carried but is INERT
+  // for stills (the wire/runner branch on `still`, not on codec).
+  still: stillDirectiveSchema.optional(),
+  })
+  // Cross-field bound, ON the schema: the SAME schema is the dispatch front
+  // door's validator (apps/dispatch/src/api.ts), so a still outside the
+  // composition is refused identically at both ends — one schema, one
+  // validator, one enqueue path.
+  .refine((request) => !request.still || request.still.frame < request.durationFrames, {
+    message: 'still.frame must be < durationFrames',
+    path: ['still', 'frame'],
+  });
 export type EnqueueRenderRequest = z.infer<typeof enqueueRenderRequestSchema>;
 
 export const enqueueRenderResponseSchema = z.object({
@@ -84,6 +113,14 @@ const completeStatus = renderStatusBase.extend({
   // packet-48 OWED: rows completed before measured settlement existed
   // (pre-migration-0016) settle nothing — null, not zero.
   creditsSettled: z.number().int().nonnegative().nullable(),
+  /**
+   * MEASURED object size (dispatch HEADs the output before completing the
+   * job). OPTIONAL so responses from a dispatch predating the field still
+   * parse during the deploy window; nullable for the same pre-0016 rows.
+   * `renderStillOnFarm` requires it (the certification evidence chain pins
+   * byte sizes) and throws a client-kind error when a farm omits it.
+   */
+  outputSizeInBytes: z.number().int().nonnegative().nullable().optional(),
 });
 export const renderStatusResponseSchema = z.discriminatedUnion('status', [completeStatus, nonCompleteStatus]);
 export type RenderStatusResponse = z.infer<typeof renderStatusResponseSchema>;
@@ -156,7 +193,11 @@ export const webhookEventSchema = z.object({
     height: z.number().int().positive(),
     fps: z.number().positive(),
     durationFrames: z.number().int().positive(),
-    codec: z.enum(['h264', 'vp8']),
+    // Nullable for still jobs (FARM-STILL): a still has no video codec —
+    // the honest value is null, never a fake 'h264'. Optional so responses
+    // from a dispatch predating the field still parse during the deploy
+    // window.
+    codec: z.enum(['h264', 'vp8']).nullable().optional(),
   }),
   ts: z.string().datetime(),
 });

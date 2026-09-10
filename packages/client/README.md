@@ -36,9 +36,22 @@ Public functions:
   `major.minor.patch`) BEFORE archiving; a malformed version throws a
   `FarmApiError` with `kind: 'client'` and no fs/network work done.
 - `renderMediaOnFarm()`
+- `renderStillOnFarm()` — ONE frame of the composition as a **lossless PNG**
+  (FARM-STILL): `renderStillOnFarm({apiKey, bundleSha256, inputProps, frame,
+  compositionId?, chromiumOptions?, compositionWidth, compositionHeight,
+  fps, durationFrames, kind?, selfRender?})` → `{url, sizeInBytes,
+  renderId, frame, verification, creditsSettled}`. Same route, schema and
+  walk-away-cancel contract as `renderMediaOnFarm`; `durationFrames` is the
+  composition's REAL duration (`frame` must be < it — the schema refuses
+  otherwise, on the client AND the farm). `verification` stays `pending` —
+  no off-node referee exists, so re-verify the PNG yourself (sha256 +
+  parity). `chromiumOptions.gl` is honored only as `'angle'` today; other
+  values are refused before any network call.
 - `enqueueRender()` — enqueue a render and return immediately with its
   `renderId`; poll with `getRenderProgress()` and cancel with
-  `cancelRender()`. `renderMediaOnFarm()` is this loop done for you.
+  `cancelRender()`. `renderMediaOnFarm()` is this loop done for you. Accepts
+  the optional `still: {frame, format: 'png'}` directive (FARM-STILL) to
+  enqueue a single-frame PNG job.
 - `getRenderProgress()`
 - `cancelRender()`
 - `getBalance()`

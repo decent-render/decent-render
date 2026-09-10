@@ -44,7 +44,7 @@ describe('farm client', () => {
       compositionWidth: 1080, compositionHeight: 1920, fps: 30,
       durationFrames: 90, codec: 'h264', pollIntervalMs: 0,
     });
-    expect(result).toEqual({outputUrl: 'https://cdn.test/video.mp4?sig=1', renderId: 'job-1', creditsSettled: 5, verification: 'passed'});
+    expect(result).toEqual({outputUrl: 'https://cdn.test/video.mp4?sig=1', renderId: 'job-1', creditsSettled: 5, verification: 'passed', outputSizeInBytes: null});
     expect(fetchMock).toHaveBeenCalledTimes(3);
     // A-5: a render that completed is never canceled.
     expect(cancelCalls(fetchMock)).toEqual([]);

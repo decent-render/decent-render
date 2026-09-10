@@ -1,6 +1,41 @@
 # Changelog
 
-## 0.3.0 — unreleased
+## 0.4.0 — unreleased
+
+- **`renderStillOnFarm()` (FARM-STILL)** — render ONE frame of a
+  composition on the farm as a LOSSLESS PNG: `renderStillOnFarm({apiKey,
+  bundleSha256, inputProps, frame, compositionId?, chromiumOptions?,
+  compositionWidth, compositionHeight, fps, durationFrames, selfRender?,
+  kind?}) → {url, sizeInBytes, renderId, frame, verification,
+  creditsSettled}`. Enqueues on the SAME `POST /api/v1/renders` route and
+  schema as `enqueueRender` (with the optional `still` directive) and polls
+  to completion with the identical walk-away-cancel contract as
+  `renderMediaOnFarm`. Not a frame extracted from an mp4 — the node renders
+  the frame directly (`renderStill`, `chrome-for-testing`, `gl: 'angle'`)
+  and verifies the PNG (signature + IHDR geometry) BEFORE uploading.
+  `verification` is HONESTLY `pending` for stills: no off-node referee
+  exists — the caller's own evidence chain (sha256 + parity re-check) is
+  the verification. `chromiumOptions.gl` is honored only as `'angle'` (the
+  farm-wide constant); other values are refused client-side with
+  `CHROMIUM_GL_UNSUPPORTED` before any network call. `kind` defaults to
+  `'gpu'` (selection only — the certification stills target WebGPU-capture
+  compositions). A complete response without a measured
+  `outputSizeInBytes` is a named client error (`OUTPUT_SIZE_UNAVAILABLE`),
+  never a guessed figure.
+- **`enqueueRender` accepts `still`** — `{frame: int ≥ 0, format: 'png'}`
+  (optional; absent ⇒ today's video request, byte-identical). The
+  cross-field bound `still.frame < durationFrames` lives ON the schema,
+  which is also the dispatch front door's validator — one schema, one
+  validator, one enqueue path; a still outside the composition is refused
+  identically at both ends. `durationFrames` is the composition's REAL
+  duration; the still renders ONE frame of it.
+- **Status/webhook honesty for stills** — complete status responses may
+  carry `outputSizeInBytes` (optional + nullable; dispatch HEADs the
+  output at completion), and webhook `composition.codec` is now nullable —
+  a still job has no video codec, and null is the honest value (a fake
+  `'h264'` would be a lie the ledger cannot audit).
+
+## 0.3.0 — published
 
 - **Cancel-ack witness (F4)**: render status responses may carry
   `cancelAckedAt` (ISO date or null) and `cancelTeardownMs` (integer ≥ 0

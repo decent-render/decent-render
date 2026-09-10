@@ -26,6 +26,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'isFarmApiError',
   'listWebhooks',
   'renderMediaOnFarm',
+  'renderStillOnFarm',
   'updateWebhook',
   'verifyWebhookSignature',
   'WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS',
