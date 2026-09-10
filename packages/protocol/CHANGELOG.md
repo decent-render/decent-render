@@ -6,6 +6,17 @@ itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
 
 ## [Unreleased]
 
+- **R2 legacy cut: `jobAssign.codec` is now OPTIONAL** — a still job has no
+  video codec, and dispatch no longer sends the round-1 `'h264'` stand-in
+  (that stand-in existed purely so pre-R2 schemas would accept the frame; no
+  legacy nodes/rows matter). A VIDEO job (no `still` directive) must still
+  carry a codec — enforced at parse time on both sides (a second refine in
+  TS; the same check in Rust's `TryFrom` validation), with a shared reject
+  fixture (video jobAssign without codec). A still MAY still carry a codec
+  (optional ≠ forbidden); dispatch simply never sends one. No
+  `PROTOCOL_VERSION` change — still version 2, same additive/loosening
+  class. Protocol package 0.1.4 → 0.2.0 (unreleased).
+
 - **Still render directive (FARM-STILL)** — `jobAssign` gains one OPTIONAL
   field, `still: {frame, format}`. Present ⇒ the job renders exactly ONE
   frame as a lossless PNG (`renderStill`) instead of a video; absent ⇒
@@ -80,7 +91,7 @@ itself is governed by `fixtures/v2.json` (the shared Rust⇄TS contract).
 - Added optional `browserSha256` / `browserGetUrl` to `jobAssign`. The browser is
   now a standalone content-addressed artifact rather than part of the render
   payload: it is ~170MB and identical across Remotion versions that pin the same
-  Chrome (4.0.487 and 4.0.506 both pin 149.0.7790.0), so bundling re-shipped it
+  Chrome (consecutive Remotion versions pinned the same 149.0.7790.0 build), so bundling re-shipped it
   per version per platform. Absent fields mean the payload carries its own
   browser under `chrome/`, so existing payloads keep working.
 

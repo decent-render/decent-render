@@ -239,7 +239,13 @@ export const JobAssignMessageSchema = z.object({
 	kind: z.enum(['standard', 'gpu']),
 	durationFrames: z.number().int(),
 	fps: z.number().int(),
-	codec: z.enum(['h264', 'vp8']),
+	/**
+	 * FARM-STILL R2: OPTIONAL — a still job has no video codec and dispatch
+	 * sends none (the round-1 `'h264'` stand-in was pure old-schema
+	 * compatibility; no legacy to carry). A VIDEO job (no `still`) must
+	 * still carry it — enforced by the second refine below on BOTH sides.
+	 */
+	codec: z.enum(['h264', 'vp8']).optional(),
 	/**
 	 * Pinned platform bundle (content-addressed tar.gz of the Remotion webpack
 	 * bundle). The worker downloads it via the presigned GET, verifies the
@@ -305,7 +311,12 @@ export const JobAssignMessageSchema = z.object({
 	.refine(
 		(assign) => !assign.still || assign.still.frame < assign.durationFrames,
 		{message: 'still.frame must be < durationFrames', path: ['still', 'frame']},
-	);
+	)
+	// A video job renders WITH a codec; only a still may omit one.
+	.refine((assign) => assign.still !== undefined || assign.codec !== undefined, {
+		message: 'codec is required unless the job carries a still directive',
+		path: ['codec'],
+	});
 export type JobAssignMessage = z.infer<typeof JobAssignMessageSchema>;
 
 export const CancelMessageSchema = z.object({

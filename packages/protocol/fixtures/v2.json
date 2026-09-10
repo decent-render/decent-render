@@ -231,7 +231,6 @@
         "kind": "gpu",
         "durationFrames": 300,
         "fps": 30,
-        "codec": "h264",
         "bundleSha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
         "bundleGetUrl": "https://r2.example.com/bundles/9f86.tar.gz?sig=1",
         "payloadSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -447,6 +446,29 @@
           "frame": 12,
           "format": "jpeg"
         }
+      }
+    },
+    {
+      "name": "jobAssign VIDEO job without a codec (FARM-STILL R2)",
+      "direction": "server",
+      "reason": "codec became optional in R2 so a still job can honestly omit it; a VIDEO job (no still directive) must still carry one — the runner cannot renderMedia without it. Refused at parse on both sides (TS refine; Rust TryFrom validation).",
+      "wire": {
+        "type": "jobAssign",
+        "tenant": "driffs",
+        "jobId": "job-video-nocodec",
+        "attempt": 1,
+        "kind": "gpu",
+        "durationFrames": 300,
+        "fps": 30,
+        "bundleSha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "bundleGetUrl": "https://r2.example.com/bundles/9f86.tar.gz?sig=1",
+        "payloadSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "payloadGetUrl": "https://r2.example.com/render-payloads/aaaa.tar.gz?sig=payload",
+        "inputPropsGetUrl": "https://r2.example.com/renders/t1/input-props.json?sig=2",
+        "assetGetUrls": [],
+        "outputPutUrl": "https://r2.example.com/renders/t1/out.mp4?sig=4",
+        "outputKey": "renders/t1/out.mp4",
+        "purgeAfter": true
       }
     }
   ]

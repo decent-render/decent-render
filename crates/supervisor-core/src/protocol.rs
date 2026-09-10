@@ -342,7 +342,13 @@ pub struct JobAssignMessage {
     pub kind: JobKind,
     pub duration_frames: u64,
     pub fps: u32,
-    pub codec: Codec,
+    /// FARM-STILL R2: optional — a still job has no video codec and dispatch
+    /// sends none (the round-1 `'h264'` stand-in was pure old-schema
+    /// compatibility; no legacy to carry). A VIDEO job must carry one —
+    /// enforced in [`JobAssignMessage::try_from`] below, the TS side's twin
+    /// refine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<Codec>,
     /// Pinned platform bundle: content-addressed tar.gz of the Remotion
     /// webpack bundle. Download via the presigned GET, verify the sha256,
     /// extract, render against the extracted dir. Content-addressing makes the
@@ -402,7 +408,8 @@ struct JobAssignMessageUnchecked {
     pub kind: JobKind,
     pub duration_frames: u64,
     pub fps: u32,
-    pub codec: Codec,
+    #[serde(default)]
+    pub codec: Option<Codec>,
     pub bundle_sha256: String,
     pub bundle_get_url: String,
     pub payload_sha256: String,
@@ -431,6 +438,10 @@ impl TryFrom<JobAssignMessageUnchecked> for JobAssignMessage {
                     still.frame, u.duration_frames
                 ));
             }
+        } else if u.codec.is_none() {
+            return Err(String::from(
+                "codec is required unless the job carries a still directive",
+            ));
         }
         Ok(Self {
             tenant: u.tenant,
@@ -603,7 +614,7 @@ mod tests {
         };
         assert_eq!(a.job_id, "job-render-abc123");
         assert_eq!(a.kind, JobKind::Gpu);
-        assert_eq!(a.codec, Codec::H264);
+        assert_eq!(a.codec, Some(Codec::H264));
         assert_eq!(a.duration_frames, 300);
         assert_eq!(a.fps, 30);
         assert_eq!(a.asset_get_urls.len(), 1);
@@ -633,7 +644,7 @@ mod tests {
         };
         assert_eq!(a.still, None);
 
-        let still_wire = "{\"type\":\"jobAssign\",\"tenant\":\"driffs\",\"jobId\":\"j\",\"kind\":\"standard\",\"durationFrames\":300,\"fps\":30,\"codec\":\"h264\",\"bundleSha256\":\"x\",\"bundleGetUrl\":\"u\",\"payloadSha256\":\"p\",\"payloadGetUrl\":\"u\",\"inputPropsGetUrl\":\"u\",\"assetGetUrls\":[],\"outputPutUrl\":\"u\",\"outputKey\":\"renders/t1/still-f12.png\",\"purgeAfter\":true,\"still\":{\"frame\":12,\"format\":\"png\"}}".to_string();
+        let still_wire = "{\"type\":\"jobAssign\",\"tenant\":\"driffs\",\"jobId\":\"j\",\"kind\":\"standard\",\"durationFrames\":300,\"fps\":30,\"bundleSha256\":\"x\",\"bundleGetUrl\":\"u\",\"payloadSha256\":\"p\",\"payloadGetUrl\":\"u\",\"inputPropsGetUrl\":\"u\",\"assetGetUrls\":[],\"outputPutUrl\":\"u\",\"outputKey\":\"renders/t1/still-f12.png\",\"purgeAfter\":true,\"still\":{\"frame\":12,\"format\":\"png\"}}".to_string();
         let msg = round_trip_server(&still_wire);
         let ServerMessage::JobAssign(a) = msg else {
             panic!("expected jobAssign");
@@ -671,6 +682,23 @@ mod tests {
     fn job_assign_rejects_unknown_still_format() {
         let wire = r#"{"type":"jobAssign","tenant":"driffs","jobId":"j","kind":"standard","durationFrames":300,"fps":30,"codec":"h264","bundleSha256":"x","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true,"still":{"frame":12,"format":"jpeg"}}"#;
         assert!(serde_json::from_str::<ServerMessage>(wire).is_err());
+    }
+
+    /// FARM-STILL R2: codec is optional so a STILL can omit it, but a VIDEO
+    /// job without a codec is unrenderable and must fail at parse time —
+    /// the twin of the TS refine. (Also pins that a still WITH a codec is
+    /// still accepted: the field is optional, not forbidden.)
+    #[test]
+    fn job_assign_video_without_codec_refused_still_without_ok() {
+        let video = r#"{"type":"jobAssign","tenant":"driffs","jobId":"j","kind":"standard","durationFrames":300,"fps":30,"bundleSha256":"x","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true}"#;
+        assert!(serde_json::from_str::<ServerMessage>(video).is_err());
+        let still = r#"{"type":"jobAssign","tenant":"driffs","jobId":"j","kind":"standard","durationFrames":300,"fps":30,"bundleSha256":"x","bundleGetUrl":"u","payloadSha256":"p","payloadGetUrl":"u","inputPropsGetUrl":"u","assetGetUrls":[],"outputPutUrl":"u","outputKey":"k","purgeAfter":true,"still":{"frame":1,"format":"png"}}"#;
+        let parsed =
+            serde_json::from_str::<ServerMessage>(still).expect("still without codec parses");
+        let ServerMessage::JobAssign(a) = parsed else {
+            panic!("expected jobAssign");
+        };
+        assert_eq!(a.codec, None);
     }
 
     /// Exact dispatch cancel frame (fixture-pinned shape; the frame is
