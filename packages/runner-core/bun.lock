@@ -5,7 +5,7 @@
     "": {
       "name": "@decent-render/runner-core",
       "dependencies": {
-        "@decent-render/protocol": "^0.1.1",
+        "@decent-render/protocol": "^0.2.0",
         "zod": "^4.3.6",
       },
       "devDependencies": {
@@ -16,7 +16,7 @@
     },
   },
   "packages": {
-    "@decent-render/protocol": ["@decent-render/protocol@0.1.1", "", { "peerDependencies": { "zod": ">=4 <5" } }, "sha512-GD4HnaVUdt9grMr8qfxChvYExts2+ydYkDDKxCiLg+8R1mZQSHw+QZQM7iGn9su1p9XbsA6DylSZ2QwdTKRagA=="],
+    "@decent-render/protocol": ["@decent-render/protocol@0.2.0", "", { "peerDependencies": { "zod": ">=4 <5" } }, "sha512-SF/plnVdaeQQliu6OnjRmf7BGfZUdr5BIiKVBmVaL+qwT0F0yGAmcR+nVhU/Svpvu0yT3MGZQCuvbj9VWMOSaw=="],
 
     "@jridgewell/sourcemap-codec": ["@jridgewell/sourcemap-codec@1.5.5", "", {}, "sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og=="],
 
