@@ -178,6 +178,29 @@ publishing; no npm token exists.
 7. Verify the npm package version and provenance.
 8. Install it in a clean consumer and run a minimal schema import.
 
+## Multi-package releases are STAGED, and the prep commit's CI is red on purpose
+
+When one npm package bumps a dependent's range (protocol 0.2.0 ⇒ runner-core
+depends on `^0.2.0`), the dependent's `bun.lock` **cannot** be refreshed until
+the dependency is actually published. So a multi-package release is ordered:
+
+1. Push the release-prep commit. **CI for the dependent package will be RED**
+   with `No version matching "^0.2.0" found for specifier ...` — expected and
+   ordered, not a broken build.
+2. Publish the dependency (protocol).
+3. In the dependent package, run `bun install` to refresh its lockfile, run its
+   tests against the now-published dependency, commit the lockfile, push.
+4. Only then run the dependent's publish workflow.
+5. Repeat down the chain. Client depends only on `zod`, so it is unaffected.
+
+Skipping step 3 fails the publish job itself at `bun install --frozen-lockfile`
+with `lockfile had changes, but lockfile is frozen` — after the environment
+approval, which wastes a human round-trip (observed 2026-09-14, run 34905311025).
+
+**Push release-prep early.** The stale-lock mismatch is already caught by CI's
+per-package `bun install --frozen-lockfile`; on 2026-09-14 it went unnoticed for
+four days only because the prep commits sat unpushed, so that gate never ran.
+
 Changing package version does not change `PROTOCOL_VERSION`. A wire change must
 follow the cross-language procedure in `CONTRIBUTING.md`.
 
