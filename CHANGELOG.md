@@ -8,7 +8,7 @@ The format follows Keep a Changelog and semantic versioning.
 
 ## [Unreleased]
 
-## [0.0.13] — 2026-09-10
+## [0.0.13] - 2026-09-10
 
 ### Added
 
