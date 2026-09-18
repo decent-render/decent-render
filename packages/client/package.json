@@ -46,7 +46,7 @@
 		"@remotion/bundler": "^4.0.349",
 		"@types/node": "^26.0.0",
 		"typescript": "^7.0.0",
-		"vitest": "^4.1.0"
+		"vitest": "^5.0.1"
 	},
 	"keywords": [
 		"decent-render",
